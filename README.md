@@ -37,13 +37,34 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 构建
 
+### 方式一：云端构建（不需要 Mac）
+
+推送到 `main` 或手动触发 `iOS` workflow，GitHub 会在 macOS runner 上编译，产出**未签名** `ControlX2-unsigned.ipa`：
+
+```
+仓库 → Actions → iOS → 最近一次运行 → Artifacts → ControlX2-unsigned-ipa
+```
+
+流水线做两件事：`ubuntu` 容器里跑 `swift test`（协议层，几秒），`macos-15` 上 `xcodegen` + `xcodebuild` 出包。编译失败时 `build-log` artifact 里有完整日志。
+
+> 私有仓库的 macOS runner 按 **10 倍**分钟计费，一次构建约消耗 50–80 分钟额度。公开仓库免费。
+
+拿到 IPA 后需要自签才能安装（未签名包 iOS 会直接拒绝）：
+
+| 工具 | 平台 | 说明 |
+|---|---|---|
+| Sideloadly | Win/macOS | 拖入 IPA，填 Apple ID，7 天有效 |
+| AltStore / SideStore | Win/macOS | 需常驻电脑或配对设备续签 |
+| Xcode | macOS | `Devices and Simulators` 里拖入 IPA |
+
+免费 Apple ID 签名有效期 7 天，到期需重签；付费开发者账号 1 年。
+
+### 方式二：本地 Xcode
+
 ```bash
-# 1) 生成 Xcode 工程（需要 XcodeGen）
 brew install xcodegen
 xcodegen generate
-
-# 2) 打开并签名
-open ControlX2.xcodeproj      # 选择你的开发者账号；真机运行需付费账号
+open ControlX2.xcodeproj      # 选择 Team，真机运行
 ```
 
 命令行跑协议层测试（不需要 Xcode，macOS 或 Linux 均可）：

@@ -1,4 +1,4 @@
-name: ControlX2iOS
+name: ControlX2
 options:
   bundleIdPrefix: org.controlx2
   deploymentTarget:
