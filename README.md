@@ -42,10 +42,10 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 现成产物
 
-`ControlX2-unsigned.ipa`（260 KB，arm64，iOS 17+，构建号 `d25bd39`）由 GitHub Actions 的 macOS runner 编译产出：
+`ControlX2-unsigned.ipa`（283 KB，arm64，iOS 17+，构建号 `1557c5b`）由 GitHub Actions 的 macOS runner 编译产出：
 
 ```
-SHA-256: f09417637192e687a0da0c5ed9e619e8113525ae15c4a7c92e70d00ea890ad7b
+SHA-256: ca3db061069c37f3886a24d1c80c0eedc039ae70260600beb48768361fbbd2ce
 ```
 
 **未签名**，iOS 会拒绝直接安装，必须先用 Apple ID 重签（见下方「云端构建」）。签名后即可在真机运行，首次启动需连接泵并输入配对码。
