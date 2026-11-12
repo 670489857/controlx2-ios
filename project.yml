@@ -1,0 +1,41 @@
+name: ControlX2iOS
+options:
+  bundleIdPrefix: org.controlx2
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  PumpX2Kit:
+    path: .
+
+targets:
+  ControlX2:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+    dependencies:
+      - package: PumpX2Kit
+        product: PumpX2Kit
+      - package: PumpX2Kit
+        product: PumpX2BLE
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: ControlX2
+        UILaunchScreen: {}
+        UIBackgroundModes:
+          - bluetooth-central
+        NSBluetoothAlwaysUsageDescription: 需要蓝牙权限以连接并读取胰岛素泵状态。
+        NSBluetoothPeripheralUsageDescription: 需要蓝牙权限以连接并读取胰岛素泵状态。
+        ITSAppUsesNonExemptEncryption: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait

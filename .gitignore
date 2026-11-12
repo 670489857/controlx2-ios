@@ -1,0 +1,19 @@
+# Swift / SPM 构建产物
+.build/
+.swiftpm/
+Package.resolved
+
+# Xcode
+DerivedData/
+build/
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# macOS
+.DS_Store
+
+# 打包产物
+*.ipa
+*.dSYM.zip
