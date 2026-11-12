@@ -92,7 +92,8 @@ public actor PumpSession {
     /// 6 位泵配对码。成功后 `authKey` 生效，后续签名报文可校验。
     public func pair(code: String, progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
         state = .pairing(progress: 0)
-        defer { if case .pairing = state { state = .failed("配对未完成") } }
+        var completed = false
+        defer { if !completed, case .pairing = state { state = .failed("配对未完成") } }
 
         let challenge = (0..<8).map { _ in UInt8.random(in: 0...255) }
         let central = try await request(AuthMessages.centralChallengeRequest(challenge: challenge),
@@ -118,6 +119,7 @@ public actor PumpSession {
         }
         authKey = key
         link.updateAuthenticationKey(key)
+        completed = true
         progress(100)
     }
 
@@ -132,13 +134,13 @@ public actor PumpSession {
             snapshot.insulinIsEstimate = frame.cargo[2] != 0
         }
 
+        // TimeSinceResetResponse：currentTime(4 字节) + pumpTimeSinceReset(4 字节)，小端
         let time = PumpMessage.request(characteristic: .currentStatus, opCode: 0x36)
         if let frame = try? await request(time, expecting: 0x37), frame.cargo.count >= 8 {
-            let v = frame.cargo.enumerated().reduce(UInt64(0)) { acc, pair in
-                acc | UInt64(pair.element) << (8 * UInt64(pair.offset))
-            }
-            snapshot.pumpTimeSinceReset = v
-            pumpTimeSinceReset = UInt32(truncatingIfNeeded: v)
+            let sinceReset = UInt32(frame.cargo[4]) | UInt32(frame.cargo[5]) << 8
+                | UInt32(frame.cargo[6]) << 16 | UInt32(frame.cargo[7]) << 24
+            pumpTimeSinceReset = sinceReset
+            snapshot.pumpTimeSinceReset = UInt64(sinceReset)
         }
         snapshot.lastUpdated = Date()
     }
