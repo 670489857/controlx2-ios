@@ -83,15 +83,17 @@ final class AppModel: ObservableObject {
     }
 
     func pair() {
-        guard pairingCode.count == 6 else {
-            errorText = "配对码为 6 位数字"
+        // 旧固件 16 位（字母数字），v7.7+ 与 Mobi 为 6 位数字；分隔符在归一化时去掉
+        let code = JPAKEAuth.normalize(pairingCode)
+        guard code.count == 6 || code.count == 16 else {
+            errorText = "配对码应为 6 位数字（v7.7+ / Mobi）或 16 位字母数字（更早固件）"
             return
         }
         errorText = nil
         pairingProgress = 0
         Task {
             do {
-                try await session.pair(code: pairingCode) { p in
+                try await session.pair(code: code) { p in
                     Task { @MainActor in self.pairingProgress = p }
                 }
                 try await session.refresh()
@@ -251,13 +253,16 @@ struct PairingView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("输入泵屏幕上显示的 6 位配对码").font(.headline)
-            TextField("000000", text: $model.pairingCode)
-                .keyboardType(.numberPad)
+            Text("输入泵屏幕上显示的配对码").font(.headline)
+            TextField("000000 或 A1B2-C3D4-E5F6-7890", text: $model.pairingCode)
+                .keyboardType(.asciiCapable)
+                .textInputAutocapitalization(.characters)
+                .autocorrectionDisabled()
                 .textFieldStyle(.roundedBorder)
-                .font(.system(size: 34, design: .monospaced))
+                .font(.system(size: 22, weight: .medium, design: .monospaced))
                 .onChange(of: model.pairingCode) { _, new in
-                    model.pairingCode = String(new.filter(\.isNumber).prefix(6))
+                    let filtered = new.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+                    model.pairingCode = String(filtered.prefix(19))
                 }
             if model.pairingProgress > 0 {
                 ProgressView(value: Double(model.pairingProgress), total: 100)
@@ -265,8 +270,11 @@ struct PairingView: View {
             }
             Button("开始配对") { model.pair() }
                 .buttonStyle(.borderedProminent)
-                .disabled(model.pairingCode.count != 6)
-            Text("配对过程会进行 EC-JPAKE 密钥协商，约需数秒。若泵提示配对失败，请在泵上重新生成配对码。")
+                .disabled(!(JPAKEAuth.normalize(model.pairingCode).count == 6
+                            || JPAKEAuth.normalize(model.pairingCode).count == 16))
+            Text("**6 位**：t:slim X2 固件 v7.7 及以上、t:slim Mobi。\n**16 位**：更早的 t:slim X2 固件，泵上常以 4 位一组显示，连字符可保留。")
+                .font(.caption).foregroundStyle(.secondary)
+            Text("配对会进行 EC-JPAKE 密钥协商，约需数秒。若泵提示失败，请在泵上重新生成配对码。")
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
         }

@@ -100,16 +100,33 @@ public final class JPAKEAuth {
 
     public init(pairingCode: String, derivedSecret: [UInt8]? = nil,
                 random: RandomSource = SystemRandomSource()) throws {
-        guard pairingCode.count == 6, pairingCode.allSatisfy({ $0.isNumber }) else {
+        let normalized = JPAKEAuth.normalize(pairingCode)
+        // t:slim X2 固件 < v7.7 为 16 位字母数字；v7.7+ 与 Mobi 为 6 位数字
+        guard normalized.count == 6 || normalized.count == 16 else {
             throw AuthError.invalidPairingCode
         }
-        self.pairingCode = pairingCode
+        self.pairingCode = normalized
         self.random = random
         self.derivedSecret = derivedSecret
         self.jpake = ECJPAKE(role: .client,
-                             secret: Array(pairingCode.utf8),
+                             secret: JPAKEAuth.codeToBytes(normalized),
                              random: random)
         self.step = (derivedSecret?.isEmpty ?? true) ? .bootstrapInitial : .confirmInitial
+    }
+
+    /// 去掉分隔符与空白，保留字母数字（16 位码在泵上常带 `-` 分组）
+    public static func normalize(_ code: String) -> String {
+        code.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber) }
+    }
+
+    /// 与 pumpX2 `JpakeAuthBuilder.charCode` 保持一致：
+    /// 只有 '0'–'9' 映射为 ASCII 48–57，字母等其他字符返回 `(byte) -1`，即 0xFF。
+    /// 若直接用 UTF-8 编码，含字母的 16 位码会算出完全不同的密钥。
+    public static func codeToBytes(_ code: String) -> [UInt8] {
+        code.map { ch in
+            if let ascii = ch.asciiValue, ascii >= 48, ascii <= 57 { return ascii }
+            return 0xFF
+        }
     }
 
     /// 发送下一帧；返回 nil 表示流程已结束（成功或失败）
