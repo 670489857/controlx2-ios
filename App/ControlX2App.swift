@@ -43,6 +43,10 @@ final class AppModel: ObservableObject {
     private var pollTask: Task<Void, Never>?
 
     init() {
+        // 已接受过免责声明就直接进扫描页；未接受则每次启动都要求确认
+        if UserDefaults.standard.bool(forKey: "disclaimerAccepted") {
+            phase = .discovery
+        }
         transport.onDiscover = { [weak self] pump in
             Task { @MainActor in
                 guard let self else { return }
@@ -53,6 +57,15 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 self?.connectedName = nil
                 self?.errorText = "泵连接已断开"
+            }
+        }
+        transport.onStateChange = { [weak self] state in
+            Task { @MainActor in
+                switch state {
+                case .poweredOff: self?.errorText = "蓝牙已关闭，请在控制中心打开"
+                case .unauthorized: self?.errorText = "未授权蓝牙访问，请到「设置 → ControlX2」开启"
+                default: break
+                }
             }
         }
     }
