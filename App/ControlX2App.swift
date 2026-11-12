@@ -40,6 +40,8 @@ final class AppModel: ObservableObject {
 
     private let transport = BLETransport()
     private lazy var session = PumpSession(link: transport)
+    private let store: CredentialStore = KeychainCredentialStore()
+    private var currentPumpID: UUID?
     private var pollTask: Task<Void, Never>?
 
     init() {
@@ -90,9 +92,49 @@ final class AppModel: ObservableObject {
         transport.stopScan()
         isScanning = false
         connectedName = pump.name
+        currentPumpID = pump.id
         transport.connect(pump.id)
         phase = .pairing
-        Task { await session.start() }
+        pairingProgress = 0
+        Task {
+            await session.start()
+            await attemptResume()
+        }
+    }
+
+    /// 连接后优先用已保存的凭据恢复会话；泵不认才退回输入配对码。
+    private func attemptResume() async {
+        guard let id = currentPumpID, let saved = store.load(for: id.uuidString) else { return }
+        do {
+            let result = try await session.resume(with: saved) { p in
+                Task { @MainActor in self.pairingProgress = p }
+            }
+            switch result {
+            case .resumed:
+                try? await session.refresh()
+                await refreshFromSession()
+                phase = .dashboard
+                startPolling()
+            case .needsPairing:
+                store.delete(for: id.uuidString)
+                errorText = "泵未认可已保存的凭据（可能重置过或换了泵），请重新输入配对码"
+            }
+        } catch {
+            errorText = "自动恢复失败：\(error)"
+        }
+    }
+
+    /// 删除本机保存的配对凭据，并断开当前连接
+    func forgetPump() {
+        if let id = currentPumpID { store.delete(for: id.uuidString) }
+        pollTask?.cancel()
+        transport.disconnect()
+        connectedName = nil
+        currentPumpID = nil
+        hasLiveData = false
+        glucoseText = "—"
+        phase = .discovery
+        startScan()
     }
 
     func pair() {
@@ -108,6 +150,10 @@ final class AppModel: ObservableObject {
             do {
                 try await session.pair(code: code) { p in
                     Task { @MainActor in self.pairingProgress = p }
+                }
+                // 配对成功即刻落盘：下次连接用 derivedSecret 做快速确认
+                if let creds = await session.credentials, let id = currentPumpID {
+                    store.save(creds, for: id.uuidString)
                 }
                 try await session.refresh()
                 await refreshFromSession()
@@ -298,6 +344,7 @@ struct PairingView: View {
 
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showForget = false
 
     var body: some View {
         ScrollView {
@@ -352,6 +399,20 @@ struct DashboardView: View {
 
                 NavigationLink("安全说明与已知限制") { SafetyView() }
                     .font(.footnote)
+
+                Button(role: .destructive) {
+                    showForget = true
+                } label: {
+                    Label("忘记此泵", systemImage: "trash")
+                        .font(.footnote)
+                }
+                .confirmationDialog("删除本机保存的配对凭据？", isPresented: $showForget,
+                                    titleVisibility: .visible) {
+                    Button("删除，下次重新输入配对码", role: .destructive) { model.forgetPump() }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("凭据只存在本机 Keychain，删除后不影响泵上的其他配对设备。")
+                }
 
                 Text("本版本只读取状态，不含任何输注指令。")
                     .font(.caption2).foregroundStyle(.secondary)

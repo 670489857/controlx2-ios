@@ -5,14 +5,14 @@ final class ProtocolTests: XCTestCase {
 
     // 向量来自 pumpX2 messages/src/test/java/.../BTResponseParserTest.java
     func testPacketizeCentralChallenge() throws {
-        let msg = AuthMessages.centralChallengeRequest(challenge: [0, 1, 2, 3, 4, 5, 6, 7])
+        let msg = AuthMessages.centralChallengeRequest(appInstanceId: 0, challenge: [0, 1, 2, 3, 4, 5, 6, 7])
         let packets = try Packetize.encode(msg, txId: 0)
         XCTAssertEqual(packets.count, 1)
         XCTAssertEqual(Hex.encode(packets[0]), "000010000a00000001020304050607361a")
     }
 
     func testPacketizeWithCapturedChallenge() throws {
-        let msg = AuthMessages.centralChallengeRequest(challenge: try Hex.decode("670b42de65985e97"))
+        let msg = AuthMessages.centralChallengeRequest(appInstanceId: 0, challenge: try Hex.decode("670b42de65985e97"))
         let packets = try Packetize.encode(msg, txId: 0)
         XCTAssertEqual(Hex.encode(packets[0]), "000010000a0000670b42de65985e97f1ce")
     }

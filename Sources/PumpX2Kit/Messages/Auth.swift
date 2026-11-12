@@ -7,7 +7,7 @@ public enum AuthMessages {
     public static let pumpChallengeRequestOp: UInt8 = 0x12
     public static let pumpChallengeResponseOp: UInt8 = 0x13
 
-    public static func centralChallengeRequest(appInstanceId: UInt16 = 0,
+    public static func centralChallengeRequest(appInstanceId: UInt16 = 1,
                                               challenge: [UInt8]) -> PumpMessage {
         precondition(challenge.count == 8)
         var cargo = AppInstance.bytes(appInstanceId)
@@ -32,7 +32,7 @@ public enum AuthMessages {
     }
 
     /// 泵校对配对码：HMAC-SHA1(key: hmacKey, message: empty)
-    public static func pumpChallengeRequest(appInstanceId: UInt16 = 0,
+    public static func pumpChallengeRequest(appInstanceId: UInt16 = 1,
                                             hmacKey: [UInt8]) -> PumpMessage {
         var cargo = AppInstance.bytes(appInstanceId)
         cargo += HMAC.sha1(key: hmacKey, message: [])
@@ -47,7 +47,7 @@ public enum AuthMessages {
 
     // JPAKE 各轮的请求体都是 2 字节 appInstanceId + 原始载荷
     public static func jpake(_ opCode: UInt8, payload: [UInt8],
-                             appInstanceId: UInt16 = 0) -> PumpMessage {
+                             appInstanceId: UInt16 = 1) -> PumpMessage {
         PumpMessage.request(characteristic: .authorization, opCode: opCode,
                             cargo: AppInstance.bytes(appInstanceId) + payload)
     }
@@ -86,6 +86,7 @@ public final class JPAKEAuth {
     public private(set) var derivedSecret: [UInt8]?
     public private(set) var authenticationKey: [UInt8]?
 
+    public let appInstanceId: UInt16
     private let pairingCode: String
     private let jpake: ECJPAKE
     private let random: RandomSource
@@ -99,12 +100,14 @@ public final class JPAKEAuth {
     private var clientNonce4: [UInt8] = []
 
     public init(pairingCode: String, derivedSecret: [UInt8]? = nil,
+                appInstanceId: UInt16 = 1,
                 random: RandomSource = SystemRandomSource()) throws {
         let normalized = JPAKEAuth.normalize(pairingCode)
         // t:slim X2 固件 < v7.7 为 16 位字母数字；v7.7+ 与 Mobi 为 6 位数字
         guard normalized.count == 6 || normalized.count == 16 else {
             throw AuthError.invalidPairingCode
         }
+        self.appInstanceId = appInstanceId
         self.pairingCode = normalized
         self.random = random
         self.derivedSecret = derivedSecret
@@ -112,6 +115,22 @@ public final class JPAKEAuth {
                              secret: JPAKEAuth.codeToBytes(normalized),
                              random: random)
         self.step = (derivedSecret?.isEmpty ?? true) ? .bootstrapInitial : .confirmInitial
+    }
+
+    /// 快速重连：跳过 1a/1b/2，用已保存的派生密钥直接做第 3、4 步确认。
+    /// 此时 JPAKE 计算不参与，pairingCode 为空串。
+    public init(derivedSecret: [UInt8], appInstanceId: UInt16 = 1,
+                random: RandomSource = SystemRandomSource()) throws {
+        guard derivedSecret.count == 32 else { throw AuthError.invalidState }
+        self.appInstanceId = appInstanceId
+        self.pairingCode = ""
+        self.random = random
+        self.derivedSecret = derivedSecret
+        // confirm 流程不会调用 jpake，此处的 secret 内容无意义
+        self.jpake = ECJPAKE(role: .client,
+                             secret: [UInt8](repeating: 0, count: 6),
+                             random: random)
+        self.step = .confirmInitial
     }
 
     /// 去掉分隔符与空白，保留字母数字（16 位码在泵上常带 `-` 分组）
@@ -163,7 +182,7 @@ public final class JPAKEAuth {
             let digest = HMAC.sha256(key: HKDF.build(nonce: serverNonce3, keyMaterial: secret),
                                      message: clientNonce4)
             step = .confirm4Sent
-            let cargo = AppInstance.bytes(0) + clientNonce4 + [UInt8](repeating: 0, count: 8) + digest
+            let cargo = AppInstance.bytes(appInstanceId) + clientNonce4 + [UInt8](repeating: 0, count: 8) + digest
             return AuthMessages.jpake(0x28, payload: Array(cargo.dropFirst(2)))
 
         case .confirm4Received:

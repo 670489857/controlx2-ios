@@ -22,7 +22,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 | 活性胰岛素 IOB | ✅ 已实现 | `ControlIQIOB(0x6C/0x6D)`，÷1000 U |
 | 药筒余量 | ✅ 已实现 | `InsulinStatus(0x24/0x25)` |
 | 电量 / 基础率 | ✅ 已实现 | `BatteryV1(0x34/0x35)`、`BasalStatus(0x28/0x29)` |
-| 配对密钥持久化（免重复输入配对码） | ⛔ 未实现 | 每次连接需在泵上确认配对码，见下方说明 |
+| 配对密钥持久化（免重复输入配对码） | ✅ 已实现 | Keychain 存 `derivedSecret` + `appInstanceId`，重连走 `0x26` 快速确认 |
 | 历史日志 / 曲线 | ⛔ 未实现 | 需 `HistoryLog` 流式解析 |
 | 大剂量 / 基础率 / 暂停 | ⛔ 未实现 | 见「为什么不开放给药」 |
 | watchOS App / 复杂功能 | ⛔ 未实现 | 规划中 |
@@ -52,7 +52,7 @@ SHA-256: f09417637192e687a0da0c5ed9e619e8113525ae15c4a7c92e70d00ea890ad7b
 
 ## 已知限制（比功能缺失更重要）
 
-1. **每次连接都要输入配对码**。配对密钥没有持久化，重连等于重新配对，需要在泵屏幕上确认。这是当前版本最影响可用性的点，也是下一步优先要解决的。
+1. **快速重连协议未在真机验证**。首次配对成功后，`derivedSecret`（32 字节）与 `appInstanceId` 存入 Keychain，之后连接跳过 JPAKE 前三轮，直接发 `0x26` 做第 3、4 步确认。这套流程依据 pumpX2 的 `CONFIRM_INITIAL` 分支实现，但「泵是否接受跳过前三轮」只能真机确认。若不接受，会自动删除凭据并退回输入配对码，不会卡死。
 2. **息屏后连接会被系统挂起**。`bluetooth-central` 后台模式只能延长存活，无法像 Android 前台服务那样常驻。血糖不会持续刷新。
 3. **字段语义未在真机核对**。血糖、IOB、基础率的字节偏移来自 pumpX2 的解析代码，量纲按 `÷1000` 换算，但「泵实际返回值是否与解析一致」只能在真机上看。
 4. **16 位配对码里的字母不参与密钥**。pumpX2 的 `charCode` 把 `'0'–'9'` 映射为 ASCII，其余字符一律返回 `(byte)-1`（0xFF），本实现照此对齐。也就是说 16 位码中字母位置的信息被折叠成同一个字节。如果旧固件配对始终失败，这是第一个要怀疑的点 —— 需要真机抓包确认泵侧是否用了别的编码。
@@ -104,7 +104,9 @@ Sources/PumpX2Kit/           纯 Swift，无 Apple 私有依赖，可在 Linux �
 ├── Crypto/                  SHA/HMAC/HKDF、U256+蒙哥马利、P-256、EC-JPAKE
 ├── Protocol/                Message/MessageMeta、注册表（自动生成）、组包、重组
 ├── Messages/                认证报文构造与解析
-└── Session/PumpSession      事务、请求响应配对、配对状态机、只读刷新
+└── Session/
+    ├── PumpSession          事务、请求响应配对、配对/恢复状态机、只读刷新
+    └── Credentials          配对凭据结构与 Keychain / 内存存储
 
 Sources/PumpX2BLE/           CoreBluetooth 传输（#if canImport(CoreBluetooth)）
 App/                         SwiftUI 界面：免责声明 → 扫描 → 配对 → 状态

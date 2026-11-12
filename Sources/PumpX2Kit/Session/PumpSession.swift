@@ -1,6 +1,9 @@
 import Foundation
 
 /// 泵会话：事务 ID 管理、请求/响应配对、配对流程、只读状态刷新。
+///
+/// 配对成功后 `credentials` 会带上派生密钥；把它持久化（App 侧用 Keychain），
+/// 下次连接时调用 `resume(with:)` 即可跳过完整 JPAKE，不必再在泵上输配对码。
 /// 目前只实现「配对 + 读取」；给药指令（bolus / 基础率）在硬件验证通过前不启用。
 public actor PumpSession {
 
@@ -40,15 +43,25 @@ public actor PumpSession {
         }
     }
 
+    public enum ResumeResult: Sendable {
+        /// 泵认可已保存的凭据，会话已恢复
+        case resumed
+        /// 泵不认识这段凭据（重置、换泵、固件升级），需要重新输入配对码
+        case needsPairing
+    }
+
     private let link: PumpLink
     private var txId: UInt8 = 0
     private var authKey: [UInt8]?
     private var pending: [UInt8: CheckedContinuation<AssembledFrame, Error>] = [:]
     private var pumpTimeSinceReset: UInt32 = 0
     private var readerTask: Task<Void, Never>?
+    private var appInstanceId: UInt16 = 1
 
     public private(set) var state: SessionState = .idle
     public private(set) var snapshot = Snapshot()
+    /// 仅在完整配对成功后才有值；持久化它即可免去下次输入配对码
+    public private(set) var credentials: PumpCredentials?
 
     public init(link: PumpLink) {
         self.link = link
@@ -102,40 +115,82 @@ public actor PumpSession {
         pending.removeValue(forKey: opCode)
     }
 
-    // MARK: 配对
+    // MARK: 认证
 
-    /// 6 位泵配对码。成功后 `authKey` 生效，后续签名报文可校验。
-    public func pair(code: String, progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
-        state = .pairing(progress: 0)
-        var completed = false
-        defer { if !completed, case .pairing = state { state = .failed("配对未完成") } }
-
+    /// 中央挑战 → 泵挑战。两步都只证明「这台设备正在与泵对话」，不需要配对码。
+    private func challengeHandshake(using instanceId: UInt16) async throws -> UInt16 {
         let challenge = (0..<8).map { _ in UInt8.random(in: 0...255) }
-        let central = try await request(AuthMessages.centralChallengeRequest(challenge: challenge),
-                                        expecting: AuthMessages.centralChallengeResponseOp)
+        let central = try await request(
+            AuthMessages.centralChallengeRequest(appInstanceId: instanceId, challenge: challenge),
+            expecting: AuthMessages.centralChallengeResponseOp)
         let parsed = try AuthMessages.parseCentralChallengeResponse(central.cargo)
 
-        let challengeReq = AuthMessages.pumpChallengeRequest(hmacKey: parsed.hmacKey)
-        let challengeResp = try await request(challengeReq,
-                                              expecting: AuthMessages.pumpChallengeResponseOp)
-        let (_, ok) = try AuthMessages.parsePumpChallengeResponse(challengeResp.cargo)
+        // 泵返回的 appInstanceId 才是权威值，后续请求统一使用
+        let id = parsed.appInstanceId
+        let challengeReq = AuthMessages.pumpChallengeRequest(appInstanceId: id,
+                                                             hmacKey: parsed.hmacKey)
+        let resp = try await request(challengeReq, expecting: AuthMessages.pumpChallengeResponseOp)
+        let (_, ok) = try AuthMessages.parsePumpChallengeResponse(resp.cargo)
         guard ok else { throw JPAKEAuth.AuthError.rejected }
-        progress(10)
+        return id
+    }
 
-        let auth = try JPAKEAuth(pairingCode: code)
+    /// 驱动 JPAKE 状态机直到结束，成功后写入会话密钥
+    private func runAuth(_ auth: JPAKEAuth,
+                         progress: @escaping @Sendable (Int) -> Void) async throws {
         while let next = try auth.nextRequest() {
-            let expected = next.opCode &+ 1
-            let frame = try await request(next, expecting: expected)
+            let frame = try await request(next, expecting: next.opCode &+ 1)
             try auth.process(opCode: frame.opCode, cargo: frame.cargo)
-            progress(min(90, auth.step.rawValue * 6))
+            progress(min(95, auth.step.rawValue * 6))
         }
         guard auth.isComplete, let key = auth.authenticationKey else {
             throw JPAKEAuth.AuthError.badConfirmation
         }
         authKey = key
         link.updateAuthenticationKey(key)
-        completed = true
-        progress(100)
+    }
+
+    /// 完整配对：输入泵屏幕上的配对码。
+    public func pair(code: String,
+                     progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
+        state = .pairing(progress: 0)
+        do {
+            let id = try await challengeHandshake(using: appInstanceId)
+            appInstanceId = id
+            progress(10)
+
+            let auth = try JPAKEAuth(pairingCode: code, appInstanceId: id)
+            try await runAuth(auth, progress: progress)
+
+            guard let secret = auth.derivedSecret else {
+                throw JPAKEAuth.AuthError.invalidState
+            }
+            credentials = PumpCredentials(appInstanceId: id, derivedSecret: secret)
+            progress(100)
+        } catch {
+            state = .failed("\(error)")
+            throw error
+        }
+    }
+
+    /// 快速重连：用已保存的派生密钥直接做第 3、4 步确认，不需要配对码。
+    /// 失败时不抛错，返回 `.needsPairing` 让界面回退到输入配对码。
+    public func resume(with saved: PumpCredentials,
+                       progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws -> ResumeResult {
+        state = .pairing(progress: 0)
+        do {
+            let id = try await challengeHandshake(using: saved.appInstanceId)
+            progress(10)
+            let auth = try JPAKEAuth(derivedSecret: saved.derivedSecret, appInstanceId: id)
+            try await runAuth(auth, progress: progress)
+            appInstanceId = id
+            credentials = saved
+            progress(100)
+            return .resumed
+        } catch {
+            state = .idle
+            return .needsPairing
+        }
     }
 
     // MARK: 只读状态
