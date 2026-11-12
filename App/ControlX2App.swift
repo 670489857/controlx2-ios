@@ -30,6 +30,13 @@ final class AppModel: ObservableObject {
     @Published var apiVersion: String?
     @Published var insulinUnits: String = "—"
     @Published var lastUpdated: String = "—"
+    @Published var glucoseText: String = "—"
+    @Published var glucoseSub: String = ""
+    @Published var trendSymbol: String = ""
+    @Published var iobText: String = "—"
+    @Published var batteryText: String = "—"
+    @Published var basalText: String = "—"
+    @Published var hasLiveData = false
 
     private let transport = BLETransport()
     private lazy var session = PumpSession(link: transport)
@@ -101,7 +108,7 @@ final class AppModel: ObservableObject {
         pollTask?.cancel()
         pollTask = Task {
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(15))
+                try? await Task.sleep(for: .seconds(60))
                 try? await session.refresh()
                 await refreshFromSession()
             }
@@ -118,11 +125,39 @@ final class AppModel: ObservableObject {
     private func refreshFromSession() async {
         let snap = await session.snapshot
         apiVersion = snap.apiVersion?.description
+
         if let units = snap.insulinUnits {
-            insulinUnits = String(format: "%.2f U", units)
+            insulinUnits = String(format: "%.0f U", units)
+        }
+        if let g = snap.glucoseMgdl, let mmol = snap.glucoseMmol {
+            glucoseText = "\(g)"
+            glucoseSub = String(format: "%.1f mmol/L", mmol)
+            hasLiveData = true
+        }
+        trendSymbol = Self.trendSymbol(for: snap.glucoseTrend)
+        if let iob = snap.iobUnits {
+            iobText = String(format: "%.2f U", iob)
+        }
+        if let b = snap.batteryPercent {
+            batteryText = "\(b)%"
+        }
+        if let rate = snap.basalRate {
+            basalText = String(format: "%.2f U/h", rate)
         }
         if let t = snap.lastUpdated {
             lastUpdated = t.formatted(date: .omitted, time: .standard)
+        }
+    }
+
+    /// 趋势码沿用 Dexcom 的 0–9 编码（Tandem 未在协议里另行定义），实际箭头以泵屏幕为准。
+    static func trendSymbol(for code: Int?) -> String {
+        switch code {
+        case 1, 2: return "arrow.up.up"
+        case 3: return "arrow.up.right"
+        case 4: return "arrow.right"
+        case 5: return "arrow.down.right"
+        case 6, 7: return "arrow.down.down"
+        default: return ""
         }
     }
 }
@@ -244,24 +279,84 @@ struct DashboardView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        List {
-            Section("泵") {
-                LabeledContent("设备", value: model.connectedName ?? "—")
-                LabeledContent("API 版本", value: model.apiVersion ?? "—")
-                LabeledContent("药筒余量", value: model.insulinUnits)
-                LabeledContent("最近刷新", value: model.lastUpdated)
+        ScrollView {
+            VStack(spacing: 14) {
+                // 血糖主卡
+                VStack(spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Text(model.glucoseText)
+                            .font(.system(size: 76, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .foregroundStyle(model.hasLiveData ? .primary : .secondary)
+                        if !model.trendSymbol.isEmpty {
+                            Image(systemName: model.trendSymbol)
+                                .font(.system(size: 34, weight: .semibold))
+                        }
+                    }
+                    Text(model.glucoseSub.isEmpty ? "等待 CGM 数据" : model.glucoseSub)
+                        .font(.callout).foregroundStyle(.secondary)
+                    Text("mg/dL · 以泵屏幕为准")
+                        .font(.caption2).foregroundStyle(.tertiary)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 22)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
+
+                HStack(spacing: 12) {
+                    MetricCard(title: "活性胰岛素", value: model.iobText, caption: "IOB")
+                    MetricCard(title: "药筒余量", value: model.insulinUnits, caption: "reservoir")
+                }
+                HStack(spacing: 12) {
+                    MetricCard(title: "基础率", value: model.basalText, caption: "basal")
+                    MetricCard(title: "电量", value: model.batteryText, caption: "battery")
+                }
+
+                HStack {
+                    Label(model.connectedName ?? "未连接", systemImage: "dot.radiowaves.left.and.right")
+                        .font(.footnote)
+                    Spacer()
+                    Text("API \(model.apiVersion ?? "—") · \(model.lastUpdated)")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 4)
+
+                Button {
+                    model.refresh()
+                } label: {
+                    Label("立即刷新", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                NavigationLink("安全说明与已知限制") { SafetyView() }
+                    .font(.footnote)
+
+                Text("本版本只读取状态，不含任何输注指令。")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .padding(.top, 4)
             }
-            Section {
-                Button("立即刷新") { model.refresh() }
-                NavigationLink("安全说明") { SafetyView() }
-            }
-            Section("尚未启用") {
-                Text("大剂量、基础率、暂停输注等指令未包含在本版本中。")
-                    .font(.callout).foregroundStyle(.secondary)
-            }
+            .padding()
         }
         .navigationTitle("状态")
         .refreshable { model.refresh() }
+    }
+}
+
+struct MetricCard: View {
+    let title: String
+    let value: String
+    let caption: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.caption).foregroundStyle(.secondary)
+            Text(value).font(.title2.weight(.semibold)).monospacedDigit()
+            Text(caption).font(.caption2).foregroundStyle(.tertiary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
     }
 }
 
