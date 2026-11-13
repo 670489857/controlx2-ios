@@ -23,13 +23,16 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 | 药筒余量 | ✅ 已实现 | `InsulinStatus(0x24/0x25)` |
 | 电量 / 基础率 | ✅ 已实现 | `BatteryV1(0x34/0x35)`、`BasalStatus(0x28/0x29)` |
 | 配对密钥持久化（免重复输入配对码） | ✅ 已实现 | Keychain 存 `derivedSecret` + `appInstanceId`，重连走 `0x26` 快速确认 |
-| 历史日志 / 曲线 | ⛔ 未实现 | 需 `HistoryLog` 流式解析 |
+| 血糖预测（4 小时）与建议剂量 | ✅ 已实现 | `Sources/X2Advisor`，44 项测试；**只算不发**，见 [半闭环说明](docs/x2-semi-closed-loop.md) |
+| 影子模式记录 | ✅ 已实现 | 每 5 分钟落一条「如果自动会给多少」，JSONL + CSV 导出 |
+| 历史曲线（内存 60 小时） | ✅ 已实现 | 环形缓冲 720 条，进程重启从磁盘恢复 |
+| 14 天 AGP / TIR 报告 | ⛔ 未实现 | 需长期存储 + 报表 |
 | 大剂量 / 基础率 / 暂停 | ⛔ 未实现 | 见「为什么不开放给药」 |
 | watchOS App / 复杂功能 | ⛔ 未实现 | 规划中 |
 
 ## 已验证的部分
 
-在 Linux 上用 Swift 6.1 跑通 21 个单元测试（`swift test`）：
+在 Linux 上跑通 94 个单元测试（`swift test`）：
 
 - SHA-256 / SHA-1 / HMAC-SHA1 / HMAC-SHA256：RFC 2202、RFC 4231、NIST 向量
 - CRC16 与组包：与 pumpX2 `BTResponseParserTest` 的真实抓包十六进制逐字节一致
@@ -37,6 +40,10 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 - P-256：对 2G、3G、任意 128 位标量、n-1 的坐标与独立实现（Python 大整数）一致
 - 蒙哥马利乘法 / 标量乘：200 组随机值对照「移位加法」慢速实现
 - EC-JPAKE：客户端与服务端各自完成两轮 ZKP 后派生**相同**的 32 字节密钥；错误配对码则不同
+- 胰岛素活性曲线：峰值恰好消耗 50%，边界归零，单调性，分段可加
+- 预测器：无 IOB 走平线、胰岛素项单调降、碳水项单调升、负 IOB 升糖、DIA 后归零
+- 建议器：九道闸门逐条覆盖，剂量按 0.05 U 取整、按单次上限截断、COB 与 IOB 匹配时相互抵消
+- 影子日志：坏行跳过、CSV 表头与列数、统计摘要
 
 未验证：任何真机 BLE 行为、泵的配对接受、字段语义。
 
