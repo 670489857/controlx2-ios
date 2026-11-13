@@ -1,6 +1,8 @@
 import SwiftUI
+import Charts
 import PumpX2Kit
 import PumpX2BLE
+import X2Advisor
 
 @main
 struct ControlX2App: App {
@@ -38,13 +40,34 @@ final class AppModel: ObservableObject {
     @Published var basalText: String = "—"
     @Published var hasLiveData = false
 
+    // 预测与建议
+    @Published var samples: [GlucoseSample] = []
+    @Published var prediction: PredictionResult?
+    @Published var advice: DoseAdvice?
+    @Published var advisorSettings: AdvisorSettings
+    @Published var shadowCount: Int = 0
+    /// IOB 读不到时预测无意义，UI 需要据此降级而不是显示 0
+    @Published var iobUnavailable = false
+
     private let transport = BLETransport()
     private lazy var session = PumpSession(link: transport)
     private let store: CredentialStore = KeychainCredentialStore()
+    private let glucoseStore: GlucoseHistoryStore
+    private let shadowLog: ShadowLog
     private var currentPumpID: UUID?
     private var pollTask: Task<Void, Never>?
+    private var lastShadowAt: Date?
+
+    private static let settingsKey = "advisorSettings"
 
     init() {
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        glucoseStore = GlucoseHistoryStore(fileURL: docs.appendingPathComponent("glucose.json"))
+        shadowLog = ShadowLog(fileURL: docs.appendingPathComponent("shadow.jsonl"))
+        advisorSettings = Self.loadSettings()
+        samples = glucoseStore.recent(minutes: 180)
+        shadowCount = shadowLog.summarize().total
+
         // 已接受过免责声明就直接进扫描页；未接受则每次启动都要求确认
         if UserDefaults.standard.bool(forKey: "disclaimerAccepted") {
             phase = .discovery
@@ -208,6 +231,111 @@ final class AppModel: ObservableObject {
         if let t = snap.lastUpdated {
             lastUpdated = t.formatted(date: .omitted, time: .standard)
         }
+        updateAdvisor(with: snap)
+    }
+
+    /// 把一次快照喂给预测与建议层。
+    ///
+    /// 这里做的事情全部是"算"，没有一条指令会发给泵。影子记录也在这里落盘，
+    /// 目的是两周后能拿真实数据回答"如果自动，会不会做蠢事"。
+    private func updateAdvisor(with snap: PumpSession.Snapshot) {
+        let now = Date()
+
+        // 采样时间用快照的抓取时刻。EGV 报文里虽然带时间戳，但那是泵自己的
+        // 时钟起点，未与 Unix 纪元对齐，直接用会把所有点挪到 1970 年。
+        if let g = snap.glucoseMgdl {
+            glucoseStore.append(GlucoseSample(
+                timestamp: snap.lastUpdated ?? now,
+                mgdl: g,
+                trendCode: snap.glucoseTrend
+            ))
+        }
+        samples = glucoseStore.recent(minutes: 180, now: now)
+
+        // IOB 读不到就不预测。用 0 顶替等于假设"体内没有活性胰岛素"，
+        // 这正是最容易导致过量建议的错误假设。
+        guard let iob = snap.iobUnits else {
+            iobUnavailable = true
+            prediction = nil
+            advice = nil
+            return
+        }
+        iobUnavailable = false
+
+        guard let latest = glucoseStore.latest else {
+            prediction = nil
+            advice = nil
+            return
+        }
+
+        let predictor = BGPPredictor()
+        let pred = predictor.predict(.init(
+            currentBg: Double(latest.mgdl),
+            now: now,
+            iob: iob,
+            isf: advisorSettings.isf,
+            carbsOnBoard: 0,
+            carbRatio: advisorSettings.carbRatio,
+            horizonMinutes: 240,
+            lowThreshold: advisorSettings.lowThreshold,
+            highThreshold: 180
+        ))
+        prediction = pred
+
+        let advisor = DoseAdvisor(settings: advisorSettings, predictor: predictor)
+        let decision = advisor.advise(.init(
+            now: now,
+            latest: latest,
+            iob: iob,
+            carbsOnBoard: 0,
+            lastBolusAt: nil,
+            measuredSlope: glucoseStore.recentSlope(now: now)
+        ))
+        advice = decision
+
+        // 影子记录按 CGM 节奏写，不用轮询节奏——轮询是 60 秒一次，
+        // 按它写会把同一个读数记四遍，统计出来的"建议频率"会虚高四倍。
+        if lastShadowAt.map({ now.timeIntervalSince($0) >= 270 }) ?? true {
+            lastShadowAt = now
+            var capped = false
+            if case let .correct(_, _, c) = decision { capped = c }
+            shadowLog.append(ShadowRecord(
+                timestamp: now,
+                bg: latest.mgdl,
+                trendCode: latest.trendCode,
+                iob: iob,
+                carbsOnBoard: 0,
+                eventualBg: pred.eventualBg,
+                suggestedUnits: decision.suggestedUnits,
+                holdReason: decision.holdReason?.rawValue,
+                capped: capped
+            ))
+            shadowCount = shadowLog.summarize().total
+        }
+    }
+
+    // MARK: 设置
+
+    static func loadSettings() -> AdvisorSettings {
+        guard let data = UserDefaults.standard.data(forKey: settingsKey),
+              let s = try? JSONDecoder().decode(AdvisorSettings.self, from: data)
+        else { return AdvisorSettings() }
+        return s
+    }
+
+    func saveSettings() {
+        guard let data = try? JSONEncoder().encode(advisorSettings) else { return }
+        UserDefaults.standard.set(data, forKey: Self.settingsKey)
+        // 参数一改就要重算，否则界面还挂着旧参数算出来的剂量
+        Task {
+            let snap = await session.snapshot
+            updateAdvisor(with: snap)
+        }
+    }
+
+    func clearShadowLog() {
+        shadowLog.reset()
+        shadowCount = 0
     }
 
     /// 趋势码沿用 Dexcom 的 0–9 编码（Tandem 未在协议里另行定义），实际箭头以泵屏幕为准。
@@ -370,6 +498,9 @@ struct DashboardView: View {
                 .padding(.vertical, 22)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
 
+                PredictionCard()
+                AdviceCard()
+
                 HStack(spacing: 12) {
                     MetricCard(title: "活性胰岛素", value: model.iobText, caption: "IOB")
                     MetricCard(title: "药筒余量", value: model.insulinUnits, caption: "reservoir")
@@ -422,6 +553,213 @@ struct DashboardView: View {
         }
         .navigationTitle("状态")
         .refreshable { model.refresh() }
+        .toolbar {
+            NavigationLink {
+                AdvisorSettingsView()
+            } label: {
+                Image(systemName: "slider.horizontal.3")
+            }
+        }
+    }
+}
+
+// MARK: - 预测与建议
+
+struct PredictionCard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("预测").font(.subheadline.weight(.semibold))
+                Spacer()
+                if let p = model.prediction {
+                    Text("4 小时后 \(Int(p.eventualBg.rounded())) mg/dL")
+                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+
+            if model.iobUnavailable {
+                Text("未读到活性胰岛素。预测缺了这一项就会系统性高估血糖，所以这里不做预测。")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let p = model.prediction, !p.points.isEmpty {
+                Chart {
+                    ForEach(model.samples, id: \.timestamp) { s in
+                        LineMark(
+                            x: .value("时间", s.timestamp),
+                            y: .value("血糖", s.mgdl),
+                            series: .value("系列", "历史")
+                        )
+                        .foregroundStyle(.primary)
+                        .lineStyle(StrokeStyle(lineWidth: 2))
+                    }
+                    ForEach(p.points, id: \.date) { point in
+                        LineMark(
+                            x: .value("时间", point.date),
+                            y: .value("血糖", point.mgdl),
+                            series: .value("系列", "预测")
+                        )
+                        .foregroundStyle(.orange)
+                        .lineStyle(StrokeStyle(lineWidth: 2, dash: [4, 3]))
+                    }
+                    RuleMark(y: .value("低血糖", model.advisorSettings.lowThreshold))
+                        .foregroundStyle(.red.opacity(0.45))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 4]))
+                }
+                .chartYScale(domain: yDomain(p))
+                .chartXAxis {
+                    AxisMarks(values: .stride(by: .hour, count: 2)) { _ in
+                        AxisGridLine()
+                        AxisValueLabel(format: .dateTime.hour())
+                    }
+                }
+                .frame(height: 150)
+
+                if let low = p.minutesToLow {
+                    Label("预测 \(low) 分钟后跌破 \(Int(model.advisorSettings.lowThreshold))", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.red)
+                }
+            } else {
+                Text("等待血糖数据").font(.caption).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            }
+        }
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func yDomain(_ p: PredictionResult) -> ClosedRange<Double> {
+        var values = model.samples.map { Double($0.mgdl) } + p.points.map(\.mgdl)
+        values.append(model.advisorSettings.lowThreshold)
+        let lo = max(40, (values.min() ?? 70) - 20)
+        let hi = min(400, (values.max() ?? 250) + 20)
+        return lo...max(hi, lo + 40)
+    }
+}
+
+struct AdviceCard: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("此刻建议").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("影子模式")
+                    .font(.caption2)
+                    .padding(.horizontal, 7).padding(.vertical, 2)
+                    .background(.orange.opacity(0.16), in: Capsule())
+            }
+
+            if let advice = model.advice {
+                switch advice {
+                case let .correct(units, _, capped):
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(String(format: "%.2f", units))
+                            .font(.system(size: 34, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                        Text("U").font(.headline).foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    if capped {
+                        Text("已按单次上限截断").font(.caption).foregroundStyle(.orange)
+                    }
+                case let .hold(reason):
+                    HStack(spacing: 6) {
+                        Image(systemName: "minus.circle").foregroundStyle(.secondary)
+                        Text(reason.explanation).font(.callout)
+                    }
+                }
+            } else {
+                Text("等待数据").font(.caption).foregroundStyle(.secondary)
+            }
+
+            Text("本版本不发送任何指令，只记录判断结果。")
+                .font(.caption2).foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+}
+
+struct AdvisorSettingsView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var showClearShadow = false
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("敏感系数 ISF") {
+                    TextField("50", value: $model.advisorSettings.isf, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("碳水比 CR") {
+                    TextField("10", value: $model.advisorSettings.carbRatio, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("目标血糖") {
+                    TextField("110", value: $model.advisorSettings.targetBg, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+            } header: {
+                Text("胰岛素参数")
+            } footer: {
+                Text("单位：ISF 为 mg/dL per U，CR 为 g per U。这些值应与医嘱一致，不是默认值。")
+            }
+
+            Section {
+                LabeledContent("单次上限") {
+                    TextField("2.0", value: $model.advisorSettings.maxSingleDoseUnits, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("追加阈值") {
+                    TextField("120", value: $model.advisorSettings.minBgToCorrect, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("低血糖阈值") {
+                    TextField("70", value: $model.advisorSettings.lowThreshold, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("给药最小间隔（分）") {
+                    TextField("45", value: $model.advisorSettings.minMinutesBetweenDoses, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                Toggle("下降时仍允许建议", isOn: $model.advisorSettings.allowCorrectionWhileFalling)
+            } header: {
+                Text("安全边界")
+            } footer: {
+                Text("下降时允许建议会显著提高低血糖风险，默认关闭。")
+            }
+
+            Section {
+                LabeledContent("影子记录条数", value: "\(model.shadowCount)")
+                Button("清空记录", role: .destructive) { showClearShadow = true }
+            } header: {
+                Text("影子模式")
+            } footer: {
+                Text("每个周期记录一次「如果自动会给多少」，但不发送。攒够两周再回看，判断这套判断逻辑值不值得打开执行。")
+            }
+        }
+        .navigationTitle("建议参数")
+        .toolbar {
+            Button("保存") { model.saveSettings() }
+        }
+        .confirmationDialog("清空全部影子记录？", isPresented: $showClearShadow,
+                            titleVisibility: .visible) {
+            Button("清空", role: .destructive) { model.clearShadowLog() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("这条不可撤销，两周的数据会一起没。")
+        }
     }
 }
 

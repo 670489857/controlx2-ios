@@ -20,6 +20,8 @@ targets:
         product: PumpX2Kit
       - package: PumpX2Kit
         product: PumpX2BLE
+      - package: PumpX2Kit
+        product: X2Advisor
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app

@@ -101,7 +101,9 @@ public actor PumpSession {
                 cont.resume(throwing: ProtocolError.truncated)
                 return
             }
-            pending[opCode] = cont
+            // 用 updateValue 而不是下标赋值：Swift 5.9 会把 actor 内的下标 setter
+            // 展开成 async inout 调用并拒绝编译，与逻辑无关，纯属编译器限制。
+            _ = pending.updateValue(cont, forKey: opCode)
             Task { [weak self] in
                 try? await Task.sleep(for: timeout)
                 if let c = await self?.takePending(opCode) {

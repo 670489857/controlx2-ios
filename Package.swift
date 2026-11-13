@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "PumpX2Kit", targets: ["PumpX2Kit"]),
         .library(name: "PumpX2BLE", targets: ["PumpX2BLE"]),
         .library(name: "TandemLoopKit", targets: ["TandemLoopKit"]),
+        .library(name: "X2Advisor", targets: ["X2Advisor"]),
     ],
     targets: [
         .target(name: "PumpX2Kit"),
@@ -15,7 +16,10 @@ let package = Package(
         .target(name: "PumpX2BLE", dependencies: ["PumpX2Kit"]),
         // LoopKit PumpManager 的适配层：泵无关的换算与模型，可在 Linux 上验证
         .target(name: "TandemLoopKit", dependencies: ["PumpX2Kit"]),
+        // 预测与建议内核：不依赖 UIKit/CoreBluetooth，纯算法，可在 Linux 上全量测试
+        .target(name: "X2Advisor"),
         .testTarget(name: "PumpX2KitTests", dependencies: ["PumpX2Kit"]),
         .testTarget(name: "TandemLoopKitTests", dependencies: ["TandemLoopKit"]),
+        .testTarget(name: "X2AdvisorTests", dependencies: ["X2Advisor"]),
     ]
 )
