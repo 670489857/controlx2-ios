@@ -56,11 +56,10 @@ public actor PumpSession {
     private var pending: [UInt8: CheckedContinuation<AssembledFrame, Error>] = [:]
     private var pumpTimeSinceReset: UInt32 = 0
     private var readerTask: Task<Void, Never>?
-    private var appInstanceId: UInt16 = 1
-    /// 已完成的第一步握手结果。连接后立刻拿到，配对时不必重复握手。
-    private var preparedInstanceId: UInt16?
-    /// 在途的握手任务。多个调用点共享同一次握手，见 `prepare(hint:)`。
-    private var prepareTask: Task<UInt16, Error>?
+    /// 多设备区分用。t:connect 抓包里是 0，pumpX2 的 JPAKE 构建器也硬编码 0，这里跟 0。
+    private var appInstanceId: UInt16 = 0
+    /// 认证序列进行中。整个 0x20–0x28 不允许被打断，重复进入会让泵侧状态机错乱
+    private var authInProgress = false
     /// 已发出、还没等到回复的 opCode。写之前就登记，避免重复事务上路。
     private var inFlightOps: Set<UInt8> = []
 
@@ -150,24 +149,6 @@ public actor PumpSession {
 
     // MARK: 认证
 
-    /// 中央挑战 → 泵挑战。两步都只证明「这台设备正在与泵对话」，不需要配对码。
-    private func challengeHandshake(using instanceId: UInt16) async throws -> UInt16 {
-        let challenge = (0..<8).map { _ in UInt8.random(in: 0...255) }
-        let central = try await request(
-            AuthMessages.centralChallengeRequest(appInstanceId: instanceId, challenge: challenge),
-            expecting: AuthMessages.centralChallengeResponseOp)
-        let parsed = try AuthMessages.parseCentralChallengeResponse(central.cargo)
-
-        // 泵返回的 appInstanceId 才是权威值，后续请求统一使用
-        let id = parsed.appInstanceId
-        let challengeReq = AuthMessages.pumpChallengeRequest(appInstanceId: id,
-                                                             hmacKey: parsed.hmacKey)
-        let resp = try await request(challengeReq, expecting: AuthMessages.pumpChallengeResponseOp)
-        let (_, ok) = try AuthMessages.parsePumpChallengeResponse(resp.cargo)
-        guard ok else { throw JPAKEAuth.AuthError.rejected }
-        return id
-    }
-
     /// 驱动 JPAKE 状态机直到结束，成功后写入会话密钥
     private func runAuth(_ auth: JPAKEAuth,
                          progress: @escaping @Sendable (Int) -> Void) async throws {
@@ -183,50 +164,97 @@ public actor PumpSession {
         link.updateAuthenticationKey(key)
     }
 
-    /// 连接成功后立刻调用：只做不需要配对码的第一步握手（0x10–0x13）。
+    /// 旧固件（16 位字母数字码）：0x10 中央挑战 → 0x12 泵挑战。
     ///
-    /// 为什么必须提前：t:slim 在 BLE 连接建立后要求授权流程尽快开始，
-    /// 迟迟收不到 CentralChallenge 会主动断开。而人工输入 6 位配对码
-    /// 往往要几十秒——等用户输完再握手，泵已经断开了，表现就是
-    /// 「点开始配对，泵主动断开」，让人误以为是配对码错误。
+    /// 只有 16 位码才走这条路。v7.7 及以后的 X2 与 Mobi 必须先做 BLE 层配对，
+    /// 然后直接进 EC-JPAKE；此时发 0x10 泵不认识，会**立刻主动断开**——
+    /// 表现就是授权帧发出的同一瞬间断链，日志里一条回复都没有。
+    private func legacyPair(code: String, progress: @escaping @Sendable (Int) -> Void) async throws {
+        let challenge = (0..<8).map { _ in UInt8.random(in: 0...255) }
+        let central = try await request(
+            AuthMessages.centralChallengeRequest(appInstanceId: appInstanceId, challenge: challenge),
+            expecting: AuthMessages.centralChallengeResponseOp)
+        progress(20)
+        let parsed = try AuthMessages.parseCentralChallengeResponse(central.cargo)
+
+        let challengeReq = AuthMessages.pumpChallengeRequest(appInstanceId: parsed.appInstanceId,
+                                                            hmacKey: parsed.hmacKey,
+                                                            pairingCode: code)
+        let resp = try await request(challengeReq, expecting: AuthMessages.pumpChallengeResponseOp)
+        let (id, ok) = try AuthMessages.parsePumpChallengeResponse(resp.cargo)
+        guard ok else { throw JPAKEAuth.AuthError.rejected }
+        progress(60)
+
+        // 旧固件的签名密钥就是配对码本身（pumpX2 `PumpState.getAuthenticationKey`）
+        appInstanceId = id
+        authKey = Array(code.utf8)
+        link.updateAuthenticationKey(authKey)
+        // 旧固件没有 "derivedSecret" 概念，用配对码字节当口令，下次仍要输码
+        credentials = PumpCredentials(appInstanceId: id, derivedSecret: Array(code.utf8))
+    }
+
+    /// 完整配对：输入泵屏幕上的配对码。
     ///
-    /// 返回泵分配的 appInstanceId（权威值，后续所有请求都用它）。
-    @discardableResult
-    /// 连接后的第一步握手：不需要配对码，只证明「这台设备正在与泵对话」。
-    ///
-    /// 必须单飞。界面在两个地方会触发它——连接流程和链路就绪回调——而 actor
-    /// 在 await 处可重入，第二个调用进来时缓存还是 nil，于是连发两个
-    /// CentralChallenge。泵看到两个未完成的认证请求会直接断链，表现就是
-    /// 「链路已就绪」之后立刻断开。共享同一个 Task 才能保证只发一次。
-    public func prepare(hint: UInt16? = nil) async throws -> UInt16 {
-        if let id = preparedInstanceId { return id }
-        if let inFlight = prepareTask {
-            return try await inFlight.value
-        }
-        let useId = hint ?? appInstanceId
-        let task = Task<UInt16, Error> { [weak self] in
-            guard let self else { throw ProtocolError.truncated }
-            return try await self.challengeHandshake(using: useId)
-        }
-        prepareTask = task
+    /// - 6 位数字（X2 v7.7+ / Mobi）→ EC-JPAKE（0x20 → 0x28，六条消息）
+    /// - 16 位字母数字（更早固件）→ 0x10 → 0x12
+    public func pair(code: String,
+                     progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
+        guard authInProgress == false else { throw JPAKEAuth.AuthError.invalidState }
+        authInProgress = true
+        defer { authInProgress = false }
+
+        let normalized = JPAKEAuth.normalize(code)
+        state = .pairing(progress: 0)
         do {
-            let id = try await task.value
-            appInstanceId = id
-            preparedInstanceId = id
-            prepareTask = nil
-            return id
+            if normalized.count == 16 {
+                try await legacyPair(code: normalized, progress: progress)
+            } else {
+                let auth = try JPAKEAuth(pairingCode: normalized, appInstanceId: appInstanceId)
+                progress(10)
+                try await runAuth(auth, progress: progress)
+                guard let secret = auth.derivedSecret else {
+                    throw JPAKEAuth.AuthError.invalidState
+                }
+                credentials = PumpCredentials(appInstanceId: appInstanceId, derivedSecret: secret)
+            }
+            progress(100)
         } catch {
-            prepareTask = nil
+            state = .failed("\(error)")
             throw error
         }
     }
 
-    /// 链路断开时调用：清掉会话级状态，重连后重新握手。
-    /// 不清的话，第二次连接会沿用上一次的 instanceId 与旧密钥。
+    /// 快速重连：用已保存的派生密钥直接做第 3、4 步确认，不需要配对码。
+    ///
+    /// 注意这里**不能**先发 0x10。新版固件只认 JPAKE 序列，多一条 0x10
+    /// 就等于在泵的授权状态机里插了一条它不认识的报文，结果是断链。
+    /// 失败时不抛错，返回 `.needsPairing` 让界面回退到输入配对码。
+    public func resume(with saved: PumpCredentials,
+                       progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws -> ResumeResult {
+        guard authInProgress == false else { return .needsPairing }
+        authInProgress = true
+        defer { authInProgress = false }
+
+        state = .pairing(progress: 0)
+        do {
+            appInstanceId = saved.appInstanceId
+            let auth = try JPAKEAuth(derivedSecret: saved.derivedSecret,
+                                     appInstanceId: saved.appInstanceId)
+            progress(10)
+            try await runAuth(auth, progress: progress)
+            credentials = saved
+            progress(100)
+            return .resumed
+        } catch {
+            state = .idle
+            return .needsPairing
+        }
+    }
+
+    /// 链路断开时调用：清掉会话级状态，重连后重新授权。
+    /// 不清的话，第二次连接会沿用上一次的实例号与旧密钥。
     public func resetSession() {
-        preparedInstanceId = nil
-        prepareTask?.cancel()
-        prepareTask = nil
+        authInProgress = false
         inFlightOps.removeAll()
         // 事务号必须归零。pumpX2 的重连流程也是这么做的：泵对每次连接
         // 从头计事务，沿用上一条连接的号会被当成过期包丢掉。
@@ -236,49 +264,6 @@ public actor PumpSession {
         for (_, c) in pending { c.resume(throwing: ProtocolError.truncated) }
         pending.removeAll()
         state = .idle
-    }
-
-    /// 完整配对：输入泵屏幕上的配对码。
-    public func pair(code: String,
-                     progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
-        state = .pairing(progress: 0)
-        do {
-            // 握手通常已在连接后完成，这里只是取结果；没有才补做
-            let id = try await prepare()
-            progress(10)
-
-            let auth = try JPAKEAuth(pairingCode: code, appInstanceId: id)
-            try await runAuth(auth, progress: progress)
-
-            guard let secret = auth.derivedSecret else {
-                throw JPAKEAuth.AuthError.invalidState
-            }
-            credentials = PumpCredentials(appInstanceId: id, derivedSecret: secret)
-            progress(100)
-        } catch {
-            state = .failed("\(error)")
-            throw error
-        }
-    }
-
-    /// 快速重连：用已保存的派生密钥直接做第 3、4 步确认，不需要配对码。
-    /// 失败时不抛错，返回 `.needsPairing` 让界面回退到输入配对码。
-    public func resume(with saved: PumpCredentials,
-                       progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws -> ResumeResult {
-        state = .pairing(progress: 0)
-        do {
-            let id = try await prepare(hint: saved.appInstanceId)
-            progress(10)
-            let auth = try JPAKEAuth(derivedSecret: saved.derivedSecret, appInstanceId: id)
-            try await runAuth(auth, progress: progress)
-            appInstanceId = id
-            credentials = saved
-            progress(100)
-            return .resumed
-        } catch {
-            state = .idle
-            return .needsPairing
-        }
     }
 
     // MARK: 只读状态

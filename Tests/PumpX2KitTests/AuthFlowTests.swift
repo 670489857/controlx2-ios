@@ -1,0 +1,154 @@
+import XCTest
+@testable import PumpX2Kit
+
+/// 可编排的假链路：把发出的分片拼回整帧记录下来，并按需回包。
+final class ScriptedLink: PumpLink {
+    private let continuation: AsyncStream<AssembledFrame>.Continuation
+    let frames: AsyncStream<AssembledFrame>
+
+    private let lock = NSLock()
+    private var _records: [(op: UInt8, txId: UInt8, cargo: [UInt8])] = []
+    /// 请求 opCode → (回复 opCode, 回复 cargo)
+    private var script: [UInt8: (UInt8, [UInt8])] = [:]
+    private var _onWrite: ((UInt8) -> Void)?
+
+    init() {
+        var c: AsyncStream<AssembledFrame>.Continuation!
+        frames = AsyncStream { c = $0 }
+        continuation = c
+    }
+
+    var onWrite: ((UInt8) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onWrite }
+        set { lock.lock(); _onWrite = newValue; lock.unlock() }
+    }
+
+    func reply(to op: UInt8, with responseOp: UInt8, cargo: [UInt8]) {
+        lock.lock(); script[op] = (responseOp, cargo); lock.unlock()
+    }
+
+    var records: [(op: UInt8, txId: UInt8, cargo: [UInt8])] {
+        lock.lock(); defer { lock.unlock() }
+        return _records
+    }
+
+    var ops: [UInt8] { records.map(\.op) }
+
+    func updateAuthenticationKey(_ key: [UInt8]?) {}
+
+    func write(_ packets: [[UInt8]], to characteristic: Characteristic) async throws {
+        // 分片格式：[remaining, txId, ...]；remaining 为 0 表示整帧结束
+        var frame: [UInt8] = []
+        var txId: UInt8 = 0
+        for p in packets {
+            guard p.count > 2 else { continue }
+            txId = p[1]
+            frame += p.dropFirst(2)
+        }
+        guard frame.count >= 3 else { return }
+        let op = frame[0]
+        let len = Int(frame[2])
+        let cargo = frame.count >= 3 + len ? Array(frame[3..<(3 + len)]) : []
+        lock.lock()
+        _records.append((op, txId, cargo))
+        let response = script[op]
+        lock.unlock()
+
+        onWrite?(op)
+
+        if let (respOp, respCargo) = response {
+            continuation.yield(.init(opCode: respOp, txId: txId, cargo: respCargo,
+                                     signed: false, hmacVerified: false))
+        }
+    }
+}
+
+final class AuthFlowTests: XCTestCase {
+
+    /// 6 位码必须直接进 JPAKE：首条报文是 0x20（Jpake1a），且全程不能出现 0x10。
+    ///
+    /// 这是上一版跑不通的根因：连接后先发了 0x10 中央挑战。v7.7+ 的泵只认
+    /// JPAKE 序列，收到不认识的 0x10 会立刻断链且不回任何报文——日志里就是
+    /// 「TX 17B 00 00 10 …」紧跟一条 disconnect，零 RX。
+    func testSixDigitCodeStartsJpake() async {
+        let link = ScriptedLink()
+        let first = expectation(description: "首帧已发出")
+        link.onWrite = { op in if op == 0x20 { first.fulfill() } }
+        let session = PumpSession(link: link)
+        await session.start()
+
+        Task { try? await session.pair(code: "123456") }
+        await fulfillment(of: [first], timeout: 5)
+
+        XCTAssertEqual(link.ops.first, 0x20, "6 位码的第一条必须是 Jpake1a")
+        XCTAssertFalse(link.ops.contains(0x10), "6 位码路径不允许出现 CentralChallenge")
+        XCTAssertEqual(link.records.first?.txId, 0, "新连接首帧事务号必须是 0")
+        XCTAssertEqual(link.records.first?.cargo.count, 167, "Jpake1a cargo 固定 167 字节")
+        // appInstanceId 为 0，与 t:connect 抓包一致
+        XCTAssertEqual(link.records.first?.cargo[0], 0)
+        XCTAssertEqual(link.records.first?.cargo[1], 0)
+    }
+
+    /// 已存凭据的快速重连：首条是 0x26（Jpake3SessionKey），同样不能有 0x10。
+    func testResumeStartsAtSessionKey() async {
+        let link = ScriptedLink()
+        let first = expectation(description: "首帧已发出")
+        link.onWrite = { op in if op == 0x26 { first.fulfill() } }
+        let session = PumpSession(link: link)
+        await session.start()
+
+        let saved = PumpCredentials(appInstanceId: 0, derivedSecret: [UInt8](repeating: 0x11, count: 32))
+        Task { _ = try? await session.resume(with: saved) }
+        await fulfillment(of: [first], timeout: 5)
+
+        XCTAssertEqual(link.ops.first, 0x26)
+        XCTAssertFalse(link.ops.contains(0x10))
+        XCTAssertEqual(link.records.first?.cargo.count, 2, "Jpake3SessionKey cargo 只有 appInstanceId")
+    }
+
+    /// 16 位旧固件码：0x10 → 0x12，且 0x12 的载荷是对**配对码**做 HMAC-SHA1。
+    func testLegacySixteenCharUsesHmacOverCode() async throws {
+        let link = ScriptedLink()
+        let hmacKey: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04]
+        var central: [UInt8] = [0x00, 0x00]
+        central += [UInt8](repeating: 0x5A, count: 20)
+        central += hmacKey
+        link.reply(to: 0x10, with: 0x11, cargo: central)
+        link.reply(to: 0x12, with: 0x13, cargo: [0x00, 0x00, 0x01])
+
+        let session = PumpSession(link: link)
+        await session.start()
+        try await session.pair(code: "A1B2-C3D4-E5F6-7890")
+
+        XCTAssertEqual(link.ops, [0x10, 0x12])
+
+        let code = "A1B2C3D4E5F67890"
+        let expected = HMAC.sha1(key: hmacKey, message: Array(code.utf8))
+        let sent = link.records[1].cargo
+        XCTAssertEqual(sent.count, 22, "PumpChallenge cargo = appInstanceId(2) + HMAC(20)")
+        XCTAssertEqual(Array(sent.dropFirst(2)), expected,
+                       "载荷必须是 HMAC-SHA1(hmacKey, 配对码)，不是对空串签名")
+        let creds = await session.credentials
+        XCTAssertNotNil(creds)
+    }
+
+    /// 认证进行中再次点「开始配对」不能插队，否则泵侧状态机会乱
+    func testConcurrentPairIsRejected() async {
+        let link = ScriptedLink()
+        let first = expectation(description: "首帧已发出")
+        link.onWrite = { op in if op == 0x20 { first.fulfill() } }
+        let session = PumpSession(link: link)
+        await session.start()
+
+        Task { try? await session.pair(code: "123456") }
+        await fulfillment(of: [first], timeout: 5)
+
+        do {
+            try await session.pair(code: "123456")
+            XCTFail("第二次配对应被拒绝")
+        } catch {
+            // 期望：invalidState
+        }
+        XCTAssertEqual(link.ops.filter { $0 == 0x20 }.count, 1)
+    }
+}

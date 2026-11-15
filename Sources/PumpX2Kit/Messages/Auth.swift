@@ -7,7 +7,7 @@ public enum AuthMessages {
     public static let pumpChallengeRequestOp: UInt8 = 0x12
     public static let pumpChallengeResponseOp: UInt8 = 0x13
 
-    public static func centralChallengeRequest(appInstanceId: UInt16 = 1,
+    public static func centralChallengeRequest(appInstanceId: UInt16 = 0,
                                               challenge: [UInt8]) -> PumpMessage {
         precondition(challenge.count == 8)
         var cargo = AppInstance.bytes(appInstanceId)
@@ -31,11 +31,15 @@ public enum AuthMessages {
         )
     }
 
-    /// 泵校对配对码：HMAC-SHA1(key: hmacKey, message: empty)
-    public static func pumpChallengeRequest(appInstanceId: UInt16 = 1,
-                                            hmacKey: [UInt8]) -> PumpMessage {
+    /// 泵校对配对码：HMAC-SHA1(key: hmacKey, message: 16 位配对码的 UTF-8 字节)
+    ///
+    /// 原来把 message 传成了空数组，等于对空串签名。泵算出来的值必然不同，
+    /// 于是旧固件（16 位码）的配对永远失败。见 pumpX2 `PumpChallengeRequestBuilder.createV1`。
+    public static func pumpChallengeRequest(appInstanceId: UInt16 = 0,
+                                            hmacKey: [UInt8],
+                                            pairingCode: String) -> PumpMessage {
         var cargo = AppInstance.bytes(appInstanceId)
-        cargo += HMAC.sha1(key: hmacKey, message: [])
+        cargo += HMAC.sha1(key: hmacKey, message: Array(pairingCode.utf8))
         return PumpMessage.request(characteristic: .authorization,
                                    opCode: pumpChallengeRequestOp, cargo: cargo)
     }
@@ -47,7 +51,7 @@ public enum AuthMessages {
 
     // JPAKE 各轮的请求体都是 2 字节 appInstanceId + 原始载荷
     public static func jpake(_ opCode: UInt8, payload: [UInt8],
-                             appInstanceId: UInt16 = 1) -> PumpMessage {
+                             appInstanceId: UInt16 = 0) -> PumpMessage {
         PumpMessage.request(characteristic: .authorization, opCode: opCode,
                             cargo: AppInstance.bytes(appInstanceId) + payload)
     }
@@ -92,7 +96,6 @@ public final class JPAKEAuth {
     private let random: RandomSource
 
     private var clientRound1: [UInt8] = []
-    private var serverRound1: [UInt8] = []
     private var clientRound2: [UInt8] = []
     private var serverNonce3: [UInt8] = []
     private var serverNonce4: [UInt8] = []
@@ -100,7 +103,7 @@ public final class JPAKEAuth {
     private var clientNonce4: [UInt8] = []
 
     public init(pairingCode: String, derivedSecret: [UInt8]? = nil,
-                appInstanceId: UInt16 = 1,
+                appInstanceId: UInt16 = 0,
                 random: RandomSource = SystemRandomSource()) throws {
         let normalized = JPAKEAuth.normalize(pairingCode)
         // t:slim X2 固件 < v7.7 为 16 位字母数字；v7.7+ 与 Mobi 为 6 位数字
@@ -119,7 +122,7 @@ public final class JPAKEAuth {
 
     /// 快速重连：跳过 1a/1b/2，用已保存的派生密钥直接做第 3、4 步确认。
     /// 此时 JPAKE 计算不参与，pairingCode 为空串。
-    public init(derivedSecret: [UInt8], appInstanceId: UInt16 = 1,
+    public init(derivedSecret: [UInt8], appInstanceId: UInt16 = 0,
                 random: RandomSource = SystemRandomSource()) throws {
         guard derivedSecret.count == 32 else { throw AuthError.invalidState }
         self.appInstanceId = appInstanceId
@@ -204,14 +207,15 @@ public final class JPAKEAuth {
 
     public func process(opCode: UInt8, cargo: [UInt8]) throws {
         switch opCode {
-        case 0x21: // Jpake1aResponse（第 1 轮前半段）
-            serverRound1 = try AuthMessages.payload(cargo)
+        case 0x21: // Jpake1aResponse（第 1 轮前半段，165 字节）
+            // 只喂给解析器、不要求这一条就解析完：泵的 ZKP 标量可能是短编码，
+            // 半轮长度会变成 164，尾部补 0；硬拼 330 字节会在这里错位。
+            try jpake.readRound1(try AuthMessages.payload(cargo))
             step = .round1aReceived
 
         case 0x23: // Jpake1bResponse（第 1 轮后半段）
-            serverRound1 += try AuthMessages.payload(cargo)
-            guard serverRound1.count >= 330 else { throw ProtocolError.truncated }
-            try jpake.readRound1(Array(serverRound1[0..<330]))
+            try jpake.readRound1(try AuthMessages.payload(cargo))
+            guard jpake.peerRound1Complete else { throw ProtocolError.truncated }
             step = .round1bReceived
 
         case 0x25: // Jpake2Response
@@ -235,9 +239,13 @@ public final class JPAKEAuth {
         }
     }
 
-    public func processCentralChallenge(_ cargo: [UInt8]) throws -> PumpMessage {
+    /// 旧固件（16 位字母数字码）第二步：对中央挑战的 hmacKey 做 HMAC-SHA1
+    public func processCentralChallenge(_ cargo: [UInt8],
+                                        pairingCode: String) throws -> PumpMessage {
         let result = try AuthMessages.parseCentralChallengeResponse(cargo)
-        return AuthMessages.pumpChallengeRequest(hmacKey: result.hmacKey)
+        return AuthMessages.pumpChallengeRequest(appInstanceId: result.appInstanceId,
+                                                hmacKey: result.hmacKey,
+                                                pairingCode: pairingCode)
     }
 
     public var isComplete: Bool { step == .complete }

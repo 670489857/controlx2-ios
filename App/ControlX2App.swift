@@ -131,17 +131,9 @@ final class AppModel: ObservableObject {
                     self.phase = .discovery
                     self.errorText = message
                 }
-                // 重连成功后补一次握手。prepare 内部有缓存且单飞，重复调用无副作用。
-                if p.isReady {
-                    Task {
-                        do { _ = try await self.session.prepare() }
-                        catch {
-                            // 这里不弹框：真正需要用户看到的失败由连接流程统一处理，
-                            // 但原因要留在日志里，否则又是"链路好了但连不上"的黑箱
-                            self.transport.log("prepare failed: \(error.localizedDescription)")
-                        }
-                    }
-                }
+                // 链路就绪后**不**自动发授权帧。新版固件（v7.7+）只认 JPAKE，
+                // 先发 0x10 会被当成不认识的报文并立刻断链；旧固件的 0x10 也要
+                // 等用户输完 16 位码才有意义。授权一律由用户点「开始配对」触发。
             }
         }
         transport.onStateChange = { [weak self] state in
@@ -207,46 +199,10 @@ final class AppModel: ObservableObject {
                 }
                 return
             }
-            do {
-                // 连接后立刻开始授权握手（不需要配对码）。t:slim 在连接建立后
-                // 迟迟收不到 CentralChallenge 会主动断开，而人工输入 6 位码
-                // 往往要几十秒——等输完再握手，泵已经断开了。
-                try await startAuthorization(retries: 2)
-            } catch {
-                await MainActor.run {
-                    self.errorText = "与该泵开始授权失败：\(error.localizedDescription)"
-                    self.phase = .discovery
-                    self.connectedName = nil
-                    self.currentPumpID = nil
-                    self.transport.disconnect()
-                    self.startScan()
-                }
-                return
-            }
+            // 有保存的凭据就先做 JPAKE 确认（不需要配对码）；
+            // 没有就停在配对页，等用户从泵屏幕上读出 6 位码。
             await attemptResume()
         }
-    }
-
-    /// 开始授权握手，失败时等链路恢复再试。
-    ///
-    /// iOS 一旦完成系统配对，经常会先断一次再自己连回来。此时正在进行的握手
-    /// 必然以「设备已断开」失败，但那是可自愈的中间态——直接弹错会把用户赶回
-    /// 列表，逼他重连一遍。所以这里等一次链路就绪再补发。
-    private func startAuthorization(retries: Int) async throws {
-        var lastError: Error?
-        for attempt in 1...max(1, retries) {
-            do {
-                _ = try await session.prepare()
-                return
-            } catch {
-                lastError = error
-                transport.log("prepare #\(attempt) failed: \(error.localizedDescription)")
-                guard attempt < retries else { break }
-                // 链路若已断开，等它重连回来；已就绪则立即返回，直接重试
-                guard (try? await transport.waitReady(timeout: .seconds(20))) != nil else { break }
-            }
-        }
-        throw lastError ?? BLETransport.TransportError.timeout
     }
 
     /// 连接后优先用已保存的凭据恢复会话；泵不认才退回输入配对码。
@@ -310,7 +266,7 @@ final class AppModel: ObservableObject {
                 phase = .dashboard
                 startPolling()
             } catch {
-                errorText = "配对失败：\(error.localizedDescription)"
+                errorText = "配对失败：\(error.localizedDescription)\n\n请逐项确认：泵上「移动连接」已开、泵上原有的配对设备已解除、t:connect 已彻底退出、输入的是泵屏幕当前显示的码。"
             }
         }
     }
@@ -674,6 +630,19 @@ struct PairingView: View {
             .padding(12)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("先在泵上做这三步").font(.headline)
+                Label("设置 → 蓝牙：打开「移动连接 / Mobile Connection」", systemImage: "1.circle.fill")
+                Label("同一页里若显示已配对的手机，先「解除配对」（泵只记一台）", systemImage: "2.circle.fill")
+                Label("点「配对设备 / Pair Device」，屏幕会显示 6 位数字", systemImage: "3.circle.fill")
+                Text("另外：如果装着 t:connect，先彻底退出（后台也要杀掉），它和本 App 会抢同一台泵。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .font(.footnote)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
             Text("输入泵屏幕上显示的配对码").font(.headline)
             TextField("000000 或 A1B2-C3D4-E5F6-7890", text: $model.pairingCode)
                 .keyboardType(.asciiCapable)
@@ -693,9 +662,9 @@ struct PairingView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(!(JPAKEAuth.normalize(model.pairingCode).count == 6
                             || JPAKEAuth.normalize(model.pairingCode).count == 16))
-            Text("**6 位**：t:slim X2 固件 v7.7 及以上、t:slim Mobi。\n**16 位**：更早的 t:slim X2 固件，泵上常以 4 位一组显示，连字符可保留。")
+            Text("**6 位数字**：t:slim X2 固件 v7.7 及以上、t:slim Mobi，走 EC-JPAKE。\n**16 位字母数字**：更早的 X2 固件，泵上常以 4 位一组显示。")
                 .font(.caption).foregroundStyle(.secondary)
-            Text("配对会进行 EC-JPAKE 密钥协商，约需数秒。若泵提示失败，请在泵上重新生成配对码。")
+            Text("6 位码的配对全程约 3–5 秒，期间会连发 6 条报文，请让 App 保持在前台。失败后泵上会换一个新码，重新读一次。")
                 .font(.caption).foregroundStyle(.secondary)
             Spacer()
         }

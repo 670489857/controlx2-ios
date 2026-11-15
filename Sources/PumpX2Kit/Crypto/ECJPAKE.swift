@@ -19,6 +19,8 @@ public final class ECJPAKE {
     public enum Role { case client, server }
     public enum JPAKEError: Error {
         case invalidState, validationFailed, unexpectedCurve, malformed, emptySecret
+        /// 数据还没收全（对端把一轮拆成两条消息，或载荷尾部带了对齐用的 0）
+        case truncated
     }
 
     private let role: Role
@@ -38,9 +40,14 @@ public final class ECJPAKE {
 
     private var hasPeerRound1 = false
     private var hasPeerRound2 = false
+    /// 对端第一轮可能分两条消息到达，也可能尾部带对齐 0；这里攒起来增量解析
+    private var round1Incoming: [UInt8] = []
     private var myRound1Bytes: [UInt8]?
     private var myRound2Bytes: [UInt8]?
     private var derived: [UInt8]?
+
+    /// 对端第一轮是否已解析完成（1a 只有半轮时仍为 false）
+    public var peerRound1Complete: Bool { hasPeerRound1 }
 
     public init(role: Role, secret: [UInt8], random: RandomSource = SystemRandomSource()) {
         self.role = role
@@ -71,14 +78,22 @@ public final class ECJPAKE {
         return out
     }
 
+    /// 可重复调用：泵把第一轮拆成 1a / 1b 两条消息，各自 165 字节；
+    /// 任一侧的 ZKP 标量若短编码，载荷尾部会带对齐 0，因此按流式增量解析。
     public func readRound1(_ data: [UInt8]) throws {
         guard !hasPeerRound1 else { throw JPAKEError.invalidState }
-        var r = Reader(data)
-        Xp1 = try readPoint(&r)
-        try readZKP(&r, base: P256.generator, X: Xp1!, id: peerId)
-        Xp2 = try readPoint(&r)
-        try readZKP(&r, base: P256.generator, X: Xp2!, id: peerId)
+        round1Incoming += data
+        var r = Reader(round1Incoming)
+        do {
+            Xp1 = try readPoint(&r)
+            try readZKP(&r, base: P256.generator, X: Xp1!, id: peerId)
+            Xp2 = try readPoint(&r)
+            try readZKP(&r, base: P256.generator, X: Xp2!, id: peerId)
+        } catch JPAKEError.truncated {
+            return   // 等下一段
+        }
         hasPeerRound1 = true
+        round1Incoming = []
     }
 
     // MARK: 第二轮
@@ -154,9 +169,14 @@ public final class ECJPAKE {
         throw JPAKEError.malformed
     }
 
-    /// b = rand16 * n + s 只是盲化，标量上等价于 b ≡ s (mod n)
+    /// b = rand16 * n + s 只是盲化，标量上等价于 b ≡ s (mod n)。
+    ///
+    /// 这 16 字节随机消耗**不能省**：它和 pumpX2 / mbedtls 的随机流顺序绑定，
+    /// 省掉之后后面每个标量都会错位一个随机块，结果与泵完全对不上。
     private func mulSecret(_ x: U256, negate: Bool) -> U256 {
-        var r = P256.scalarMul(x, secret)
+        let b16 = U256(bytesBE: random.bytes(16))
+        let blinded = P256.scalarAdd(P256.scalarMul(b16, P256.n), secret)
+        var r = P256.scalarMul(x, blinded)
         if negate { r = P256.scalarNegate(r) }
         return r
     }
@@ -168,9 +188,20 @@ public final class ECJPAKE {
     }
 
     private func readPoint(_ r: inout Reader) throws -> P256.Affine {
-        let len = try r.uint8()
-        let enc = try r.bytes(Int(len))
-        return try P256.decode(enc)
+        let len = try readLengthPrefix(&r)
+        let enc = try r.bytes(len)
+        do { return try P256.decode(enc) }
+        catch { throw JPAKEError.malformed }
+    }
+
+    /// 读 1 字节长度前缀。长度 0 不可能是合法点/标量（最短也是 1 字节），
+    /// 因此把它当作对端载荷尾部的对齐填充跳过。
+    private func readLengthPrefix(_ r: inout Reader) throws -> Int {
+        while true {
+            let len = Int(try r.uint8())
+            if len == 0 { continue }
+            return len
+        }
     }
 
     private func writeZKP(_ out: inout [UInt8], base: P256.Affine, x: U256, X: P256.Affine,
@@ -197,7 +228,10 @@ public final class ECJPAKE {
     private func zkpHash(_ g: P256.Affine, _ v: P256.Affine, _ x: P256.Affine, _ id: [UInt8]) -> U256 {
         var buf: [UInt8] = []
         for p in [g, v, x] {
-            let enc = P256.encodeCompressed(p)
+            // 必须是**非压缩**点（0x04 || X || Y，65 字节）。
+            // 原来用压缩点（33 字节）会让哈希输入与泵端 mbedtls 不一致，
+            // 算出的挑战 h 全错，泵校验 ZKP 失败后直接断链且不给任何回包。
+            let enc = P256.encodeUncompressed(p)
             buf += ByteUtil.u32be(UInt32(enc.count))
             buf += enc
         }
@@ -214,9 +248,9 @@ public final class ECJPAKE {
     }
 
     private func readNum(_ r: inout Reader) throws -> U256 {
-        let len = try r.uint8()
-        guard len >= 1, len <= 32 else { throw JPAKEError.malformed }
-        return P256.scalarReduce(U256(bytesBE: try r.bytes(Int(len))))
+        let len = try readLengthPrefix(&r)
+        guard len <= 32 else { throw JPAKEError.malformed }
+        return P256.scalarReduce(U256(bytesBE: try r.bytes(len)))
     }
 
     private func readCurveId(_ r: inout Reader) throws {
@@ -233,12 +267,12 @@ struct Reader {
     init(_ d: [UInt8]) { data = d }
     var remaining: Int { data.count - offset }
     mutating func uint8() throws -> UInt8 {
-        guard offset < data.count else { throw ECJPAKE.JPAKEError.malformed }
+        guard offset < data.count else { throw ECJPAKE.JPAKEError.truncated }
         defer { offset += 1 }
         return data[offset]
     }
     mutating func bytes(_ n: Int) throws -> [UInt8] {
-        guard n >= 0, offset + n <= data.count else { throw ECJPAKE.JPAKEError.malformed }
+        guard n >= 0, offset + n <= data.count else { throw ECJPAKE.JPAKEError.truncated }
         defer { offset += n }
         return Array(data[offset..<offset + n])
     }
