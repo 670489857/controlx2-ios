@@ -111,6 +111,9 @@ public final class BLETransport: NSObject, PumpLink {
     private var autoReconnect = false
 
     public private(set) var phase: LinkPhase = .idle
+
+    /// 收发记录。排障用，正常路径不读它。
+    public let trace = ProtocolTrace()
     private var pendingWrites: [(data: [UInt8], characteristic: Characteristic,
                                  cont: CheckedContinuation<Void, Error>)] = []
     private var currentWrite: CheckedContinuation<Void, Error>?
@@ -194,6 +197,7 @@ public final class BLETransport: NSObject, PumpLink {
     private func setPhase(_ p: LinkPhase) {
         guard phase != p else { return }
         phase = p
+        trace.add(.note, "phase: \(p.text)")
         onPhase?(p)
     }
 
@@ -283,6 +287,10 @@ public final class BLETransport: NSObject, PumpLink {
         isWriting = true
         currentWrite = item.cont
         let type: CBCharacteristicWriteType = ch.properties.contains(.write) ? .withResponse : .withoutResponse
+        // packet 布局是 [remaining, txId, opCode, ...]，opCode 在第三字节
+        let opCode = item.data.count > 2 ? String(format: "0x%02x", item.data[2]) : "?"
+        trace.addPacket(.tx, item.data,
+                        note: "\(opCode) \(item.characteristic.rawValue.prefix(8)) \(type == .withResponse ? "resp" : "noresp")")
         p.writeValue(Data(item.data), for: ch, type: type)
         if type == .withoutResponse {
             // 无响应写没有系统回调，交给系统即视为完成
@@ -366,6 +374,7 @@ extension BLETransport: CBCentralManagerDelegate {
     /// 否则第一次配对永远走不过去。
     private func handleLinkLoss(reason: String) {
         let id = lastConnectedID
+        trace.add(.note, "link lost: \(reason)")
         resetConnectionState()
         onDisconnect?()
 
@@ -472,6 +481,7 @@ extension BLETransport: CBPeripheralDelegate {
                            didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         guard let data = characteristic.value, !data.isEmpty else { return }
         let bytes = [UInt8](data)
+        trace.addPacket(.rx, bytes, note: String(characteristic.uuid.uuidString.prefix(8)))
         queue.async {
             do {
                 if let frame = try self.assembler.ingest(bytes) {

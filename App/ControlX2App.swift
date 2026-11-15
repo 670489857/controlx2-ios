@@ -3,6 +3,9 @@ import Charts
 import PumpX2Kit
 import PumpX2BLE
 import X2Advisor
+#if canImport(UIKit)
+import UIKit
+#endif
 
 @main
 struct ControlX2App: App {
@@ -117,6 +120,8 @@ final class AppModel: ObservableObject {
                 // 否则自动重连的每一次断开都会打断用户一次
                 self?.connectedName = nil
             }
+            // 会话级状态（instanceId、密钥）必须一起清掉，否则重连后会沿用旧值
+            Task { await self?.session.resetSession() }
         }
         transport.onPhase = { [weak self] p in
             Task { @MainActor in
@@ -125,6 +130,10 @@ final class AppModel: ObservableObject {
                 if case let .failed(message) = p {
                     self.phase = .discovery
                     self.errorText = message
+                }
+                // 重连成功后补一次握手。prepare 内部有缓存，重复调用无副作用。
+                if p.isReady {
+                    Task { try? await self.session.prepare() }
                 }
             }
         }
@@ -183,6 +192,22 @@ final class AppModel: ObservableObject {
             } catch {
                 await MainActor.run {
                     self.errorText = "\(pump.name) 未能建立连接：\(error.localizedDescription)"
+                    self.phase = .discovery
+                    self.connectedName = nil
+                    self.currentPumpID = nil
+                    self.transport.disconnect()
+                    self.startScan()
+                }
+                return
+            }
+            do {
+                // 连接后立刻开始授权握手（不需要配对码）。t:slim 在连接建立后
+                // 迟迟收不到 CentralChallenge 会主动断开，而人工输入 6 位码
+                // 往往要几十秒——等输完再握手，泵已经断开了。
+                try await session.prepare()
+            } catch {
+                await MainActor.run {
+                    self.errorText = "与该泵开始授权失败：\(error.localizedDescription)"
                     self.phase = .discovery
                     self.connectedName = nil
                     self.currentPumpID = nil
@@ -260,6 +285,15 @@ final class AppModel: ObservableObject {
             }
         }
     }
+
+    /// 诊断日志：把最近几百条收发原样导出。排障时这是唯一能区分
+    /// 「报文没发出去」「泵没回」「回了个不相干的」的依据。
+    func traceDump() -> String {
+        let body = transport.trace.dump()
+        return body.isEmpty ? "（还没有收发记录，先连接一次泵）" : body
+    }
+
+    func clearTrace() { transport.trace.clear() }
 
     private func startPolling() {
         pollTask?.cancel()
@@ -683,8 +717,11 @@ struct DashboardView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
 
-                NavigationLink("安全说明与已知限制") { SafetyView() }
-                    .font(.footnote)
+                HStack(spacing: 16) {
+                    NavigationLink("安全说明") { SafetyView() }
+                    NavigationLink("诊断日志") { DiagnosticView() }
+                }
+                .font(.footnote)
 
                 Button(role: .destructive) {
                     showForget = true
@@ -952,5 +989,42 @@ struct SafetyView: View {
             .padding()
         }
         .navigationTitle("安全说明")
+    }
+}
+
+// MARK: - 诊断
+
+struct DiagnosticView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var text = ""
+    @State private var copied = false
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .font(.system(size: 10, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+        }
+        .navigationTitle("诊断日志")
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button(copied ? "已复制" : "复制") {
+                    UIPasteboard.general.string = text
+                    copied = true
+                    Task {
+                        try? await Task.sleep(for: .seconds(2))
+                        copied = false
+                    }
+                }
+                Button("刷新") { load() }
+            }
+        }
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        text = model.traceDump()
     }
 }

@@ -57,6 +57,8 @@ public actor PumpSession {
     private var pumpTimeSinceReset: UInt32 = 0
     private var readerTask: Task<Void, Never>?
     private var appInstanceId: UInt16 = 1
+    /// 已完成的第一步握手结果。连接后立刻拿到，配对时不必重复握手。
+    private var preparedInstanceId: UInt16?
 
     public private(set) var state: SessionState = .idle
     public private(set) var snapshot = Snapshot()
@@ -152,13 +154,41 @@ public actor PumpSession {
         link.updateAuthenticationKey(key)
     }
 
+    /// 连接成功后立刻调用：只做不需要配对码的第一步握手（0x10–0x13）。
+    ///
+    /// 为什么必须提前：t:slim 在 BLE 连接建立后要求授权流程尽快开始，
+    /// 迟迟收不到 CentralChallenge 会主动断开。而人工输入 6 位配对码
+    /// 往往要几十秒——等用户输完再握手，泵已经断开了，表现就是
+    /// 「点开始配对，泵主动断开」，让人误以为是配对码错误。
+    ///
+    /// 返回泵分配的 appInstanceId（权威值，后续所有请求都用它）。
+    @discardableResult
+    public func prepare(hint: UInt16? = nil) async throws -> UInt16 {
+        if let id = preparedInstanceId { return id }
+        let id = try await challengeHandshake(using: hint ?? appInstanceId)
+        appInstanceId = id
+        preparedInstanceId = id
+        return id
+    }
+
+    /// 链路断开时调用：清掉会话级状态，重连后重新握手。
+    /// 不清的话，第二次连接会沿用上一次的 instanceId 与旧密钥。
+    public func resetSession() {
+        preparedInstanceId = nil
+        authKey = nil
+        link.updateAuthenticationKey(nil)
+        for (_, c) in pending { c.resume(throwing: ProtocolError.truncated) }
+        pending.removeAll()
+        state = .idle
+    }
+
     /// 完整配对：输入泵屏幕上的配对码。
     public func pair(code: String,
                      progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws {
         state = .pairing(progress: 0)
         do {
-            let id = try await challengeHandshake(using: appInstanceId)
-            appInstanceId = id
+            // 握手通常已在连接后完成，这里只是取结果；没有才补做
+            let id = try await prepare()
             progress(10)
 
             let auth = try JPAKEAuth(pairingCode: code, appInstanceId: id)
@@ -181,7 +211,7 @@ public actor PumpSession {
                        progress: @escaping @Sendable (Int) -> Void = { _ in }) async throws -> ResumeResult {
         state = .pairing(progress: 0)
         do {
-            let id = try await challengeHandshake(using: saved.appInstanceId)
+            let id = try await prepare(hint: saved.appInstanceId)
             progress(10)
             let auth = try JPAKEAuth(derivedSecret: saved.derivedSecret, appInstanceId: id)
             try await runAuth(auth, progress: progress)
