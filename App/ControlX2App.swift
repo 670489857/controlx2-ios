@@ -54,6 +54,9 @@ final class AppModel: ObservableObject {
     @Published var pairingProgress = 0
     @Published var errorText: String?
     @Published var connectedName: String?
+    /// 链路阶段，来自 BLETransport。用来把"等系统配对弹窗"这件事显示出来，
+    /// 而不是让用户对着一个不动的进度条猜。
+    @Published var linkPhase: BLETransport.LinkPhase = .idle
     @Published var apiVersion: String?
     @Published var insulinUnits: String = "—"
     @Published var lastUpdated: String = "—"
@@ -110,8 +113,19 @@ final class AppModel: ObservableObject {
         }
         transport.onDisconnect = { [weak self] in
             Task { @MainActor in
+                // 断开本身不弹框：要不要报错由 linkPhase 决定，
+                // 否则自动重连的每一次断开都会打断用户一次
                 self?.connectedName = nil
-                self?.errorText = "泵连接已断开"
+            }
+        }
+        transport.onPhase = { [weak self] p in
+            Task { @MainActor in
+                guard let self else { return }
+                self.linkPhase = p
+                if case let .failed(message) = p {
+                    self.phase = .discovery
+                    self.errorText = message
+                }
             }
         }
         transport.onStateChange = { [weak self] state in
@@ -156,18 +170,19 @@ final class AppModel: ObservableObject {
         isScanning = false
         connectedName = pump.name
         currentPumpID = pump.id
+        linkPhase = .connecting
         transport.connect(pump.id)
         phase = .pairing
         pairingProgress = 0
         Task {
             await session.start()
             do {
-                // 先确认链路真的可用再让用户输码。否则连不上时界面照样停在输入页，
-                // 用户输完六位数字才等到一个 timeout，白费一次配对机会。
+                // 先确认链路真的可用再让用户输码。iOS 的系统配对弹窗需要用户手动
+                // 点一下，这期间链路是"连上但未加密"的状态，写什么都失败。
                 try await transport.waitReady()
             } catch {
                 await MainActor.run {
-                    self.errorText = "连接 \(pump.name) 失败：\(error.localizedDescription)"
+                    self.errorText = "\(pump.name) 未能建立连接：\(error.localizedDescription)"
                     self.phase = .discovery
                     self.connectedName = nil
                     self.currentPumpID = nil
@@ -226,6 +241,9 @@ final class AppModel: ObservableObject {
         pairingProgress = 0
         Task {
             do {
+                // 链路可能在输码期间断掉（系统配对未完成时泵会主动断开），
+                // 这里再确认一次，避免把"链路已断"报成"配对码错误"
+                try await transport.waitReady()
                 try await session.pair(code: code) { p in
                     Task { @MainActor in self.pairingProgress = p }
                 }
@@ -238,7 +256,7 @@ final class AppModel: ObservableObject {
                 phase = .dashboard
                 startPolling()
             } catch {
-                errorText = "配对失败：\(error)"
+                errorText = "配对失败：\(error.localizedDescription)"
             }
         }
     }
@@ -549,8 +567,34 @@ struct DiscoveryView: View {
 struct PairingView: View {
     @EnvironmentObject var model: AppModel
 
+    private var linkColor: Color {
+        switch model.linkPhase {
+        case .ready: return .green
+        case .waitingForPairing, .reconnecting: return .orange
+        case .failed: return .red
+        default: return .secondary
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
+            // 第一屏先说清链路状态。iOS 的系统配对弹窗与这里的配对码是两件事，
+            // 不分开讲，用户会把"系统弹窗没点"当成"配对码错"。
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Circle().fill(linkColor).frame(width: 8, height: 8)
+                    Text(model.linkPhase.text).font(.footnote)
+                    if !model.linkPhase.isReady { ProgressView().controlSize(.mini) }
+                }
+                if model.linkPhase.isWaitingForUser {
+                    Text("iPhone 上弹出了「蓝牙配对请求 tslim X2」，点「配对」。如果随后还要输入 PIN，就输泵屏幕上那 6 位码。这一步不做完，下面的配对码发了也没用。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
             Text("输入泵屏幕上显示的配对码").font(.headline)
             TextField("000000 或 A1B2-C3D4-E5F6-7890", text: $model.pairingCode)
                 .keyboardType(.asciiCapable)

@@ -15,6 +15,8 @@ public final class BLETransport: NSObject, PumpLink {
         case poweredOff, unauthorized, notFound, disconnected, timeout, writeFailed
         /// 连上了但没凑齐可写通道。带上计数，把"超时"变成可诊断的信息。
         case notReady(services: Int, characteristics: Int)
+        /// 链路没建立起来，或者建立了但不可用。reason 直接面向用户。
+        case linkFailed(String)
 
         public var errorDescription: String? {
             switch self {
@@ -26,7 +28,45 @@ public final class BLETransport: NSObject, PumpLink {
             case .writeFailed: return "写入失败"
             case let .notReady(s, c):
                 return "已连接，但没找到可用的数据通道（服务 \(s) 个，特征值 \(c) 个）。若服务数为 0，通常是固件版本过旧、没有开放手机控制接口。"
+            case let .linkFailed(reason):
+                return reason
             }
+        }
+    }
+
+    /// 链路阶段。iOS 的系统配对弹窗没有 API 可监听，只能由「订阅请求发出后迟迟不回调」
+    /// 推断，这个枚举就是把那个推断显式化，让界面能提示用户去点弹窗。
+    public enum LinkPhase: Equatable, Sendable {
+        case idle
+        case connecting
+        case discovering
+        /// 已发出需要加密的请求，等用户点系统弹窗
+        case waitingForPairing
+        case ready
+        /// 断了但在自动重连。属于可恢复状态，界面应显示进度而不是弹错误框。
+        case reconnecting(attempt: Int, reason: String)
+        case failed(String)
+
+        public var text: String {
+            switch self {
+            case .idle: return "未连接"
+            case .connecting: return "正在连接泵…"
+            case .discovering: return "正在发现服务…"
+            case .waitingForPairing: return "等待蓝牙配对，请在 iPhone 弹窗上点「配对」"
+            case .ready: return "链路已就绪"
+            case let .reconnecting(attempt, reason): return "\(reason)，正在重连 \(attempt)/2…"
+            case let .failed(m): return m
+            }
+        }
+
+        public var isWaitingForUser: Bool {
+            if case .waitingForPairing = self { return true }
+            return false
+        }
+
+        public var isReady: Bool {
+            if case .ready = self { return true }
+            return false
         }
     }
 
@@ -57,6 +97,20 @@ public final class BLETransport: NSObject, PumpLink {
     private var isConnected = false
     private var serviceCount = 0
     private var characteristicCount = 0
+
+    /// 已提交、尚未回调的订阅请求数。iOS 在等用户点配对弹窗时不会回调，
+    /// 所以这个数字 > 0 就等价于「系统正在等用户确认配对」。
+    private var pendingSubscribe = 0
+    private var subscribedCount = 0
+    private var sawNotifiableCharacteristic = false
+    private var lastSubscribeError: String?
+    private var sawEncryptionError = false
+
+    private var lastConnectedID: UUID?
+    private var reconnectAttempts = 0
+    private var autoReconnect = false
+
+    public private(set) var phase: LinkPhase = .idle
     private var pendingWrites: [(data: [UInt8], characteristic: Characteristic,
                                  cont: CheckedContinuation<Void, Error>)] = []
     private var currentWrite: CheckedContinuation<Void, Error>?
@@ -69,6 +123,8 @@ public final class BLETransport: NSObject, PumpLink {
     public var onDiscover: ((DiscoveredPump) -> Void)?
     public var onStateChange: ((CBManagerState) -> Void)?
     public var onDisconnect: (() -> Void)?
+    /// 链路阶段变化。界面据此提示「去点系统配对弹窗」，而不是干等一个 timeout。
+    public var onPhase: ((LinkPhase) -> Void)?
 
     public override init() {
         var c: AsyncStream<AssembledFrame>.Continuation!
@@ -112,28 +168,52 @@ public final class BLETransport: NSObject, PumpLink {
     public func connect(_ id: UUID) {
         queue.async {
             guard let p = self.discovered[id]
-                ?? self.central.retrievePeripherals(withIdentifiers: [id]).first else { return }
-            self.isReady = false
+                ?? self.central.retrievePeripherals(withIdentifiers: [id]).first else {
+                self.setPhase(.failed("找不到这台设备，请重新扫描"))
+                return
+            }
+            self.autoReconnect = true
+            self.lastConnectedID = id
+            self.resetLinkState()
             self.peripheral = p
             p.delegate = self
+            self.setPhase(.connecting)
             self.central.connect(p, options: nil)
         }
     }
 
     public func disconnect() {
         queue.async {
+            self.autoReconnect = false
             if let p = self.peripheral { self.central.cancelPeripheralConnection(p) }
             self.resetConnectionState()
+            self.setPhase(.idle)
         }
     }
 
-    private func resetConnectionState() {
-        peripheral = nil
+    private func setPhase(_ p: LinkPhase) {
+        guard phase != p else { return }
+        phase = p
+        onPhase?(p)
+    }
+
+    /// 只清链路状态，保留设备标识与重连意图
+    private func resetLinkState() {
         characteristics.removeAll()
         isReady = false
         isConnected = false
         serviceCount = 0
         characteristicCount = 0
+        pendingSubscribe = 0
+        subscribedCount = 0
+        sawNotifiableCharacteristic = false
+        lastSubscribeError = nil
+        sawEncryptionError = false
+    }
+
+    private func resetConnectionState() {
+        peripheral = nil
+        resetLinkState()
         isWriting = false
         let waiting = pendingWrites
         pendingWrites.removeAll()
@@ -146,16 +226,25 @@ public final class BLETransport: NSObject, PumpLink {
         queue.async { self.assembler.authKey = key }
     }
 
-    /// 轮询等待服务发现完成。连接后特征值可能还没齐，此时写入会失败。
-    private func waitUntilReady(timeout: Duration = .seconds(8)) async throws {
+    /// 轮询等待链路可用。
+    ///
+    /// 默认给 45 秒：iOS 的蓝牙配对弹窗需要用户手动点，等 8 秒必然超时，
+    /// 而超时后界面报"配对失败"，用户会误以为是配对码错了。
+    private func waitUntilReady(timeout: Duration = .seconds(45)) async throws {
         let deadline = ContinuousClock.now + timeout
         while ContinuousClock.now < deadline {
-            let ready = queue.sync { self.isReady }
+            let (ready, phase) = queue.sync { (self.isReady, self.phase) }
             if ready { return }
+            if case let .failed(reason) = phase {
+                throw TransportError.linkFailed(reason)
+            }
             try await Task.sleep(for: .milliseconds(80))
         }
-        let (connected, s, c) = queue.sync {
-            (self.isConnected, self.serviceCount, self.characteristicCount)
+        let (connected, s, c, phase) = queue.sync {
+            (self.isConnected, self.serviceCount, self.characteristicCount, self.phase)
+        }
+        if phase.isWaitingForUser {
+            throw TransportError.linkFailed("蓝牙配对没有完成：系统弹窗上没有点「配对」，或点了取消")
         }
         // 还没连上和服务发现了但没特征值，是两种完全不同的故障，不能共用一条文案
         if !connected { throw TransportError.timeout }
@@ -164,14 +253,15 @@ public final class BLETransport: NSObject, PumpLink {
 
     /// 供上层在进入配对界面之前显式确认链路可用。
     /// 不这样做的话，连接失败时界面会停在"输入配对码"，用户输完才看到超时。
-    public func waitReady(timeout: Duration = .seconds(6)) async throws {
+    public func waitReady(timeout: Duration = .seconds(45)) async throws {
         try await waitUntilReady(timeout: timeout)
     }
 
     // MARK: 写入
 
     public func write(_ packets: [[UInt8]], to characteristic: Characteristic) async throws {
-        try await waitUntilReady()
+        // 一旦断开就快速失败：这里再等 45 秒只会让用户对着转圈发呆
+        try await waitUntilReady(timeout: .seconds(5))
         for packet in packets {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 queue.async {
@@ -244,6 +334,8 @@ extension BLETransport: CBCentralManagerDelegate {
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         peripheral.delegate = self
         isConnected = true
+        reconnectAttempts = 0
+        setPhase(.discovering)
         // 不指定服务列表：留空才会枚举全部。指定错一个 UUID 的代价是
         // "连接成功但没有任何特征值"，这条路径没有可观测的报错，只有超时。
         peripheral.discoverServices(nil)
@@ -251,14 +343,65 @@ extension BLETransport: CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager,
                                didFailToConnect peripheral: CBPeripheral, error: Error?) {
-        resetConnectionState()
-        onDisconnect?()
+        handleLinkLoss(reason: error.map { "连接失败：\(describe($0))" } ?? "连接失败")
     }
 
     public func centralManager(_ central: CBCentralManager,
                                didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        let reason: String
+        if let error {
+            reason = "连接中断：\(describe(error))"
+        } else if sawEncryptionError || phase.isWaitingForUser {
+            // iOS 在 SMP 未完成时会直接断开且 error 为 nil，这是最容易误判成"配对码错"的一条路径
+            reason = "蓝牙配对没有完成，泵断开了连接"
+        } else {
+            reason = "连接已断开"
+        }
+        handleLinkLoss(reason: reason)
+    }
+
+    /// 链路丢失的统一出口：先决定能否自动重连，再决定报什么。
+    ///
+    /// iOS 在系统配对完成后常会断开一次再重连成功，所以这里必须重连，
+    /// 否则第一次配对永远走不过去。
+    private func handleLinkLoss(reason: String) {
+        let id = lastConnectedID
         resetConnectionState()
         onDisconnect?()
+
+        guard autoReconnect, let id, reconnectAttempts < 2 else {
+            let hint = autoReconnect
+                ? "\(reason)。若反复失败：iOS 设置 → 蓝牙 → 忽略「tslim X2」，泵上删除已配对设备，再重试。"
+                : reason
+            setPhase(.failed(hint))
+            return
+        }
+        reconnectAttempts += 1
+        let attempt = reconnectAttempts
+        setPhase(.reconnecting(attempt: attempt, reason: reason))
+        queue.asyncAfter(deadline: .now() + 1.5) {
+            guard self.autoReconnect, self.lastConnectedID == id else { return }
+            self.connect(id)
+        }
+    }
+
+    /// 把 CoreBluetooth 的错误码翻成人能读的原因，尤其是加密相关的几条。
+    private func describe(_ error: Error) -> String {
+        let ns = error as NSError
+        if ns.domain == CBErrorDomain, let code = CBError.Code(rawValue: ns.code) {
+            switch code {
+            case .peerRemovedPairingInformation: return "泵上没有保留这台手机的配对信息"
+            case .connectionTimeout: return "连接超时"
+            case .peripheralDisconnected: return "泵主动断开"
+            case .connectionLimitReached: return "泵已连满（另一台设备正占着）"
+            default: break
+            }
+        }
+        if ns.domain == CBATTErrorDomain, let code = CBATTError.Code(rawValue: ns.code) {
+            if code == .insufficientEncryption { return "链路未加密（系统配对未完成）" }
+            if code == .insufficientAuthentication { return "链路未认证（系统配对未完成）" }
+        }
+        return error.localizedDescription
     }
 }
 
@@ -266,6 +409,10 @@ extension BLETransport: CBPeripheralDelegate {
     public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         let services = peripheral.services ?? []
         serviceCount = services.count
+        if services.isEmpty {
+            setPhase(.failed("泵没有暴露任何服务，通常是固件版本过旧、未开放手机控制接口"))
+            return
+        }
         for s in services {
             peripheral.discoverCharacteristics(nil, for: s)
         }
@@ -279,15 +426,46 @@ extension BLETransport: CBPeripheralDelegate {
             guard let known = Characteristic(rawValue: ch.uuid.uuidString.uppercased()) else { continue }
             characteristics[known] = ch
             if ch.properties.contains(.notify) || ch.properties.contains(.indicate) {
+                // 这一句就是系统配对弹窗的触发点：订阅需要加密的特征值时，
+                // iOS 自己弹「蓝牙配对请求」，我们无法预先控制，只能等回调。
+                sawNotifiableCharacteristic = true
+                pendingSubscribe += 1
                 peripheral.setNotifyValue(true, for: ch)
             }
         }
-        // 配对只需要 authorization，读状态需要 currentStatus。两者任一就绪即可放行，
-        // 否则 pairing 会被一个用不到的 currentStatus 卡住。
-        if characteristics[.authorization] != nil || characteristics[.currentStatus] != nil {
-            isReady = true
-            drain()
+        evaluateReadiness()
+    }
+
+    /// 订阅结果即加密结果。回调 nil 才代表 SMP 完成、链路可用。
+    public func peripheral(_ peripheral: CBPeripheral,
+                           didUpdateNotificationStateFor characteristic: CBCharacteristic,
+                           error: Error?) {
+        pendingSubscribe = max(0, pendingSubscribe - 1)
+        if let error {
+            lastSubscribeError = describe(error)
+        } else {
+            subscribedCount += 1
         }
+        evaluateReadiness()
+    }
+
+    /// 就绪判定：拿到 authorization 特征，且所有订阅请求都有回调。
+    /// 订阅全失败说明加密没建立，此时不能放行——否则后面每个写都会以失败告终，
+    /// 用户看到的却是"配对码错误"。
+    private func evaluateReadiness() {
+        guard characteristics[.authorization] != nil || characteristics[.currentStatus] != nil else { return }
+        guard pendingSubscribe == 0 else {
+            setPhase(.waitingForPairing)
+            return
+        }
+        if sawNotifiableCharacteristic && subscribedCount == 0 {
+            let reason = lastSubscribeError ?? "订阅失败"
+            setPhase(.failed("蓝牙配对未完成（\(reason)）"))
+            return
+        }
+        isReady = true
+        setPhase(.ready)
+        drain()
     }
 
     public func peripheral(_ peripheral: CBPeripheral,
@@ -311,6 +489,16 @@ extension BLETransport: CBPeripheralDelegate {
         currentWrite = nil
         isWriting = false
         if let error {
+            // 写操作也可能成为加密的触发点（订阅没过但读写在先时）。这类失败不是
+            // 协议错误，把它标出来，界面才不会引导用户去怀疑配对码。
+            let ns = error as NSError
+            if ns.domain == CBATTErrorDomain,
+               let code = CBATTError.Code(rawValue: ns.code),
+               code == .insufficientEncryption || code == .insufficientAuthentication {
+                sawEncryptionError = true
+                isReady = false
+                setPhase(.waitingForPairing)
+            }
             cont?.resume(throwing: error)
         } else {
             cont?.resume()
