@@ -37,8 +37,13 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: ControlX2
+        # 必须显式绑定：xcodegen 在没写这两项时会填死 1.0 / 1，
+        # 于是 xcodebuild 的 MARKETING_VERSION 覆盖对 Info.plist 完全无效，
+        # 产物文件名上的版本就成了假的。
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         # 装完后能在 App 内核对「手里这个包对应哪个提交」，不用回 CI 翻日志
-        BuildGitSHA: $(BUILD_GIT_SHA)
+        BuildGitSHA: "$(BUILD_GIT_SHA)"
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
