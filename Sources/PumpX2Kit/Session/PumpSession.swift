@@ -109,7 +109,10 @@ public actor PumpSession {
         let id = nextTxId()
         let packets = try Packetize.encode(message, txId: id, authKey: authKey ?? [],
                                            pumpTimeSinceReset: pumpTimeSinceReset)
-        try await link.write(packets, to: message.characteristic)
+
+        // 先登记待回复，再写。反过来会丢第一帧：泵的回包可能比 write 返回还快，
+        // 此时 pending 里还没有这个 opCode，dispatch 找不到接收者就把帧丢了，
+        // 然后白等满 8 秒超时——表现为「发出去没回音」，极难与链路问题区分。
         return try await withCheckedThrowingContinuation { cont in
             // 用 updateValue 而不是下标赋值：Swift 5.9 会把 actor 内的下标 setter
             // 展开成 async inout 调用并拒绝编译，与逻辑无关，纯属编译器限制。
@@ -118,6 +121,17 @@ public actor PumpSession {
                 try? await Task.sleep(for: timeout)
                 if let c = await self?.takePending(opCode) {
                     c.resume(throwing: ProtocolError.truncated)
+                }
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    try await self.link.write(packets, to: message.characteristic)
+                } catch {
+                    // 写失败要把等回复的 continuation 收掉，否则调用方要等到超时
+                    if let c = await self.takePending(opCode) {
+                        c.resume(throwing: error)
+                    }
                 }
             }
         }
