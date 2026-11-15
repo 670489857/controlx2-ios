@@ -3,6 +3,7 @@ name: iOS
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   workflow_dispatch:
 
 concurrency:
@@ -28,6 +29,35 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
+        with:
+          # commit 计数与短 SHA 都需要完整历史，浅克隆会让构建号漂移
+          fetch-depth: 0
+
+      # 版本号只有一个来源：仓库根的 VERSION 文件。
+      # 构建号用提交数（单调递增、与代码状态一一对应），短 SHA 用于精确定位。
+      - name: 解析版本
+        id: ver
+        run: |
+          set -euo pipefail
+          APP_VERSION=$(tr -d '[:space:]' < VERSION)
+          if [ -z "$APP_VERSION" ]; then
+            echo "::error::VERSION 文件为空"
+            exit 1
+          fi
+          SPEC_VERSION=$(grep -oE 'MARKETING_VERSION: *"[^"]+"' project.yml | head -1 | sed -E 's/.*"(.*)"/\1/')
+          echo "VERSION=$APP_VERSION  project.yml=$SPEC_VERSION"
+          if [ "$APP_VERSION" != "$SPEC_VERSION" ]; then
+            echo "::error::版本号不一致：VERSION 是 $APP_VERSION，project.yml 是 $SPEC_VERSION"
+            exit 1
+          fi
+          BUILD_NUMBER=$(git rev-list --count HEAD)
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "版本 $APP_VERSION / 构建 $BUILD_NUMBER / $SHA"
+          {
+            echo "version=$APP_VERSION"
+            echo "build=$BUILD_NUMBER"
+            echo "sha=$SHA"
+          } >> "$GITHUB_OUTPUT"
 
       - name: 环境信息
         run: |
@@ -42,6 +72,10 @@ jobs:
         run: xcodegen generate
 
       - name: 编译（不签名）
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+          BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+          BUILD_GIT_SHA: ${{ steps.ver.outputs.sha }}
         run: |
           set -o pipefail
           xcodebuild \
@@ -50,6 +84,9 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
+            MARKETING_VERSION="$APP_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            BUILD_GIT_SHA="$BUILD_GIT_SHA" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -58,26 +95,68 @@ jobs:
             (grep -E "error:|warning: .*deprecated|BUILD FAILED" build.log | head -60; exit 1)
 
       - name: 打包 IPA
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+          BUILD_NUMBER: ${{ steps.ver.outputs.build }}
+          SHA: ${{ steps.ver.outputs.sha }}
         run: |
+          set -euo pipefail
           APP="build/Build/Products/Release-iphoneos/ControlX2.app"
           test -d "$APP" || { echo "找不到 .app，编译未产出"; exit 1; }
-          mkdir -p Payload
-          cp -R "$APP" Payload/
-          zip -qry ControlX2-unsigned.ipa Payload
-          ls -lh ControlX2-unsigned.ipa
-          echo "BundleSwift 路径: $(find Payload -name 'PumpX2Kit*' -o -name '*.swiftmodule' | head -5)"
+
+          # 核对注入是否真的生效：Info.plist 没被改写的话，文件名上的版本就是假的
+          PLIST_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$APP/Info.plist")
+          PLIST_BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$APP/Info.plist")
+          PLIST_SHA=$(/usr/libexec/PlistBuddy -c "Print :BuildGitSHA" "$APP/Info.plist" 2>/dev/null || echo "")
+          echo "plist: $PLIST_VERSION ($PLIST_BUILD) $PLIST_SHA"
+          if [ "$PLIST_VERSION" != "$APP_VERSION" ] || [ "$PLIST_BUILD" != "$BUILD_NUMBER" ]; then
+            echo "::error::Info.plist 版本未按预期注入，产物会名不副实"
+            exit 1
+          fi
+
+          NAME="ControlX2-$APP_VERSION-b$BUILD_NUMBER-$SHA"
+          mkdir -p dist/Payload
+          cp -R "$APP" dist/Payload/
+          (cd dist && zip -qry "$NAME.ipa" Payload && rm -rf Payload)
+          ls -lh "dist/$NAME.ipa"
+
+          {
+            echo "version: $APP_VERSION"
+            echo "build: $BUILD_NUMBER"
+            echo "sha: $SHA"
+            echo "commit_time: $(git log -1 --format=%cI)"
+            echo "branch: ${GITHUB_REF_NAME}"
+            echo "workflow_run: $GITHUB_RUN_ID"
+            echo "ipa: $NAME.ipa"
+            echo "size_bytes: $(stat -f%z "dist/$NAME.ipa")"
+          } > dist/build-info.txt
+          cat dist/build-info.txt
+          echo "IPA_NAME=$NAME" >> "$GITHUB_ENV"
+
+      - name: 写入构建摘要
+        run: |
+          {
+            echo "### ControlX2 ${{ steps.ver.outputs.version }} (build ${{ steps.ver.outputs.build }})"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| IPA | \`${IPA_NAME}.ipa\` |"
+            echo "| 提交 | \`${{ steps.ver.outputs.sha }}\` |"
+            echo "| 分支 | \`${GITHUB_REF_NAME}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: ControlX2-unsigned-ipa
-          path: ControlX2-unsigned.ipa
-          retention-days: 30
+          # 产物名带版本，历史构建不会互相盖住
+          name: ControlX2-${{ steps.ver.outputs.version }}-b${{ steps.ver.outputs.build }}
+          path: dist/
+          retention-days: 90
 
       - name: 上传编译日志
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-b${{ steps.ver.outputs.build }}
           path: build.log
           retention-days: 7

@@ -12,6 +12,29 @@ struct ControlX2App: App {
     }
 }
 
+/// 构建信息。版本号来自仓库根的 VERSION 文件，由 CI 注入到
+/// MARKETING_VERSION / CURRENT_PROJECT_VERSION / BuildGitSHA。
+/// 目的很实际：手上同时有几个 IPA 时，能一眼确认装的是哪一版、对应哪个提交。
+enum BuildInfo {
+    static var version: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+    }
+
+    static var build: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+    }
+
+    static var gitSHA: String {
+        let sha = Bundle.main.object(forInfoDictionaryKey: "BuildGitSHA") as? String ?? ""
+        // 未替换的 $(BUILD_GIT_SHA) 说明是不带注入的本地构建，别把它当提交号显示
+        return sha.isEmpty || sha.hasPrefix("$(") ? "local" : sha
+    }
+
+    static var display: String { "\(version) (\(build))" }
+
+    static var full: String { gitSHA == "local" ? display : "\(display) · \(gitSHA)" }
+}
+
 /// UI 层状态机。只负责展示与用户动作，协议细节全部在 PumpX2Kit。
 @MainActor
 final class AppModel: ObservableObject {
@@ -636,6 +659,10 @@ struct DashboardView: View {
                 Text("本版本只读取状态，不含任何输注指令。")
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.top, 4)
+
+                Text("版本 \(BuildInfo.full)")
+                    .font(.caption2).foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
             }
             .padding()
         }

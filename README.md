@@ -9,7 +9,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ---
 
-## 当前实现范围（v0.1）
+## 当前实现范围（v0.2）
 
 | 能力 | 状态 | 说明 |
 |---|---|---|
@@ -49,11 +49,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 现成产物
 
-`ControlX2-unsigned.ipa`（283 KB，arm64，iOS 17+，构建号 `1557c5b`）由 GitHub Actions 的 macOS runner 编译产出：
-
-```
-SHA-256: ca3db061069c37f3886a24d1c80c0eedc039ae70260600beb48768361fbbd2ce
-```
+当前版本 `0.2.0`，产物名形如 `ControlX2-0.2.0-b<N>-<短SHA>.ipa`（arm64，iOS 17+），在 GitHub Actions 的对应 artifact 里，与 `build-info.txt` 一起下载。每次构建的版本、构建号、提交都不同，**以文件名和 `build-info.txt` 为准**，不要凭大小或上传时间判断新旧。
 
 **未签名**，iOS 会拒绝直接安装，必须先用 Apple ID 重签（见下方「云端构建」）。签名后即可在真机运行，首次启动需连接泵并输入配对码。
 
@@ -66,15 +62,38 @@ SHA-256: ca3db061069c37f3886a24d1c80c0eedc039ae70260600beb48768361fbbd2ce
 
 ## 构建
 
+### 版本号怎么定
+
+版本号只有一个来源：仓库根的 [`VERSION`](VERSION)。`project.yml` 的 `MARKETING_VERSION` 必须与它相同，CI 会校验，不一致直接失败而不是出一个名字好听的错包。
+
+| 项 | 取值 | 例 |
+|---|---|---|
+| 版本 | `VERSION` 文件 | `0.2.0` |
+| 构建号 | `git rev-list --count HEAD` | `42` |
+| 提交 | 短 SHA | `a1b2c3d` |
+| 产物名 | `ControlX2-<版本>-b<构建号>-<SHA>.ipa` | `ControlX2-0.2.0-b42-a1b2c3d.ipa` |
+| Artifact | `ControlX2-<版本>-b<构建号>` | `ControlX2-0.2.0-b42` |
+
+构建号随提交单调递增，所以同一个版本号多次构建也能区分先后。App 状态页底部会显示 `版本 0.2.0 (42) · a1b2c3d`，装完可以直接核对手上这个包对应哪次提交。
+
+改版本：
+
+```bash
+python3 Tools/bump_version.py patch    # 0.2.0 -> 0.2.1，同时改 project.yml 与 CHANGELOG
+git add -A && git commit -m "release: v0.2.1" && git push
+```
+
+CI 还会做一道校验：打包后从 `.app/Info.plist` 里读回 `CFBundleShortVersionString` 和 `CFBundleVersion`，与预期不符就失败。文件名上的版本号必须是包里真的版本，否则核对手册就成了摆设。
+
 ### 方式一：云端构建（不需要 Mac）
 
-推送到 `main` 或手动触发 `iOS` workflow，GitHub 会在 macOS runner 上编译，产出**未签名** `ControlX2-unsigned.ipa`：
+推送到 `main`（或推 `v*` tag、手动触发）`iOS` workflow，GitHub 会在 macOS runner 上编译，产出**未签名** IPA：
 
 ```
-仓库 → Actions → iOS → 最近一次运行 → Artifacts → ControlX2-unsigned-ipa
+仓库 → Actions → iOS → 最近一次运行 → Artifacts → ControlX2-0.2.0-b42
 ```
 
-流水线做两件事：`ubuntu` 容器里跑 `swift test`（协议层，几秒），`macos-15` 上 `xcodegen` + `xcodebuild` 出包。编译失败时 `build-log` artifact 里有完整日志。
+产物目录里有两个文件：`ControlX2-<版本>-b<构建号>-<SHA>.ipa` 和 `build-info.txt`（版本、构建号、提交、提交时间、分支、大小）。流水线做两件事：`ubuntu` 容器里跑 `swift test`（协议层，几秒），`macos-15` 上 `xcodegen` + `xcodebuild` 出包。编译失败时 `build-log-b<构建号>` artifact 里有完整日志。
 
 > 私有仓库的 macOS runner 按 **10 倍**分钟计费，一次构建约消耗 50–80 分钟额度。公开仓库免费。
 
