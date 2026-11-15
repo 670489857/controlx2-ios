@@ -108,7 +108,7 @@ def main() -> None:
 
     write_version(new)
     print(f"版本 {current} -> {new}")
-    print(f"已同步: VERSION, project.yml, CHANGELOG.md")
+    print("已同步: VERSION, project.yml, CHANGELOG.md")
     print("")
     print("下一步:")
     print("  git add -A && git commit -m \"release: v" + new + "\" && git push")
