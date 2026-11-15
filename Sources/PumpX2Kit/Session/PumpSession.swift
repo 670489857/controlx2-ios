@@ -92,8 +92,15 @@ public actor PumpSession {
     // MARK: 请求
 
     private func nextTxId() -> UInt8 {
+        // 先取当前值、再递增，与 pumpX2 的 TransactionId 完全一致：
+        //   byte currentTxId = Packetize.txId.get();  // 0
+        //   Packetize.txId.increment();               // 1
+        // 也就是每次新连接的第一条消息事务号必须是 0。
+        // 反过来写（先加后返回）会让首条变成 1，泵按事务号顺序校验时
+        // 等于看到「0 号事务凭空丢了」，直接断链且不给任何回应。
+        let id = txId
         txId = txId &+ 1
-        return txId
+        return id
     }
 
     private func request(_ message: PumpMessage, expecting opCode: UInt8,

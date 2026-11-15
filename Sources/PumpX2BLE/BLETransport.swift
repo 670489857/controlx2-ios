@@ -362,6 +362,13 @@ extension BLETransport: CBCentralManagerDelegate {
 
     public func centralManager(_ central: CBCentralManager,
                                didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        // 原始码要留下：同一个 "泵主动断开" 文案可能对应泵删了配对信息、
+        // 连接超限、或单纯的对端关闭，三者的处理方式完全不同。
+        if let ns = error as NSError? {
+            trace.add(.note, "disconnect code: \(ns.domain) \(ns.code)")
+        } else {
+            trace.add(.note, "disconnect: no error (对端关闭或系统回收)")
+        }
         let reason: String
         if let error {
             reason = "连接中断：\(describe(error))"

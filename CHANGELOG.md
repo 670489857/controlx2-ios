@@ -6,6 +6,29 @@
 
 产物命名：`ControlX2-<版本>-b<构建号>-<短SHA>.ipa`。
 
+## 0.2.4 — 2026-11-16
+
+### 修复
+
+- **首条消息的事务号从 0 开始**。pumpX2 的 `TransactionId` 是「取当前值再递增」，初值 0，
+  抓包里首条 `CentralChallenge` 也是 `00 00 10 00 0a …`（分片头与帧头 txId 均为 0）。
+  原实现先加后返回，首条变成 1，泵看到的序列缺了起点，直接断链且不回任何报文——
+  日志里正是「发出一条 0x10、零条 RX、1 秒后断开」。
+  这是从 0.1.0 起就存在的偏差，抓包 txId 恰好为 0 让它在对比中看不出来。
+
+### 诊断
+
+- 断开时记录 CBError 的原始域与码，区分「泵删了配对信息 / 连接超限 / 对端关闭」
+- 新增 `testFirstTransactionIdIsZero`；把实现改回先加后返回，该用例立即失败
+
+### 核对结论（本轮逐项比对 pumpX2 源码）
+
+- 报文布局 `[remaining, txId, opCode, txId, len, cargo, crc16]`：一致
+- `CentralChallenge` cargo = appInstanceId(2 LE) + 8 字节挑战：一致
+- CRC-16/CCITT（poly 0x1021，初值 0xFFFF，小端追加）：抓包与本机报文双向复算均吻合
+- 特征值 `7B83FFF9`（AUTHORIZATION）、写类型 `WITH_RESPONSE`：一致
+
+
 ## 0.2.3 — 2026-11-15
 
 ### 修复

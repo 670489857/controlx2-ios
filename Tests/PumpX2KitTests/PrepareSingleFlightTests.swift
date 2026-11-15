@@ -7,6 +7,7 @@ private final class CountingLink: PumpLink {
     let frames: AsyncStream<AssembledFrame>
     private let lock = NSLock()
     private var sent: [UInt8] = []
+    private var txIds: [UInt8] = []
 
     init() {
         var c: AsyncStream<AssembledFrame>.Continuation!
@@ -21,12 +22,17 @@ private final class CountingLink: PumpLink {
         return sent.filter { $0 == opCode }.count
     }
 
+    func firstTxId() -> UInt8? {
+        lock.lock(); defer { lock.unlock() }
+        return txIds.first
+    }
+
     func write(_ packets: [[UInt8]], to characteristic: Characteristic) async throws {
         guard let first = packets.first else { return }
         // packet 布局：[remaining, txId, opCode, len, ...]
         let opCode = first[2]
         let txId = first[1]
-        lock.lock(); sent.append(opCode); lock.unlock()
+        lock.lock(); sent.append(opCode); txIds.append(txId); lock.unlock()
 
         // 故意延迟回包，让第二个请求有机会在第一个完成前进入——这正是
         // actor 在 await 处重入的窗口，没有单飞就会连发两个 0x10。
@@ -83,4 +89,20 @@ final class PrepareSingleFlightTests: XCTestCase {
         XCTAssertEqual(link.count(of: 0x10), 1)
     }
 
+
+    /// 新连接的第一条消息事务号必须是 0。
+    ///
+    /// pumpX2 的 TransactionId 是「取当前值再递增」，初值 0；抓包里的首条
+    /// CentralChallenge 也是 `00 00 10 00 0a …`（分片头 txId=0、帧头 txId=0）。
+    /// 先加后返回会让首条变成 1，泵按事务号顺序校验时等于看到一个不存在于
+    /// 序列中的起点，直接断链且不回任何报文。
+    func testFirstTransactionIdIsZero() async throws {
+        let link = CountingLink()
+        let session = PumpSession(link: link)
+        await session.start()
+
+        _ = try await session.prepare()
+
+        XCTAssertEqual(link.firstTxId(), 0, "首条消息的 txId 必须是 0")
+    }
 }
