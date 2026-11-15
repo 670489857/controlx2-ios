@@ -29,13 +29,13 @@ final class CredentialsTests: XCTestCase {
     func testResumeStartsAtConfirmStep() throws {
         let auth = try JPAKEAuth(derivedSecret: [UInt8](repeating: 7, count: 32))
         XCTAssertEqual(auth.step.rawValue, JPAKEAuth.Step.confirmInitial.rawValue)
-        XCTAssertEqual(auth.appInstanceId, 1)
+        XCTAssertEqual(auth.appInstanceId, 0, "与 t:connect 抓包一致")
 
         let first = try XCTUnwrap(try auth.nextRequest())
         XCTAssertEqual(first.opCode, 0x26)
         XCTAssertEqual(first.characteristic, .authorization)
         // 请求体 = 2 字节 appInstanceId + 空载荷
-        XCTAssertEqual(first.cargo, [1, 0])
+        XCTAssertEqual(first.cargo, [0, 0])
     }
 
     func testResumeRejectsWrongSecretLength() {

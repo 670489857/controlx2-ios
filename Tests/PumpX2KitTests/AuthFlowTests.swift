@@ -10,17 +10,11 @@ final class ScriptedLink: PumpLink {
     private var _records: [(op: UInt8, txId: UInt8, cargo: [UInt8])] = []
     /// 请求 opCode → (回复 opCode, 回复 cargo)
     private var script: [UInt8: (UInt8, [UInt8])] = [:]
-    private var _onWrite: ((UInt8) -> Void)?
 
     init() {
         var c: AsyncStream<AssembledFrame>.Continuation!
         frames = AsyncStream { c = $0 }
         continuation = c
-    }
-
-    var onWrite: ((UInt8) -> Void)? {
-        get { lock.lock(); defer { lock.unlock() }; return _onWrite }
-        set { lock.lock(); _onWrite = newValue; lock.unlock() }
     }
 
     func reply(to op: UInt8, with responseOp: UInt8, cargo: [UInt8]) {
@@ -37,7 +31,7 @@ final class ScriptedLink: PumpLink {
     func updateAuthenticationKey(_ key: [UInt8]?) {}
 
     func write(_ packets: [[UInt8]], to characteristic: Characteristic) async throws {
-        // 分片格式：[remaining, txId, ...]；remaining 为 0 表示整帧结束
+        // 分片格式：[remaining, txId, ...]；把各片载荷顺序拼回整帧
         var frame: [UInt8] = []
         var txId: UInt8 = 0
         for p in packets {
@@ -54,8 +48,6 @@ final class ScriptedLink: PumpLink {
         let response = script[op]
         lock.unlock()
 
-        onWrite?(op)
-
         if let (respOp, respCargo) = response {
             continuation.yield(.init(opCode: respOp, txId: txId, cargo: respCargo,
                                      signed: false, hmacVerified: false))
@@ -65,6 +57,17 @@ final class ScriptedLink: PumpLink {
 
 final class AuthFlowTests: XCTestCase {
 
+    /// 等到链路记录里出现第一条报文（最多 2 秒）
+    private func waitForFirstFrame(_ link: ScriptedLink,
+                                   _ file: StaticString = #filePath,
+                                   _ line: UInt = #line) async {
+        for _ in 0..<100 {
+            if !link.records.isEmpty { return }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("2 秒内没有发出任何报文", file: file, line: line)
+    }
+
     /// 6 位码必须直接进 JPAKE：首条报文是 0x20（Jpake1a），且全程不能出现 0x10。
     ///
     /// 这是上一版跑不通的根因：连接后先发了 0x10 中央挑战。v7.7+ 的泵只认
@@ -72,38 +75,37 @@ final class AuthFlowTests: XCTestCase {
     /// 「TX 17B 00 00 10 …」紧跟一条 disconnect，零 RX。
     func testSixDigitCodeStartsJpake() async {
         let link = ScriptedLink()
-        let first = expectation(description: "首帧已发出")
-        link.onWrite = { op in if op == 0x20 { first.fulfill() } }
         let session = PumpSession(link: link)
         await session.start()
 
         Task { try? await session.pair(code: "123456") }
-        await fulfillment(of: [first], timeout: 5)
+        await waitForFirstFrame(link)
 
-        XCTAssertEqual(link.ops.first, 0x20, "6 位码的第一条必须是 Jpake1a")
+        let first = link.records[0]
+        XCTAssertEqual(first.op, 0x20, "6 位码的第一条必须是 Jpake1a")
         XCTAssertFalse(link.ops.contains(0x10), "6 位码路径不允许出现 CentralChallenge")
-        XCTAssertEqual(link.records.first?.txId, 0, "新连接首帧事务号必须是 0")
-        XCTAssertEqual(link.records.first?.cargo.count, 167, "Jpake1a cargo 固定 167 字节")
+        XCTAssertEqual(first.txId, 0, "新连接首帧事务号必须是 0")
+        XCTAssertEqual(first.cargo.count, 167, "Jpake1a cargo 固定 167 字节")
         // appInstanceId 为 0，与 t:connect 抓包一致
-        XCTAssertEqual(link.records.first?.cargo[0], 0)
-        XCTAssertEqual(link.records.first?.cargo[1], 0)
+        XCTAssertEqual(first.cargo[0], 0)
+        XCTAssertEqual(first.cargo[1], 0)
     }
 
     /// 已存凭据的快速重连：首条是 0x26（Jpake3SessionKey），同样不能有 0x10。
     func testResumeStartsAtSessionKey() async {
         let link = ScriptedLink()
-        let first = expectation(description: "首帧已发出")
-        link.onWrite = { op in if op == 0x26 { first.fulfill() } }
         let session = PumpSession(link: link)
         await session.start()
 
-        let saved = PumpCredentials(appInstanceId: 0, derivedSecret: [UInt8](repeating: 0x11, count: 32))
+        let saved = PumpCredentials(appInstanceId: 0,
+                                    derivedSecret: [UInt8](repeating: 0x11, count: 32))
         Task { _ = try? await session.resume(with: saved) }
-        await fulfillment(of: [first], timeout: 5)
+        await waitForFirstFrame(link)
 
-        XCTAssertEqual(link.ops.first, 0x26)
+        let first = link.records[0]
+        XCTAssertEqual(first.op, 0x26)
         XCTAssertFalse(link.ops.contains(0x10))
-        XCTAssertEqual(link.records.first?.cargo.count, 2, "Jpake3SessionKey cargo 只有 appInstanceId")
+        XCTAssertEqual(first.cargo.count, 2, "Jpake3SessionKey cargo 只有 appInstanceId")
     }
 
     /// 16 位旧固件码：0x10 → 0x12，且 0x12 的载荷是对**配对码**做 HMAC-SHA1。
@@ -135,13 +137,11 @@ final class AuthFlowTests: XCTestCase {
     /// 认证进行中再次点「开始配对」不能插队，否则泵侧状态机会乱
     func testConcurrentPairIsRejected() async {
         let link = ScriptedLink()
-        let first = expectation(description: "首帧已发出")
-        link.onWrite = { op in if op == 0x20 { first.fulfill() } }
         let session = PumpSession(link: link)
         await session.start()
 
         Task { try? await session.pair(code: "123456") }
-        await fulfillment(of: [first], timeout: 5)
+        await waitForFirstFrame(link)
 
         do {
             try await session.pair(code: "123456")
