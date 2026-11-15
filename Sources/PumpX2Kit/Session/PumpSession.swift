@@ -152,8 +152,18 @@ public actor PumpSession {
     /// 驱动 JPAKE 状态机直到结束，成功后写入会话密钥
     private func runAuth(_ auth: JPAKEAuth,
                          progress: @escaping @Sendable (Int) -> Void) async throws {
+        var stepIndex = 0
         while let next = try auth.nextRequest() {
-            let frame = try await request(next, expecting: next.opCode &+ 1)
+            stepIndex += 1
+            let frame: AssembledFrame
+            do {
+                frame = try await request(next, expecting: next.opCode &+ 1)
+            } catch {
+                // 把「第几步、哪个 opCode」一起抛出去。泵在授权中途断链时，
+                // 界面只能看到「超时」；没有轮次信息就分不清是密码错还是链路断。
+                throw ProtocolError.authStepFailed(step: stepIndex, opCode: next.opCode,
+                                                   reason: error.localizedDescription)
+            }
             try auth.process(opCode: frame.opCode, cargo: frame.cargo)
             progress(min(95, auth.step.rawValue * 6))
         }

@@ -64,6 +64,8 @@ public enum ProtocolError: Error, Equatable {
     case notAuthenticated
     /// 同一 opCode 已有在途请求。并发发两个事务，泵会判定为并发认证并断链。
     case concurrentRequest(opCode: UInt8)
+    /// JPAKE 某一轮失败。带上 opCode 与轮次，排障时不必再靠猜。
+    case authStepFailed(step: Int, opCode: UInt8, reason: String)
 }
 
 extension ProtocolError: LocalizedError {
@@ -85,6 +87,8 @@ extension ProtocolError: LocalizedError {
         case .notAuthenticated: return "链路尚未认证，无法发送签名报文"
         case let .concurrentRequest(opCode):
             return String(format: "已有同类型请求在途（0x%02x），已阻止重复发送", opCode)
+        case let .authStepFailed(step, opCode, reason):
+            return String(format: "配对第 %d 步（0x%02x）失败：%@", step, opCode, reason)
         }
     }
 }
