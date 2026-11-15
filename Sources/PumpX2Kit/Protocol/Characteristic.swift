@@ -16,7 +16,13 @@ public enum Characteristic: String, CaseIterable, Sendable {
 }
 
 public enum ServiceUUID {
-    public static let pump = "7B83FFF5-9F77-4E5C-8064-AAE2C24838B9"
+    /// Tandem 的 GATT 主服务。这是标准 16 位 UUID `0xFDFB` 的 128 位展开形式，
+    /// 不是按特征值序号推出来的 `7B83FFF5-…`——后者在真实泵上不存在。
+    /// 写错它的后果很隐蔽：连接能建立、`discoverServices` 正常回调，
+    /// 只是返回空列表，然后所有写入都卡在"等待就绪"直到超时。
+    public static let pump = "0000FDFB-0000-1000-8000-00805F9B34FB"
+    /// 泵若以 16 位短格式广播，CBUUID.uuidString 会缩成这个
+    public static let pumpShort = "FDFB"
     public static let cccd = "00002902-0000-1000-8000-00805F9B34FB"
     public static let deviceName = "00002A00-0000-1000-8000-00805F9B34FB"
     public static let modelNumber = "00002A24-0000-1000-8000-00805F9B34FB"

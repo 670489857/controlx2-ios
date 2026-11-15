@@ -138,6 +138,21 @@ final class AppModel: ObservableObject {
         pairingProgress = 0
         Task {
             await session.start()
+            do {
+                // 先确认链路真的可用再让用户输码。否则连不上时界面照样停在输入页，
+                // 用户输完六位数字才等到一个 timeout，白费一次配对机会。
+                try await transport.waitReady()
+            } catch {
+                await MainActor.run {
+                    self.errorText = "连接 \(pump.name) 失败：\(error.localizedDescription)"
+                    self.phase = .discovery
+                    self.connectedName = nil
+                    self.currentPumpID = nil
+                    self.transport.disconnect()
+                    self.startScan()
+                }
+                return
+            }
             await attemptResume()
         }
     }
