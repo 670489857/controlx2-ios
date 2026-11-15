@@ -62,4 +62,29 @@ public enum ProtocolError: Error, Equatable {
     case outOfOrderPacket(found: Int, expected: Int)
     case unregisteredMessage
     case notAuthenticated
+    /// 同一 opCode 已有在途请求。并发发两个事务，泵会判定为并发认证并断链。
+    case concurrentRequest(opCode: UInt8)
+}
+
+extension ProtocolError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case let .unexpectedOpCode(found, expected):
+            return String(format: "报文类型不符：收到 0x%02x，期望 0x%02x", found, expected)
+        case let .unexpectedTransactionId(found, expected):
+            return "事务号不连续：收到 \(found)，期望 \(expected)"
+        case let .unexpectedCargoSize(found, expected):
+            return "报文体长度不符：\(found) 字节，期望 \(expected)"
+        case .invalidCRC: return "报文校验和不通过"
+        case .invalidSignature: return "报文签名不通过"
+        case .truncated: return "报文不完整或等待回复超时"
+        case .emptyPacket: return "收到空的数据包"
+        case let .outOfOrderPacket(found, expected):
+            return "报文分片乱序：收到第 \(found) 片，期望第 \(expected) 片"
+        case .unregisteredMessage: return "收到未登记的报文类型"
+        case .notAuthenticated: return "链路尚未认证，无法发送签名报文"
+        case let .concurrentRequest(opCode):
+            return String(format: "已有同类型请求在途（0x%02x），已阻止重复发送", opCode)
+        }
+    }
 }

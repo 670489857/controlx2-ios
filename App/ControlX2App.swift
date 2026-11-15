@@ -131,9 +131,16 @@ final class AppModel: ObservableObject {
                     self.phase = .discovery
                     self.errorText = message
                 }
-                // 重连成功后补一次握手。prepare 内部有缓存，重复调用无副作用。
+                // 重连成功后补一次握手。prepare 内部有缓存且单飞，重复调用无副作用。
                 if p.isReady {
-                    Task { try? await self.session.prepare() }
+                    Task {
+                        do { _ = try await self.session.prepare() }
+                        catch {
+                            // 这里不弹框：真正需要用户看到的失败由连接流程统一处理，
+                            // 但原因要留在日志里，否则又是"链路好了但连不上"的黑箱
+                            self.transport.log("prepare failed: \(error.localizedDescription)")
+                        }
+                    }
                 }
             }
         }
@@ -204,7 +211,7 @@ final class AppModel: ObservableObject {
                 // 连接后立刻开始授权握手（不需要配对码）。t:slim 在连接建立后
                 // 迟迟收不到 CentralChallenge 会主动断开，而人工输入 6 位码
                 // 往往要几十秒——等输完再握手，泵已经断开了。
-                try await session.prepare()
+                try await startAuthorization(retries: 2)
             } catch {
                 await MainActor.run {
                     self.errorText = "与该泵开始授权失败：\(error.localizedDescription)"
@@ -218,6 +225,28 @@ final class AppModel: ObservableObject {
             }
             await attemptResume()
         }
+    }
+
+    /// 开始授权握手，失败时等链路恢复再试。
+    ///
+    /// iOS 一旦完成系统配对，经常会先断一次再自己连回来。此时正在进行的握手
+    /// 必然以「设备已断开」失败，但那是可自愈的中间态——直接弹错会把用户赶回
+    /// 列表，逼他重连一遍。所以这里等一次链路就绪再补发。
+    private func startAuthorization(retries: Int) async throws {
+        var lastError: Error?
+        for attempt in 1...max(1, retries) {
+            do {
+                _ = try await session.prepare()
+                return
+            } catch {
+                lastError = error
+                transport.log("prepare #\(attempt) failed: \(error.localizedDescription)")
+                guard attempt < retries else { break }
+                // 链路若已断开，等它重连回来；已就绪则立即返回，直接重试
+                guard (try? await transport.waitReady(timeout: .seconds(20))) != nil else { break }
+            }
+        }
+        throw lastError ?? BLETransport.TransportError.timeout
     }
 
     /// 连接后优先用已保存的凭据恢复会话；泵不认才退回输入配对码。
@@ -460,6 +489,7 @@ final class AppModel: ObservableObject {
 
 struct RootView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showDiag = false
 
     var body: some View {
         NavigationStack {
@@ -472,9 +502,24 @@ struct RootView: View {
         }
         .alert("提示", isPresented: Binding(get: { model.errorText != nil },
                                           set: { if !$0 { model.errorText = nil } })) {
+            // 失败后最需要的是「这一秒到底收发了什么」，把入口直接放在弹窗上，
+            // 不让用户再去翻菜单。很多故障只在这一刻可复现。
+            Button("查看收发日志") {
+                showDiag = true
+            }
             Button("知道了", role: .cancel) { model.errorText = nil }
         } message: {
             Text(model.errorText ?? "")
+        }
+        .sheet(isPresented: $showDiag) {
+            NavigationStack {
+                DiagnosticView()
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button("关闭") { showDiag = false }
+                        }
+                    }
+            }
         }
     }
 }

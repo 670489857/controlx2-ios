@@ -59,6 +59,10 @@ public actor PumpSession {
     private var appInstanceId: UInt16 = 1
     /// 已完成的第一步握手结果。连接后立刻拿到，配对时不必重复握手。
     private var preparedInstanceId: UInt16?
+    /// 在途的握手任务。多个调用点共享同一次握手，见 `prepare(hint:)`。
+    private var prepareTask: Task<UInt16, Error>?
+    /// 已发出、还没等到回复的 opCode。写之前就登记，避免重复事务上路。
+    private var inFlightOps: Set<UInt8> = []
 
     public private(set) var state: SessionState = .idle
     public private(set) var snapshot = Snapshot()
@@ -94,15 +98,19 @@ public actor PumpSession {
 
     private func request(_ message: PumpMessage, expecting opCode: UInt8,
                          timeout: Duration = .seconds(8)) async throws -> AssembledFrame {
+        // 拦截必须发生在写入之前。原来的检查放在 continuation 里，等于第二个请求
+        // 已经带着新事务号发出去了才报错，泵那边已经收到重叠事务。
+        guard !inFlightOps.contains(opCode), pending[opCode] == nil else {
+            throw ProtocolError.concurrentRequest(opCode: opCode)
+        }
+        inFlightOps.insert(opCode)
+        defer { inFlightOps.remove(opCode) }
+
         let id = nextTxId()
         let packets = try Packetize.encode(message, txId: id, authKey: authKey ?? [],
                                            pumpTimeSinceReset: pumpTimeSinceReset)
         try await link.write(packets, to: message.characteristic)
         return try await withCheckedThrowingContinuation { cont in
-            if pending[opCode] != nil {
-                cont.resume(throwing: ProtocolError.truncated)
-                return
-            }
             // 用 updateValue 而不是下标赋值：Swift 5.9 会把 actor 内的下标 setter
             // 展开成 async inout 调用并拒绝编译，与逻辑无关，纯属编译器限制。
             _ = pending.updateValue(cont, forKey: opCode)
@@ -163,18 +171,45 @@ public actor PumpSession {
     ///
     /// 返回泵分配的 appInstanceId（权威值，后续所有请求都用它）。
     @discardableResult
+    /// 连接后的第一步握手：不需要配对码，只证明「这台设备正在与泵对话」。
+    ///
+    /// 必须单飞。界面在两个地方会触发它——连接流程和链路就绪回调——而 actor
+    /// 在 await 处可重入，第二个调用进来时缓存还是 nil，于是连发两个
+    /// CentralChallenge。泵看到两个未完成的认证请求会直接断链，表现就是
+    /// 「链路已就绪」之后立刻断开。共享同一个 Task 才能保证只发一次。
     public func prepare(hint: UInt16? = nil) async throws -> UInt16 {
         if let id = preparedInstanceId { return id }
-        let id = try await challengeHandshake(using: hint ?? appInstanceId)
-        appInstanceId = id
-        preparedInstanceId = id
-        return id
+        if let inFlight = prepareTask {
+            return try await inFlight.value
+        }
+        let useId = hint ?? appInstanceId
+        let task = Task<UInt16, Error> { [weak self] in
+            guard let self else { throw ProtocolError.truncated }
+            return try await self.challengeHandshake(using: useId)
+        }
+        prepareTask = task
+        do {
+            let id = try await task.value
+            appInstanceId = id
+            preparedInstanceId = id
+            prepareTask = nil
+            return id
+        } catch {
+            prepareTask = nil
+            throw error
+        }
     }
 
     /// 链路断开时调用：清掉会话级状态，重连后重新握手。
     /// 不清的话，第二次连接会沿用上一次的 instanceId 与旧密钥。
     public func resetSession() {
         preparedInstanceId = nil
+        prepareTask?.cancel()
+        prepareTask = nil
+        inFlightOps.removeAll()
+        // 事务号必须归零。pumpX2 的重连流程也是这么做的：泵对每次连接
+        // 从头计事务，沿用上一条连接的号会被当成过期包丢掉。
+        txId = 0
         authKey = nil
         link.updateAuthenticationKey(nil)
         for (_, c) in pending { c.resume(throwing: ProtocolError.truncated) }

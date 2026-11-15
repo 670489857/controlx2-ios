@@ -230,6 +230,12 @@ public final class BLETransport: NSObject, PumpLink {
         queue.async { self.assembler.authKey = key }
     }
 
+    /// 供上层往诊断日志里写一行。故障排查最缺的就是「谁在哪一步报了什么」，
+    /// 而这行信息只有上层知道，transport 自己写不出来。
+    public func log(_ note: String) {
+        trace.add(.note, note)
+    }
+
     /// 轮询等待链路可用。
     ///
     /// 默认给 45 秒：iOS 的蓝牙配对弹窗需要用户手动点，等 8 秒必然超时，
@@ -502,6 +508,7 @@ extension BLETransport: CBPeripheralDelegate {
             // 写操作也可能成为加密的触发点（订阅没过但读写在先时）。这类失败不是
             // 协议错误，把它标出来，界面才不会引导用户去怀疑配对码。
             let ns = error as NSError
+            trace.add(.note, "write failed: \(describe(error)) [\(ns.domain) \(ns.code)]")
             if ns.domain == CBATTErrorDomain,
                let code = CBATTError.Code(rawValue: ns.code),
                code == .insufficientEncryption || code == .insufficientAuthentication {
