@@ -30,6 +30,16 @@ public final class BLETransport: NSObject, PumpLink {
         public let id: UUID
         public let name: String
         public let rssi: Int
+        /// 广播包里带 Tandem 服务 UUID，或名字像泵。为 false 时是"其他蓝牙设备"，
+        /// 只在用户打开「显示全部设备」时出现，用于区分"蓝牙没工作"和"泵没在广播"。
+        public let isPumpCandidate: Bool
+
+        public init(id: UUID, name: String, rssi: Int, isPumpCandidate: Bool = true) {
+            self.id = id
+            self.name = name
+            self.rssi = rssi
+            self.isPumpCandidate = isPumpCandidate
+        }
     }
 
     private let queue = DispatchQueue(label: "controlx2.ble", qos: .userInitiated)
@@ -66,14 +76,25 @@ public final class BLETransport: NSObject, PumpLink {
         frameContinuation.finish()
     }
 
+    /// 是否把非泵设备也报给上层
+    private var includeNonPumps = false
+
     // MARK: 扫描与连接
 
-    public func startScan() {
+    /// 开始扫描。
+    ///
+    /// 刻意不按服务 UUID 过滤：`7B83FFF5-…` 是连接后才暴露的服务，泵的广播包里
+    /// 不一定带它。按它过滤的后果是"明明泵就在旁边，列表里一个都没有"，而且
+    /// 看不出是权限问题还是泵没广播。这里改成全量扫描 + 回调里分类，
+    /// 至少能区分"扫到了 12 个设备但没有泵"和"一个都没扫到"。
+    public func startScan(includeNonPumps: Bool = false) {
         queue.async {
             guard self.central.state == .poweredOn else { return }
-            let service = CBUUID(string: ServiceUUID.pump)
-            self.central.scanForPeripherals(withServices: [service],
-                                            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
+            self.includeNonPumps = includeNonPumps
+            // allowDuplicates 必须为 true：iOS 首次回调常常拿不到 LocalName，
+            // 名字要等 scan response 补上。只报一次的话会一直显示 "Tandem"。
+            self.central.scanForPeripherals(withServices: nil,
+                                            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
         }
     }
 
@@ -172,10 +193,30 @@ extension BLETransport: CBCentralManagerDelegate {
                                didDiscover peripheral: CBPeripheral,
                                advertisementData: [String: Any],
                                rssi RSSI: NSNumber) {
-        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
-            ?? peripheral.name ?? "Tandem"
+        // 名字可能来自广播、scan response 或缓存，三者优先级依次降低
+        let advName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let name = advName ?? peripheral.name ?? "(未命名)"
+
+        // 服务 UUID 可能出现在广播包，也可能只在 scan response 的 overflow 列表里
+        var services = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+        services += (advertisementData[CBAdvertisementDataOverflowServiceUUIDsKey] as? [CBUUID]) ?? []
+        let hasPumpService = services.contains {
+            $0.uuidString.uppercased() == ServiceUUID.pump.uppercased()
+        }
+
+        // 兜底：泵的广播名形如 "tslim X2 12345678"、"t:slim X2"、"Tandem Mobi"
+        let lower = name.lowercased()
+        let nameLooksLikePump = ["tslim", "t:slim", "tandem", "mobi", "x2"].contains {
+            lower.contains($0)
+        }
+
+        let isPump = hasPumpService || nameLooksLikePump
+
         discovered[peripheral.identifier] = peripheral
-        onDiscover?(DiscoveredPump(id: peripheral.identifier, name: name, rssi: RSSI.intValue))
+        guard isPump || includeNonPumps else { return }
+
+        onDiscover?(DiscoveredPump(id: peripheral.identifier, name: name,
+                                   rssi: RSSI.intValue, isPumpCandidate: isPump))
     }
 
     public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {

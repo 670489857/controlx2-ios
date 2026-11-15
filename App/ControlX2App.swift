@@ -25,6 +25,8 @@ final class AppModel: ObservableObject {
     @Published var phase: Phase = .disclaimer
     @Published var pumps: [BLETransport.DiscoveredPump] = []
     @Published var isScanning = false
+    /// 打开后连非泵设备也列出来，用于区分「蓝牙没工作」和「泵没在广播」
+    @Published var showAllDevices = false
     @Published var pairingCode = ""
     @Published var pairingProgress = 0
     @Published var errorText: String?
@@ -75,7 +77,12 @@ final class AppModel: ObservableObject {
         transport.onDiscover = { [weak self] pump in
             Task { @MainActor in
                 guard let self else { return }
-                if !self.pumps.contains(where: { $0.id == pump.id }) { self.pumps.append(pump) }
+                // 同一个 peripheral 会因 scan response 补全名字而多次回调，按 id 覆盖而不是只去重
+                if let idx = self.pumps.firstIndex(where: { $0.id == pump.id }) {
+                    self.pumps[idx] = pump
+                } else {
+                    self.pumps.append(pump)
+                }
             }
         }
         transport.onDisconnect = { [weak self] in
@@ -86,9 +93,13 @@ final class AppModel: ObservableObject {
         }
         transport.onStateChange = { [weak self] state in
             Task { @MainActor in
+                guard let self else { return }
                 switch state {
-                case .poweredOff: self?.errorText = "蓝牙已关闭，请在控制中心打开"
-                case .unauthorized: self?.errorText = "未授权蓝牙访问，请到「设置 → ControlX2」开启"
+                case .poweredOn: self.errorText = nil
+                case .poweredOff: self.errorText = "蓝牙已关闭，请在控制中心打开"
+                case .unauthorized: self.errorText = "未授权蓝牙访问，请到「设置 → ControlX2」开启"
+                case .unsupported: self.errorText = "此设备不支持蓝牙低功耗"
+                case .resetting: self.errorText = "蓝牙正在重置，请稍候"
                 default: break
                 }
             }
@@ -104,11 +115,17 @@ final class AppModel: ObservableObject {
     func startScan() {
         pumps = []
         isScanning = true
-        transport.startScan()
+        transport.startScan(includeNonPumps: showAllDevices)
         Task {
-            try? await Task.sleep(for: .seconds(12))
+            // 泵的广播间隔可能到 1–2 秒，12 秒太短；给 30 秒
+            try? await Task.sleep(for: .seconds(30))
             await MainActor.run { self.isScanning = false }
         }
+    }
+
+    func toggleShowAll(_ on: Bool) {
+        showAllDevices = on
+        startScan()
     }
 
     func connect(_ pump: BLETransport.DiscoveredPump) {
@@ -401,29 +418,85 @@ struct DisclaimerView: View {
 struct DiscoveryView: View {
     @EnvironmentObject var model: AppModel
 
+    private var candidates: [BLETransport.DiscoveredPump] {
+        model.pumps.filter(\.isPumpCandidate)
+    }
+    private var others: [BLETransport.DiscoveredPump] {
+        model.pumps.filter { !$0.isPumpCandidate }
+    }
+
     var body: some View {
         List {
             Section("附近的泵") {
-                if model.pumps.isEmpty {
-                    HStack(spacing: 12) {
-                        if model.isScanning { ProgressView() }
-                        Text(model.isScanning ? "正在扫描…" : "未发现设备")
-                            .foregroundStyle(.secondary)
+                if candidates.isEmpty {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack(spacing: 12) {
+                            if model.isScanning { ProgressView() }
+                            Text(model.isScanning ? "正在扫描…" : "没有发现泵")
+                                .foregroundStyle(.secondary)
+                        }
+                        if !model.isScanning {
+                            if model.showAllDevices {
+                                Text("扫到了 \(others.count) 个其他蓝牙设备，但没有一个像泵。蓝牙本身是通的，问题在泵那一端。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            } else {
+                                Text("打开下面的开关，可以看到附近所有蓝牙设备——用来判断是蓝牙没工作还是泵没广播。")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
-                ForEach(model.pumps) { pump in
+                ForEach(candidates) { pump in
                     Button {
                         model.connect(pump)
                     } label: {
                         HStack {
                             VStack(alignment: .leading) {
                                 Text(pump.name)
-                                Text(pump.id.uuidString.prefix(8)).font(.caption).foregroundStyle(.secondary)
+                                Text(pump.id.uuidString.prefix(8))
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                             Spacer()
-                            Text("\(pump.rssi) dBm").font(.caption).foregroundStyle(.secondary)
+                            Text("\(pump.rssi) dBm")
+                                .font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                }
+            }
+
+            if model.showAllDevices {
+                Section("全部蓝牙设备") {
+                    if others.isEmpty {
+                        Text("没有其他设备").font(.caption).foregroundStyle(.secondary)
+                    }
+                    ForEach(others) { device in
+                        HStack {
+                            Text(device.name).foregroundStyle(.secondary)
+                            Spacer()
+                            Text("\(device.rssi) dBm")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            Section {
+                Toggle("显示全部蓝牙设备", isOn: Binding(
+                    get: { model.showAllDevices },
+                    set: { model.toggleShowAll($0) }
+                ))
+            } footer: {
+                Text("用来判断是「蓝牙没工作」还是「泵没在广播」。如果打开后能看到一堆设备但列表里没有泵，问题在泵那一端，不在 App。")
+            }
+
+            Section("扫不到泵时依次确认") {
+                ForEach([
+                    "① 泵上：设置 → 蓝牙 → 打开，屏幕顶部出现蓝牙图标",
+                    "② 泵上：设置 → 蓝牙 → 添加设备，泵这时才主动广播",
+                    "③ 官方 t:connect 或另一台手机占着连接，先在那边断开",
+                    "④ iOS 设置 → ControlX2 → 蓝牙，必须为开启",
+                ], id: \.self) { line in
+                    Text(line).font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
