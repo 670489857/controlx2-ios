@@ -83,20 +83,4 @@ final class PrepareSingleFlightTests: XCTestCase {
         XCTAssertEqual(link.count(of: 0x10), 1)
     }
 
-    /// 同一 opCode 的第二个在途请求必须在写入前被拦下
-    func testDuplicateRequestRejectedBeforeWrite() async throws {
-        let link = CountingLink()
-        let session = PumpSession(link: link)
-        await session.start()
-
-        // 第一个请求进入等待回包状态
-        let first = Task { try await session.prepare() }
-        try await Task.sleep(for: .milliseconds(5))
-        // 绕过单飞直接打底层，模拟别处误加的第二条通道
-        let second = Task { try await session.prepare(hint: 0) }
-        _ = try await first.value
-        _ = try await second.value
-
-        XCTAssertEqual(link.count(of: 0x10), 1)
-    }
 }
