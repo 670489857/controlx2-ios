@@ -40,6 +40,9 @@ public final class ECJPAKE {
 
     private var hasPeerRound1 = false
     private var hasPeerRound2 = false
+    /// 第一轮会被重复扫描（1a 收了半轮、1b 再补齐），每个点的零知识证明只验一次
+    private var zkp1Checked = false
+    private var zkp2Checked = false
     /// 对端第一轮可能分两条消息到达，也可能尾部带对齐 0；这里攒起来增量解析
     private var round1Incoming: [UInt8] = []
     private var myRound1Bytes: [UInt8]?
@@ -99,17 +102,22 @@ public final class ECJPAKE {
         round1Incoming += data
         var r = Reader(round1Incoming)
         do {
-            let p1 = try readZKPRaw(&r)
-            if Xp1 == nil {
-                Xp1 = p1.point
-                if !verifyZKP(p1, base: P256.generator, X: p1.point, id: peerId) {
+            // 顺序必须是「点 → 该点的零知识证明」，与 writePoint/writeZKP 的写出顺序一致
+            let x1 = try readPoint(&r)
+            Xp1 = x1
+            let z1 = try readZKPRaw(&r)
+            if !zkp1Checked {
+                zkp1Checked = true
+                if !verifyZKP(z1, base: P256.generator, X: x1, id: peerId) {
                     peerZKPWarning = "对端 X1 的零知识证明不通过"
                 }
             }
-            let p2 = try readZKPRaw(&r)
-            if Xp2 == nil {
-                Xp2 = p2.point
-                if !verifyZKP(p2, base: P256.generator, X: p2.point, id: peerId) {
+            let x2 = try readPoint(&r)
+            Xp2 = x2
+            let z2 = try readZKPRaw(&r)
+            if !zkp2Checked {
+                zkp2Checked = true
+                if !verifyZKP(z2, base: P256.generator, X: x2, id: peerId) {
                     peerZKPWarning = "对端 X2 的零知识证明不通过"
                 }
             }
@@ -151,11 +159,12 @@ public final class ECJPAKE {
         guard let Xm1, let Xm2, let Xp1 else { throw JPAKEError.invalidState }
         let g = P256.add(P256.add(P256.toJacobian(Xm1), Xm2), Xp1)
         guard let gAffine = P256.toAffine(g) else { throw JPAKEError.malformed }
+        let point = try readPoint(&r)
         let raw = try readZKPRaw(&r)
-        guard verifyZKP(raw, base: gAffine, X: raw.point, id: peerId) else {
+        guard verifyZKP(raw, base: gAffine, X: point, id: peerId) else {
             throw JPAKEError.validationFailed
         }
-        Xp = raw.point
+        Xp = point
         hasPeerRound2 = true
     }
 
