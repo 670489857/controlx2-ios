@@ -344,4 +344,89 @@ final class AuthFlowTests: XCTestCase {
 
         XCTAssertEqual(link.ops, [0x20, 0x22], "0x21 之后必须继续发 0x22")
     }
+
+    // MARK: 认证成功之后的读取
+
+    /// 造一个已认证的会话：把 0x26 → 0x27 → 0x28 → 0x29 四步按泵的真实格式喂回去，
+    /// 0x29 的摘要用同一个 derivedSecret 现算，保证客户端验签通过。
+    private func makeAuthenticatedSession(_ link: ScriptedLink) async throws -> PumpSession {
+        let secret = [UInt8](repeating: 0x11, count: 32)
+        let nonce3: [UInt8] = [1, 2, 3, 4, 5, 6, 7, 8]
+        let nonce4: [UInt8] = [9, 10, 11, 12, 13, 14, 15, 16]
+        let digest = HMAC.sha256(key: HKDF.build(nonce: nonce3, keyMaterial: secret),
+                                 message: nonce4)
+
+        link.reply(to: 0x26, with: 0x27,
+                   cargo: [0, 0] + nonce3 + [UInt8](repeating: 0, count: 8))
+        link.reply(to: 0x28, with: 0x29,
+                   cargo: [0, 0] + nonce4 + [UInt8](repeating: 0, count: 8) + digest)
+
+        let session = PumpSession(link: link)
+        await session.start()
+        _ = try await session.resume(with: PumpCredentials(appInstanceId: 0,
+                                                           derivedSecret: secret))
+        let authed = await session.isAuthenticated
+        XCTAssertTrue(authed, "四步走完应当是已认证状态")
+        return session
+    }
+
+    /// 0x20 的 cargo 必须是空的。
+    ///
+    /// 现场日志：认证明明走完（`ok -> 4 已收`），紧接着发 0x20 读版本，泵回一条
+    /// `0x04` Nack，63ms 后主动断开。原因是这里发了两字节 `[1, 0]`，而 pumpX2 的
+    /// `ApiVersionRequest()` 无参构造是 `cargo = EMPTY`。
+    func testApiVersionRequestUsesEmptyCargo() async throws {
+        let link = ScriptedLink()
+        link.reply(to: 0x20, with: 0x21, cargo: [3, 0, 4, 0])
+        // refresh 会依次读版本、药筒、血糖、IOB、电量、基础率、泵计时；
+        // 全部配上应答，否则每条都要等满 8 秒超时。
+        link.reply(to: 0x24, with: 0x25, cargo: [0, 0, 0, 0])
+        link.reply(to: 0x22, with: 0x23, cargo: [0, 0, 0, 0, 100, 0, 0, 5])
+        link.reply(to: 0x6C, with: 0x6D, cargo: [UInt8](repeating: 0, count: 17))
+        link.reply(to: 0x34, with: 0x35, cargo: [0, 80])
+        link.reply(to: 0x36, with: 0x37, cargo: [UInt8](repeating: 0, count: 8))
+        let session = try await makeAuthenticatedSession(link)
+
+        try await session.refresh()
+
+        let apiVersion = try XCTUnwrap(link.records.last { $0.op == 0x20 },
+                                       "refresh 必须发过 0x20")
+        XCTAssertEqual(apiVersion.cargo.count, 0, "ApiVersion 请求不能带载荷")
+        let version = await session.snapshot.apiVersion
+        XCTAssertEqual(version?.description, "3.4")
+    }
+
+    /// 连接建立但没认证时，一条状态请求都不该发出去。
+    ///
+    /// 现场的死循环就是从这里开始的：重连后「链路已就绪」，App 直接发 0x24，
+    /// 泵拒绝并断开，再重连再发，永远连不上。会话层现在会先把这条路堵住。
+    func testStatusRequestsBlockedBeforeAuthentication() async throws {
+        let link = ScriptedLink()
+        let session = PumpSession(link: link)
+        await session.start()
+
+        try? await session.refresh()
+
+        XCTAssertTrue(link.ops.isEmpty, "未认证时不允许发出任何状态请求，实际发了 \(link.ops)")
+        let authed = await session.isAuthenticated
+        XCTAssertFalse(authed)
+    }
+
+    /// 泵回 Nack（0x04）时必须立刻失败，而不是白等满 8 秒超时。
+    func testNackFailsImmediately() async throws {
+        let link = ScriptedLink()
+        link.reply(to: 0x20, with: 0x04, cargo: [2, 0])
+        let session = PumpSession(link: link)
+        await session.start()
+
+        let began = Date()
+        do {
+            try await session.pair(code: "123456")
+            XCTFail("泵回了 Nack，配对应失败")
+        } catch {
+            // 期望被包装成 authStepFailed，并带上 opCode
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(began), 6,
+                          "Nack 应当立刻结束等待（request 超时是 8 秒）")
+    }
 }

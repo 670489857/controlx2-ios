@@ -32,7 +32,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 已验证的部分
 
-在 Linux 上跑通 112 个单元测试（`swift test`）：
+在 Linux 上跑通 115 个单元测试（`swift test`）：
 
 - SHA-256 / SHA-1 / HMAC-SHA1 / HMAC-SHA256：RFC 2202、RFC 4231、NIST 向量
 - CRC16 与组包：与 pumpX2 `BTResponseParserTest` 的真实抓包十六进制逐字节一致

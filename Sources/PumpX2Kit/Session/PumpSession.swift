@@ -67,6 +67,9 @@ public actor PumpSession {
     public private(set) var snapshot = Snapshot()
     /// 仅在完整配对成功后才有值；持久化它即可免去下次输入配对码
     public private(set) var credentials: PumpCredentials?
+    /// 本次连接是否已完成 JPAKE 认证。重连后 `resetSession()` 会把它清成 false，
+    /// 上层必须先重新 `resume` 才能读状态——连接建立不等于会话已恢复。
+    public var isAuthenticated: Bool { authKey != nil }
 
     public init(link: PumpLink) {
         self.link = link
@@ -83,6 +86,20 @@ public actor PumpSession {
     }
 
     private func dispatch(_ frame: AssembledFrame) {
+        // 0x04 = Nack：泵明确拒绝上一条请求。它只带 2 字节原因码，不带被拒请求的
+        // opCode，所以只能配给当前在途的那一条。不处理的话会白等满 8 秒超时，
+        // 现场表现为「发出去没回音」，而泵其实早就说了「不认这条」。
+        if frame.opCode == 0x04 {
+            let reason = frame.cargo.count >= 2
+                ? Int(frame.cargo[0]) | Int(frame.cargo[1]) << 8
+                : -1
+            link.note("收到 Nack：reason=\(reason)（被拒的请求未得到正常回复）")
+            if let (op, cont) = pending.first {
+                pending.removeValue(forKey: op)
+                cont.resume(throwing: ProtocolError.nacked(reason: reason))
+            }
+            return
+        }
         if let cont = pending.removeValue(forKey: frame.opCode) {
             cont.resume(returning: frame)
         }
@@ -104,6 +121,13 @@ public actor PumpSession {
 
     private func request(_ message: PumpMessage, expecting opCode: UInt8,
                          timeout: Duration = .seconds(8)) async throws -> AssembledFrame {
+        // 未认证就发状态请求，泵会直接断开（现场日志：重连后「链路已就绪」的
+        // 第一秒发 0x24，749ms 后 CBErrorDomain 7，然后又是重连、又发 0x24，死循环）。
+        // 与其让它看起来像「泵不稳定」，不如在这里立刻失败，把责任说清楚：
+        // 连接建立不等于会话已恢复，重连之后必须重新走 0x26 / 0x20 那套认证。
+        if message.characteristic == .currentStatus, authKey == nil {
+            throw ProtocolError.notAuthenticated
+        }
         // 拦截必须发生在写入之前。原来的检查放在 continuation 里，等于第二个请求
         // 已经带着新事务号发出去了才报错，泵那边已经收到重叠事务。
         guard !inFlightOps.contains(opCode), pending[opCode] == nil else {
@@ -359,7 +383,12 @@ public actor PumpSession {
     }
 
     private func readApiVersion() async throws -> ApiVersion {
-        let req = PumpMessage.request(characteristic: .currentStatus, opCode: 0x20, cargo: [1, 0])
+        // cargo 必须为空。pumpX2 的 `ApiVersionRequest()` 无参构造就是 `cargo = EMPTY`，
+        // 注释写着「empty cargo is ok」。原来发的是 `[1, 0]` 两字节，泵不认这条请求，
+        // 回一条 `0x04` Nack（reason=2）后主动断开——现场日志里
+        // 「auth 2: ok -> 4 已收 → TX 0x20 → RX 9B 0x04 → 63ms 后 CBErrorDomain 7」
+        // 就是这条路径：认证明明已经成功了，第一条读状态的报文把链路发断。
+        let req = PumpMessage.request(characteristic: .currentStatus, opCode: 0x20)
         let frame = try await request(req, expecting: 0x21)
         guard frame.cargo.count >= 4 else { throw ProtocolError.truncated }
         let major = Int(frame.cargo[0]) | Int(frame.cargo[1]) << 8

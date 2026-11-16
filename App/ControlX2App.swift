@@ -90,6 +90,9 @@ final class AppModel: ObservableObject {
     private var currentPumpID: UUID?
     private var pollTask: Task<Void, Never>?
     private var lastShadowAt: Date?
+    /// 重连后补认证的状态。连续失败两次就停下，不留在一个「一直重连、一直失败」的循环里。
+    private var isResuming = false
+    private var resumeAttempts = 0
 
     private static let settingsKey = "advisorSettings"
 
@@ -139,6 +142,13 @@ final class AppModel: ObservableObject {
                 // 链路就绪后**不**自动发授权帧。新版固件（v7.7+）只认 JPAKE，
                 // 先发 0x10 会被当成不认识的报文并立刻断链；旧固件的 0x10 也要
                 // 等用户输完 16 位码才有意义。授权一律由用户点「开始配对」触发。
+                //
+                // 但「重连」是另一回事：链路恢复不等于会话恢复，`resetSession()`
+                // 已经把 authKey 清掉了。这里补一次自动认证，否则重连后的第一条
+                // 状态请求会被泵拒绝并断开，然后重连、再发，形成永远连不上的循环。
+                if p.isReady {
+                    Task { await self.resumeAfterReconnectIfNeeded() }
+                }
             }
         }
         transport.onStateChange = { [weak self] state in
@@ -219,6 +229,7 @@ final class AppModel: ObservableObject {
             }
             switch result {
             case .resumed:
+                resumeAttempts = 0
                 try? await session.refresh()
                 await refreshFromSession()
                 phase = .dashboard
@@ -230,6 +241,51 @@ final class AppModel: ObservableObject {
         } catch {
             errorText = "自动恢复失败：\(error)"
         }
+    }
+
+    /// 重连后自动补认证。
+    ///
+    /// 链路恢复不等于会话恢复：泵对每条新连接都要求重新确认密钥，而
+    /// `resetSession()` 已经把 authKey 清空。之前这里什么都不做，于是重连后的
+    /// 第一条状态请求被泵回 Nack 并断开——日志里「链路已就绪 → TX 0x24 →
+    /// 749ms 后 CBErrorDomain 7 → 重连 1/2」反复出现，表现就是「划掉 App
+    /// 再进来就再也连不上」。
+    private func resumeAfterReconnectIfNeeded() async {
+        guard phase == .dashboard, !isResuming else { return }
+        if await session.isAuthenticated {
+            resumeAttempts = 0
+            return
+        }
+        guard let id = currentPumpID, let saved = store.load(for: id.uuidString) else { return }
+
+        isResuming = true
+        defer { isResuming = false }
+        do {
+            let result = try await session.resume(with: saved) { p in
+                Task { @MainActor in self.pairingProgress = p }
+            }
+            if case .resumed = result {
+                resumeAttempts = 0
+                try? await session.refresh()
+                await refreshFromSession()
+            } else {
+                await giveUpSession(reason: "泵不再认可这台设备保存的配对凭据")
+            }
+        } catch {
+            await giveUpSession(reason: "重连后恢复会话失败（\(error.localizedDescription)）")
+        }
+    }
+
+    /// 连续两次恢复失败就停下。凭据失效（泵重置、换泵、固件升级）不会因为
+    /// 多试几次而变好，继续重连只会让用户看着「连接中…」反复跳。
+    private func giveUpSession(reason: String) async {
+        resumeAttempts += 1
+        guard resumeAttempts >= 2 else { return }
+        resumeAttempts = 0
+        pollTask?.cancel()
+        transport.setAutoReconnect(false)
+        errorText = "\(reason)。请回到配对页，重新输入泵屏幕上的 6 位码"
+        phase = .pairing
     }
 
     /// 删除本机保存的配对凭据，并断开当前连接
@@ -271,6 +327,7 @@ final class AppModel: ObservableObject {
                 if let creds = await session.credentials, let id = currentPumpID {
                     store.save(creds, for: id.uuidString)
                 }
+                resumeAttempts = 0
                 try await session.refresh()
                 await refreshFromSession()
                 phase = .dashboard
@@ -329,6 +386,9 @@ final class AppModel: ObservableObject {
         pollTask = Task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(60))
+                // 链路可能在两个 cycle 之间断过又自动连回来，那时 onPhase 的
+                // ready 回调早过去了。每轮先确认会话还在，再读数据。
+                await resumeAfterReconnectIfNeeded()
                 try? await session.refresh()
                 await refreshFromSession()
             }
@@ -337,6 +397,9 @@ final class AppModel: ObservableObject {
 
     func refresh() {
         Task {
+            // 断线重连后 authKey 已被清空，此时直接 refresh 一条报文都发不出去
+            //（会话层会拦下未认证的状态请求）。先补认证，再读。
+            await resumeAfterReconnectIfNeeded()
             try? await session.refresh()
             await refreshFromSession()
         }
