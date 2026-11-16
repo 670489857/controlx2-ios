@@ -165,15 +165,17 @@ final class AuthFlowTests: XCTestCase {
         XCTAssertEqual(first.opCode, 0x26)
 
         // 泵的 0x27：appInstanceId(2) + deviceKeyNonce(8) + reserved(8)
+        let nonce3 = try Hex.decode("1122334455667788")
+        let nonce4 = try Hex.decode("99aabbccddeeff00")
         var resp: [UInt8] = [0, 0]
-        resp += Hex.decode("1122334455667788")
+        resp += nonce3
         resp += [UInt8](repeating: 0, count: 8)
         try auth.process(opCode: 0x27, cargo: resp)
 
         let fourth = try XCTUnwrap(try auth.nextRequest())
         XCTAssertEqual(fourth.opCode, 0x28)
         XCTAssertEqual(fourth.cargo.count, 50, "0x28 固定 50 字节")
-        XCTAssertEqual(Array(fourth.cargo[2..<10]), Hex.decode("99aabbccddeeff00"), "客户端 nonce 在前")
+        XCTAssertEqual(Array(fourth.cargo[2..<10]), nonce4, "客户端 nonce 在前")
         XCTAssertEqual(Array(fourth.cargo[10..<18]), [UInt8](repeating: 0, count: 8), "reserved 全 0")
         XCTAssertEqual(Hex.encode(Array(fourth.cargo[18..<50])),
                        "60416617f993a8871a4c80d5d2d83c549644774be11dcb03c3d75c7a5aa60020",
@@ -181,7 +183,8 @@ final class AuthFlowTests: XCTestCase {
 
         // 配对后的签名密钥同样是 HKDF(nonce3, secret)，不是 JPAKE 原始派生值。
         // 用错了，配对照样显示成功，但第一条签名报文必被泵拒。
-        XCTAssertEqual(Hex.encode(try XCTUnwrap(auth.authenticationKey)),
+        let signingKey = try XCTUnwrap(auth.authenticationKey)
+        XCTAssertEqual(Hex.encode(signingKey),
                        "9975790885aa35399285519cf4c1e0413487fbdf92ceb3d7910383cb1b49e67f")
     }
 }

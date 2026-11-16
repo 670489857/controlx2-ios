@@ -193,19 +193,19 @@ final class CryptoTests: XCTestCase {
     /// 期望值由 JDK 实跑 pumpX2 的 Hkdf.java 得到。写反成 HMAC(key: keyMaterial, data: nonce)
     /// 会得到 d0aba68b…，长度一样、自测照样通过，但泵算出的第 6 步摘要不同，
     /// 结果是 0x28 发出后泵一条回复都不给就断链。
-    func testHKDFMatchesPumpX2() {
-        let nonce = Hex.decode("e734344901549417")
-        let keyMaterial = Hex.decode("e734344901549417f6243f8e4a712f87ae9409476f8d022c347ff690249683aa")
+    func testHKDFMatchesPumpX2() throws {
+        let nonce = try Hex.decode("e734344901549417")
+        let keyMaterial = try Hex.decode("e734344901549417f6243f8e4a712f87ae9409476f8d022c347ff690249683aa")
         XCTAssertEqual(Hex.encode(HKDF.build(nonce: nonce, keyMaterial: keyMaterial)),
                        "c47d71d77ff8a9001f53ee15fcdccfc0b3bd85232e8be18ec431f2f5f16f03e9")
     }
 
     /// 第 4 步确认摘要：HMAC-SHA256(key: HKDF(nonce3, secret), data: nonce4)。
     /// 期望值同样由 JDK 跑 pumpX2 的 Hkdf + HmacSha256 得到。
-    func testKeyConfirmationDigest() {
+    func testKeyConfirmationDigest() throws {
         let secret = (0...31).map { UInt8($0) }
-        let nonce3 = Hex.decode("1122334455667788")
-        let nonce4 = Hex.decode("99aabbccddeeff00")
+        let nonce3 = try Hex.decode("1122334455667788")
+        let nonce4 = try Hex.decode("99aabbccddeeff00")
         let okm = HKDF.build(nonce: nonce3, keyMaterial: secret)
         XCTAssertEqual(Hex.encode(okm),
                        "9975790885aa35399285519cf4c1e0413487fbdf92ceb3d7910383cb1b49e67f")
