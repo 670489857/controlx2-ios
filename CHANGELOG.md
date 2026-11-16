@@ -69,7 +69,24 @@ IOB 偏高、没有血糖读数只出提示，不拦——它们是推断值，�
   所以这一版不用它做闸门，只靠 App 侧上限 + 泵自己的拒绝。
 - 自动闭环：理由没变，见 `docs/x2-semi-closed-loop.md`。
 
-测试 133 → 171（新增 38 条：报文逐字节 19 条、闸门与台账 19 条）。
+#### 基础率：能读的读全，写不了的说清楚
+
+- 新增 `Sources/PumpX2Kit/Messages/Profile.swift`：`ProfileStatus` 0x3E/0x3F、
+  `IDPSettings` 0x40/0x41、`IDPSegment` 0x42/0x43，全部只读。
+- 会话层 `readBasalProfile()`：先问「当前是哪个计划」，再问名称/段数/泵的上限，
+  然后按 `0..<段数` 逐段读基础率、碳水比、目标血糖、敏感系数。
+- **段索引是 0 基**。upstream 的 `IDPManager` 用 `0..<count`，而
+  `InsulinDeliveryProfileRequestBuilder` 写成 `1...count`（差一位）。按后者读，
+  最后一条必然越界，泵回 ErrorResponse 后**主动断开蓝牙**——现场表现是
+  「看个基础率，连接突然掉了」，很难往索引上想。这里按 0 基读，段数上限 16 兜底。
+- 新增「基础率计划」页：计划名、24 小时基础量（按段时长累加）、各时段四参数。
+
+写入侧一条都没做，理由写在代码里：`SetTempRate` / `SuspendPumping` /
+`ResumePumping` / `CreateIDP` / `SetIDPSegment` 在 pumpX2 里全部标
+`supportedDevices=MOBI_ONLY`，X2 固件收到会直接拒绝。能改而没做，和压根改不了
+是两件事，页面上分开写清楚。
+
+测试 133 → 182（新增 49 条：大剂量报文 19 条、闸门与台账 19 条、基础率计划 11 条）。
 
 ## 0.2.12 — 2026-11-17
 

@@ -1,5 +1,39 @@
 import Foundation
 
+/// 一个基础率计划（IDP）的只读快照。
+///
+/// 只有读：写入侧（临时基础率 / 暂停 / 恢复 / 改计划）在 X2 固件是 `MOBI_ONLY`，
+/// 泵不收，所以这个类型刻意没有任何 mutate 方法。
+public struct BasalProfile: Equatable, Sendable {
+    public var idpId: Int
+    public var name: String
+    public var insulinDurationMinutes: Int
+    /// 泵里给这个计划设的单次大剂量上限（U）
+    public var maxBolusUnits: Double
+    public var carbEntry: Bool
+    public var segments: [ProfileMessages.Segment]
+    /// 当前处在第几段（来自 0x3F）
+    public var activeSegmentIndex: Int?
+
+    public var totalDailyBasalUnits: Double {
+        guard !segments.isEmpty else { return 0 }
+        // 每段按「到下一段开始」的时长累加，最后一段跨到 24:00
+        var total = 0.0
+        for (i, segment) in segments.enumerated() {
+            let start = segment.startMinutes
+            let end = i + 1 < segments.count ? segments[i + 1].startMinutes : 24 * 60
+            let hours = max(0, end - start) / 60.0
+            total += segment.basalRateUnitsPerHour * hours
+        }
+        return total
+    }
+
+    public var currentSegment: ProfileMessages.Segment? {
+        guard let idx = activeSegmentIndex else { return nil }
+        return segments.first { $0.index == idx }
+    }
+}
+
 /// 泵会话：事务 ID 管理、请求/响应配对、配对流程、只读状态刷新、大剂量。
 ///
 /// 配对成功后 `credentials` 会带上派生密钥；把它持久化（App 侧用 Keychain），
@@ -51,6 +85,8 @@ public actor PumpSession {
         public var lastUpdated: Date?
         /// 当前/最近一次大剂量（CurrentBolusStatus 0x2D）。输注过程中靠它判断进度。
         public var currentBolus: BolusMessages.BolusState?
+        /// 最近一次读到的当前基础率计划（只读）
+        public var basalProfileSchedule: BasalProfile?
         /// 最近一次读取的原始 cargo，按响应 opCode 索引。
         /// 只给「读数核对」页用：界面上的数字一旦和泵屏幕不一致，唯一能判断
         /// 「是解析错了还是泵就这么报的」的证据就是这几个字节。
@@ -524,6 +560,59 @@ public actor PumpSession {
         }
         snapshot.currentBolus = state
         return state
+    }
+
+    /// 基础率计划（只读）。三段：0x3E 问「当前是哪个计划」→ 0x40 问这个计划的
+    /// 名称与段数 → 0x42 逐段问参数。
+    ///
+    /// 段索引必须落在 `0..<segmentCount`。越界时泵回 ErrorResponse 并主动断开蓝牙，
+    /// 所以这里宁可少读几段，也不按下标猜着发。段数上限 16 是兜底：正常计划不会
+    /// 超过十几段，读到异常大的值说明解析偏了，继续发只会把链路搞断。
+    public func readBasalProfile() async throws -> BasalProfile {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+
+        let statusFrame = try await request(ProfileMessages.profileStatusRequest(),
+                                            expecting: 0x3F, timeout: .seconds(8))
+        snapshot.rawCargo[0x3F] = statusFrame.cargo
+        guard let status = ProfileMessages.parseStatus(statusFrame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        guard let idpId = status.activeIdpId else {
+            throw ProfileMessages.ProfileError.noActiveProfile
+        }
+
+        let settingsFrame = try await request(ProfileMessages.settingsRequest(idpId: idpId),
+                                             expecting: 0x41, timeout: .seconds(8))
+        snapshot.rawCargo[0x41] = settingsFrame.cargo
+        guard let settings = ProfileMessages.parseSettings(settingsFrame.cargo) else {
+            throw ProfileMessages.ProfileError.badSettingsCargo
+        }
+
+        let count = min(max(settings.segmentCount, 0), 16)
+        var segments: [ProfileMessages.Segment] = []
+        for index in 0..<count {
+            let frame = try await request(ProfileMessages.segmentRequest(idpId: idpId, index: index),
+                                          expecting: 0x43, timeout: .seconds(8))
+            snapshot.rawCargo[0x43] = frame.cargo
+            guard let segment = ProfileMessages.parseSegment(frame.cargo) else {
+                throw ProfileMessages.ProfileError.badSegmentCargo
+            }
+            segments.append(segment)
+        }
+        // 段按开始时间排序再展示：泵是按索引返回的，索引不等于时钟顺序
+        segments.sort { $0.startMinutes < $1.startMinutes }
+
+        let profile = BasalProfile(idpId: idpId,
+                                   name: settings.name,
+                                   insulinDurationMinutes: settings.insulinDurationMinutes,
+                                   maxBolusUnits: settings.maxBolusUnits,
+                                   carbEntry: settings.carbEntry,
+                                   segments: segments,
+                                   activeSegmentIndex: status.activeSegmentIndex)
+        snapshot.basalProfileSchedule = profile
+        link.note("基础率: 计划「\(settings.name)」idpId=\(idpId) \(segments.count) 段"
+                  + " 单次上限 \(settings.maxBolusUnits) U")
+        return profile
     }
 
     private func u16(_ b: [UInt8], _ o: Int) -> UInt16 {        UInt16(b[o]) | UInt16(b[o + 1]) << 8

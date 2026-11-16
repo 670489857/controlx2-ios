@@ -150,6 +150,12 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var ledger: BolusLedger = BolusLedger.decode(UserDefaults.standard.data(forKey: "bolusLedger"))
     @Published var bolusPolicy: BolusPolicy = AppModel.loadBolusPolicy()
 
+    // MARK: 基础率计划（只读）
+    /// 当前生效的基础率计划。只有读——写入侧在 X2 是 MOBI_ONLY，泵不收。
+    @Published var basalProfile: BasalProfile?
+    @Published var basalProfileLoading = false
+    @Published var basalProfileError: String?
+
     /// 数值型读数：闸门要用数，不能拿格式化后的字符串去比
     @Published var reservoirValue: Double?
     @Published var glucoseValue: Int?
@@ -822,6 +828,25 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 
     // MARK: 大剂量
 
+    // MARK: 基础率计划（只读）
+
+    /// 读当前基础率计划。要 3 + N 条报文（N 是段数），比普通刷新重，
+    /// 所以只在用户进入「基础率计划」页时读，不并进每次刷新。
+    func loadBasalProfile() async {
+        guard linkPhase.isReady else {
+            basalProfileError = "链路未就绪，先等连接恢复"
+            return
+        }
+        basalProfileLoading = true
+        defer { basalProfileLoading = false }
+        do {
+            basalProfile = try await session.readBasalProfile()
+            basalProfileError = nil
+        } catch {
+            basalProfileError = error.localizedDescription
+        }
+    }
+
     nonisolated static func loadBolusPolicy() -> BolusPolicy {
         guard let data = UserDefaults.standard.data(forKey: "bolusPolicy"),
               let p = try? JSONDecoder().decode(BolusPolicy.self, from: data)
@@ -1347,6 +1372,7 @@ struct DashboardView: View {
                 .controlSize(.large)
 
                 HStack(spacing: 16) {
+                    NavigationLink("基础率计划") { BasalProfileView() }
                     NavigationLink("读数核对") { ReadingsCheckView() }
                     NavigationLink("安全说明") { SafetyView() }
                     NavigationLink("诊断日志") { DiagnosticView() }
@@ -2076,6 +2102,89 @@ struct DiagnosticView: View {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
         if (try? document.write(to: url, atomically: true, encoding: .utf8)) != nil {
             exportURL = url
+        }
+    }
+}
+
+// MARK: - 基础率计划（只读）
+
+/// 只读的基础率计划页。
+///
+/// 页面上不放任何可编辑控件，这不是偷懒：X2 固件把「设临时基础率 / 暂停 / 恢复 /
+/// 改计划」划给了 MOBI（pumpX2 里对应报文全部标 `MOBI_ONLY`），泵收到会回 Nack。
+/// 能改而没做，和压根改不了，是两件事，界面上必须区分清楚。
+struct BasalProfileView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section {
+                if let profile = model.basalProfile {
+                    LabeledContent("计划名", value: profile.name)
+                    LabeledContent("时段数", value: "\(profile.segments.count)")
+                    LabeledContent("24 小时基础量",
+                                   value: String(format: "%.2f U", profile.totalDailyBasalUnits))
+                    LabeledContent("泵设的单次上限",
+                                   value: String(format: "%.2f U", profile.maxBolusUnits))
+                    LabeledContent("胰岛素作用时长", value: "\(profile.insulinDurationMinutes) 分钟")
+                    LabeledContent("碳水录入", value: profile.carbEntry ? "开" : "关")
+                } else {
+                    Text("还没读到。连上泵后点下面的「读取计划」。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("当前计划")
+            } footer: {
+                Text("「泵设的单次上限」和「大剂量」页里的闸门是两道独立的口子，谁小谁生效。")
+            }
+
+            if let profile = model.basalProfile, !profile.segments.isEmpty {
+                Section {
+                    ForEach(profile.segments, id: \.index) { segment in
+                        HStack(spacing: 8) {
+                            Text(segment.startText)
+                                .font(.system(.body, design: .monospaced))
+                            Spacer()
+                            Text(String(format: "%.2f U/h", segment.basalRateUnitsPerHour))
+                                .monospacedDigit()
+                            Text(String(format: "1:%.1f", segment.carbRatioGramsPerUnit))
+                                .font(.caption).foregroundStyle(.secondary)
+                            Text("\(segment.targetBgMgdl)/\(segment.isfMgdlPerUnit)")
+                                .font(.caption).foregroundStyle(.secondary)
+                                .monospacedDigit()
+                        }
+                    }
+                } header: {
+                    Text("时段")
+                } footer: {
+                    Text("依次是：开始时间 · 基础率 · 碳水比（1 单位抵多少克）· 目标血糖/敏感系数（mg/dL）。")
+                }
+            }
+
+            Section {
+                Button {
+                    Task { await model.loadBasalProfile() }
+                } label: {
+                    HStack {
+                        Label("读取计划", systemImage: "arrow.down.circle")
+                        Spacer()
+                        if model.basalProfileLoading { ProgressView().controlSize(.small) }
+                    }
+                }
+                .disabled(!model.linkPhase.isReady || model.basalProfileLoading)
+
+                if let error = model.basalProfileError {
+                    Text(error).font(.footnote).foregroundStyle(.red)
+                }
+            } footer: {
+                Text("只能读。基础率写入、临时基础率、暂停与恢复在 X2 固件属于 MOBI 专属指令，泵会直接拒绝，所以没有实现。")
+            }
+        }
+        .navigationTitle("基础率计划")
+        .onAppear {
+            if model.basalProfile == nil, model.linkPhase.isReady {
+                Task { await model.loadBasalProfile() }
+            }
         }
     }
 }
