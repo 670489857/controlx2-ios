@@ -22,7 +22,7 @@ public struct BasalProfile: Equatable, Sendable {
         for (i, segment) in segments.enumerated() {
             let start = segment.startMinutes
             let end = i + 1 < segments.count ? segments[i + 1].startMinutes : 24 * 60
-            let hours = max(0, end - start) / 60.0
+            let hours = Double(max(0, end - start)) / 60.0
             total += segment.basalRateUnitsPerHour * hours
         }
         return total
