@@ -126,6 +126,11 @@ public final class BLETransport: NSObject, PumpLink {
     private var pendingWrites: [PendingWrite] = []
     private var currentWrite: CheckedContinuation<Void, Error>?
     private var isWriting = false
+    /// 每次出队自增。超时回调只在「还是同一次写」时生效，
+    /// 否则会误伤后面已经正常发出的包。
+    private var writeGeneration = 0
+    /// 单包写回调的等待上限。泵回 ATT 确认通常在几十毫秒内，3 秒已经远超正常值。
+    private static let writeTimeout: TimeInterval = 3
 
     private let frameContinuation: AsyncStream<AssembledFrame>.Continuation
     public let frames: AsyncStream<AssembledFrame>
@@ -312,10 +317,14 @@ public final class BLETransport: NSObject, PumpLink {
         let item = pendingWrites.removeFirst()
         guard let ch = characteristics[item.characteristic] else {
             item.cont.resume(throwing: TransportError.notFound)
-            return
+            // 不能直接 return：isWriting 仍是 false，但没有任何事件会再来触发 drain，
+            // 队列里剩下的分片会永久滞留。继续出队，让后续写入照常走。
+            return drain()
         }
         isWriting = true
         currentWrite = item.cont
+        writeGeneration &+= 1
+        let generation = writeGeneration
         let type: CBCharacteristicWriteType = ch.properties.contains(.write) ? .withResponse : .withoutResponse
         // 包布局是 [remaining, txId] + 帧体，帧体前三字节是 [opCode, txId, len]。
         // 只有首片的第三字节才是 opCode；续片那是载荷，按 opCode 打印会显示成
@@ -331,6 +340,20 @@ public final class BLETransport: NSObject, PumpLink {
             currentWrite = nil
             item.cont.resume()
             drain()
+            return
+        }
+        // 有响应写必须自带超时。`didWriteValueFor` 不保证到达：链路半死、泵不确认、
+        // 系统把 App 挂起时都可能静默丢掉回调。没有这道闸门，一次丢失的回调就把
+        // `isWriting` 永远留在 true，之后每条报文都堆在队列里不出队——日志上正是
+        // 「没有 TX、没有 RX、也没有断链」，与「泵把连接掐了」看起来一模一样。
+        queue.asyncAfter(deadline: .now() + Self.writeTimeout) { [weak self] in
+            guard let self, self.isWriting, self.writeGeneration == generation else { return }
+            self.trace.add(.note, "写入回调超时 \(Int(Self.writeTimeout))s：\(head)r=\(item.data.first ?? 0)，复位发送队列")
+            self.isWriting = false
+            let stuck = self.currentWrite
+            self.currentWrite = nil
+            stuck?.resume(throwing: TransportError.timeout)
+            self.drain()
         }
     }
 }

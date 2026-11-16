@@ -61,6 +61,35 @@ public enum AuthMessages {
         return Array(cargo.dropFirst(2))
     }
 
+    /// 取出 JPAKE 各轮载荷，并按该轮**声明的固定长度**补齐。
+    ///
+    /// 泵把 1a / 1b / 2 三条回复装在固定长度的 cargo 里（167 / 167 / 170），
+    /// 但零知识证明的标量有时按最短长度编码，整轮会比声明长度短 1–4 字节，
+    /// 尾部由 0 补满。pumpX2 的 `Jpake1aResponse.parse` 为此专门写了一段：
+    ///
+    /// ```java
+    /// Validate.isTrue(raw.length <= props().size());
+    /// this.cargo = Arrays.copyOf(raw, props().size());   // 不足则补 0
+    /// ```
+    ///
+    /// 少补这一步，拼接就会错位：1a 实际 164 字节、1b 从第 165 个字节开始，
+    /// 若直接接在 164 后面，第二个点会从错开的位置解码，`P256.decode` 必失败。
+    /// 表现是「收到 0x21 之后没有任何收发」——不是泵不回，是本地解析崩了。
+    ///
+    /// 每个字段自带长度前缀，`readLengthPrefix` 会把补齐的 0 当作填充跳过，
+    /// 所以补满不影响解析；超长则说明这条报文本身不对，直接报长度错。
+    public static func jpakePayload(_ cargo: [UInt8], fixedLength: Int) throws -> [UInt8] {
+        guard cargo.count >= 2 else { throw ProtocolError.truncated }
+        var body = Array(cargo.dropFirst(2))
+        guard body.count <= fixedLength else {
+            throw ProtocolError.unexpectedCargoSize(found: body.count, expected: fixedLength)
+        }
+        if body.count < fixedLength {
+            body += [UInt8](repeating: 0, count: fixedLength - body.count)
+        }
+        return body
+    }
+
     public static func nonceAndDigest(_ cargo: [UInt8]) throws -> (nonce: [UInt8], digest: [UInt8]) {
         guard cargo.count >= 50 else { throw ProtocolError.truncated }
         return (Array(cargo[2..<10]), Array(cargo[18..<50]))
@@ -234,19 +263,20 @@ public final class JPAKEAuth {
 
     public func process(opCode: UInt8, cargo: [UInt8]) throws {
         switch opCode {
-        case 0x21: // Jpake1aResponse（第 1 轮前半段，165 字节）
-            // 只喂给解析器、不要求这一条就解析完：泵的 ZKP 标量可能是短编码，
-            // 半轮长度会变成 164，尾部补 0；硬拼 330 字节会在这里错位。
-            try jpake.readRound1(try AuthMessages.payload(cargo))
+        case 0x21: // Jpake1aResponse（第 1 轮前半段，载荷声明 165 字节）
+            // 泵的 ZKP 标量可能按最短长度编码，这一条会比 165 短 1–4 字节。
+            // 必须补 0 到 165 再喂解析器：直接把它当成 164 字节攒着，
+            // 下一条 0x23 接上来就会整体错位（见 jpakePayload 的注释）。
+            try jpake.readRound1(try AuthMessages.jpakePayload(cargo, fixedLength: 165))
             step = .round1aReceived
 
-        case 0x23: // Jpake1bResponse（第 1 轮后半段）
-            try jpake.readRound1(try AuthMessages.payload(cargo))
+        case 0x23: // Jpake1bResponse（第 1 轮后半段，同样补到 165）
+            try jpake.readRound1(try AuthMessages.jpakePayload(cargo, fixedLength: 165))
             guard jpake.peerRound1Complete else { throw ProtocolError.truncated }
             step = .round1bReceived
 
-        case 0x25: // Jpake2Response
-            let r2 = try AuthMessages.payload(cargo)
+        case 0x25: // Jpake2Response（载荷声明 168 = curveId(3) + 一轮 165）
+            let r2 = try AuthMessages.jpakePayload(cargo, fixedLength: 168)
             try jpake.readRound2(r2)
             step = .round2Received
 

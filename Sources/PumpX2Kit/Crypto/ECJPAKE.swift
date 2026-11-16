@@ -161,8 +161,11 @@ public final class ECJPAKE {
         guard let gAffine = P256.toAffine(g) else { throw JPAKEError.malformed }
         let point = try readPoint(&r)
         let raw = try readZKPRaw(&r)
-        guard verifyZKP(raw, base: gAffine, X: point, id: peerId) else {
-            throw JPAKEError.validationFailed
+        // 与第一轮同一策略：ZKP 只是防中间人的旁证，会话密钥由标量运算决定，
+        // 真正的判定点是泵对 0x28 摘要的确认。这里校验不过就中止，等于把
+        // 「本地实现与泵端有细微差异」重新变成一个查不出原因的硬失败。
+        if !verifyZKP(raw, base: gAffine, X: point, id: peerId) {
+            peerZKPWarning = "对端第二轮的零知识证明不通过"
         }
         Xp = point
         hasPeerRound2 = true

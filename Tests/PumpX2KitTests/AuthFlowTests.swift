@@ -192,4 +192,156 @@ final class AuthFlowTests: XCTestCase {
         XCTAssertEqual(Hex.encode(signingKey),
                        "9975790885aa35399285519cf4c1e0413487fbdf92ceb3d7910383cb1b49e67f")
     }
+
+    // MARK: 第一轮的短编码与载荷补齐
+
+    /// 把一轮 330 字节里的第一个 ZKP 标量改成 31 字节（最短编码），
+    /// 整轮因此短 1 字节，与泵端「约 1/256 每次标量」的行为一致。
+    private func makeShortRound1(_ full: [UInt8]) -> (a: [UInt8], b: [UInt8], all: [UInt8]) {
+        // 布局：X1(66) + V1(66) + s1(33) | X2(66) + V2(66) + s2(33)
+        let s1Prefix = 132
+        var short = Array(full[0..<s1Prefix])
+        short += [31]                       // 长度前缀改为 31
+        short += full[(s1Prefix + 2)..<full.count]  // 丢掉标量首字节
+        precondition(short.count == full.count - 1)
+        return (Array(short[0..<164]), Array(short[164..<short.count]), short)
+    }
+
+    /// 泵把 1a 装在 167 字节的 cargo 里，但载荷只有 164 字节时，尾部会补 0。
+    /// 补满到 165 再拼接，第二轮的点才落在正确位置。
+    func testShortRound1CargoIsZeroPadded() throws {
+        let secret = Array("123456".utf8)
+        let server = ECJPAKE(role: .server, secret: secret)
+        let full = try server.round1()
+        XCTAssertEqual(full.count, 330)
+
+        let split = makeShortRound1(full)
+
+        let client = ECJPAKE(role: .client, secret: secret)
+        _ = try client.round1()             // 生成自己的 Xm1/Xm2/xm2
+
+        // 1a：164 字节真实载荷 + 1 个补位 0，总 cargo 167（= 2 appId + 165）
+        let aCargo: [UInt8] = [0, 0] + split.a + [0]
+        XCTAssertEqual(aCargo.count, 167)
+        try client.readRound1(try AuthMessages.jpakePayload(aCargo, fixedLength: 165))
+        XCTAssertFalse(client.peerRound1Complete, "1a 只有半轮，此时不应认为第一轮已完成")
+
+        // 1b：165 字节
+        let bCargo: [UInt8] = [0, 0] + split.b
+        XCTAssertEqual(bCargo.count, 167)
+        try client.readRound1(try AuthMessages.jpakePayload(bCargo, fixedLength: 165))
+        XCTAssertTrue(client.peerRound1Complete)
+
+        // 两个点都解析正确，才能算出共享点 g —— round2 成功即证明这一点
+        XCTAssertNoThrow(try client.round2())
+    }
+
+    /// 短编码（标量按最短长度写出）本身能被增量解析吞下：每个字段都带长度前缀。
+    /// 但泵的 cargo 是固定长度的，缺的字节由 0 补满；补齐与不补齐必须得到同一个结果，
+    /// 否则说明解析器偷偷依赖了字节偏移，而不是长度前缀。
+    ///
+    /// 这条用例同时守住「不要退回按固定偏移切 165 + 165」——那种写法只有在
+    /// 每轮都恰好 165 字节时才成立，泵一旦短编码就会把第二轮的点读错位置。
+    func testShortRound1ParsesWithAndWithoutPadding() throws {
+        let secret = Array("123456".utf8)
+        let server = ECJPAKE(role: .server, secret: secret)
+        let full = try server.round1()
+        let split = makeShortRound1(full)
+        XCTAssertEqual(split.a.count + split.b.count, 329)
+
+        // 补齐路径
+        let padded = ECJPAKE(role: .client, secret: secret)
+        _ = try padded.round1()
+        try padded.readRound1(try AuthMessages.jpakePayload([0, 0] + split.a + [0], fixedLength: 165))
+        try padded.readRound1(try AuthMessages.jpakePayload([0, 0] + split.b, fixedLength: 165))
+        XCTAssertTrue(padded.peerRound1Complete)
+
+        // 不补齐路径：直接接上
+        let raw = ECJPAKE(role: .client, secret: secret)
+        _ = try raw.round1()
+        try raw.readRound1(split.a)
+        try raw.readRound1(split.b)
+        XCTAssertTrue(raw.peerRound1Complete)
+
+        // 两条路径解出的点一致 —— round2 依赖 Xp1/Xp2，能算出来即证明点位相同
+        XCTAssertNoThrow(try padded.round2())
+        XCTAssertNoThrow(try raw.round2())
+    }
+
+    /// 0x25 的载荷声明 168 字节（curveId 3 + 一轮 165），同样要补满。
+    func testShortRound2CargoIsZeroPadded() throws {
+        let secret = Array("123456".utf8)
+        let alice = ECJPAKE(role: .server, secret: secret)
+        let bob = ECJPAKE(role: .client, secret: secret)
+
+        // 双方先交换第一轮
+        let a1 = try alice.round1()
+        let b1 = try bob.round1()
+        try alice.readRound1(b1)
+        try bob.readRound1(a1)
+
+        let b2 = try bob.round2()
+        try alice.readRound2(b2)
+
+        let r2 = try alice.round2()          // [3, 0, 23] + X + ZKP = 168
+        XCTAssertEqual(r2.count, 168)
+
+        // 把标量改成 31 字节，整条短 1 字节；泵会把它补满到 168 再发
+        let scalarPrefix = 3 + 66 + 66
+        XCTAssertEqual(r2[scalarPrefix], 32)
+        var short = Array(r2[0..<scalarPrefix])
+        short += [31]
+        short += r2[(scalarPrefix + 2)..<r2.count]
+        let padded = try AuthMessages.jpakePayload([0, 0] + short, fixedLength: 168)
+        XCTAssertEqual(padded.count, 168)
+
+        XCTAssertNoThrow(try bob.readRound2(padded))
+        // 补位只让 ZKP 校验不过（记告警），共享点仍是同一个，派生密钥必须相等
+        XCTAssertEqual(try bob.deriveSecret(), try alice.deriveSecret())
+    }
+
+    /// 载荷补齐的边界：不足补 0，正好原样，超长报错而不是悄悄截断。
+    func testJpakePayloadLengthHandling() throws {
+        XCTAssertEqual(try AuthMessages.jpakePayload([0, 0, 1, 2, 3], fixedLength: 5),
+                       [1, 2, 3, 0, 0])
+        XCTAssertEqual(try AuthMessages.jpakePayload([0, 0, 1, 2, 3, 4, 5], fixedLength: 5),
+                       [1, 2, 3, 4, 5])
+        XCTAssertThrowsError(try AuthMessages.jpakePayload([0, 0] + [UInt8](repeating: 9, count: 6),
+                                                           fixedLength: 5)) { error in
+            guard case ProtocolError.unexpectedCargoSize(found: 6, expected: 5) = error else {
+                return XCTFail("应为长度不符，实际 \(error)")
+            }
+        }
+        XCTAssertThrowsError(try AuthMessages.jpakePayload([0], fixedLength: 5))
+    }
+
+    /// 收到 0x21 之后必须继续发 0x22；泵那侧不回应时，报错要带「第几步、哪个 opCode」。
+    ///
+    /// 现场日志里出现过「TX 0x20 → RX 0x21 → 之后既没有 TX 也没有断链」。
+    /// 无论那一次是发送队列卡住还是状态机没推进，这里都要求两条底线：
+    /// 0x22 一定被发出；失败信息必须指向第 2 步，而不是笼统的「超时」。
+    func testPairContinuesToRound1BAndReportsStep() async throws {
+        let secret = Array("123456".utf8)
+        let server = ECJPAKE(role: .server, secret: secret)
+        let r1 = try server.round1()
+
+        let link = ScriptedLink()
+        link.reply(to: 0x20, with: 0x21, cargo: [0, 0] + Array(r1[0..<165]))
+        // 故意不给 0x23 的回复
+
+        let session = PumpSession(link: link)
+        await session.start()
+
+        do {
+            try await session.pair(code: "123456")
+            XCTFail("泵不回 0x23，配对应失败")
+        } catch let ProtocolError.authStepFailed(step, opCode, _) {
+            XCTAssertEqual(step, 2, "停在第 2 步（0x22）")
+            XCTAssertEqual(opCode, 0x22)
+        } catch {
+            XCTFail("应带轮次信息，实际 \(error)")
+        }
+
+        XCTAssertEqual(link.ops, [0x20, 0x22], "0x21 之后必须继续发 0x22")
+    }
 }
