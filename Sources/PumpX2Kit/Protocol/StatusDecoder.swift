@@ -1,0 +1,147 @@
+import Foundation
+
+/// 只读状态的字段解码。
+///
+/// 单独拆出来的理由：这些偏移量是全套预测与建议的地基，错一个字节，
+/// 界面上仍然会显示一个「看起来合理」的数字。所以每一处都必须能拿
+/// 上游 pumpX2 的抓包向量（十六进制）直接对照，而不是靠肉眼盯 Swift 代码。
+///
+/// 字段定义来源（jwoglom/pumpX2，与 t:connect 抓包逐字节核对过）：
+/// - `InsulinStatusResponse` opCode 37 / 0x25，size 4
+/// - `CurrentBasalStatusResponse` opCode 41 / 0x29，size 9
+/// - `ControlIQIOBResponse` opCode 109 / 0x6D，size 17
+/// - `CurrentBatteryV1Response` opCode 53 / 0x35，size 2
+/// - `CurrentEGVGuiDataResponse` opCode 35 / 0x23，size 8
+public enum StatusDecoder {
+
+    // MARK: 药筒余量 0x25
+
+    public struct InsulinStatus: Equatable, Sendable {
+        /// 泵显示的剩余量（U）。原始值是 0.001 U 的整数，与 `InsulinUnit.from1000To1` 一致
+        public let units: Double
+        /// 泵自己也说这是估算值（换筒、回抽中途）
+        public let isEstimate: Bool
+        /// 泵上设的低余量提醒阈值（U）
+        public let lowAmount: Double
+    }
+
+    /// cargo = [amount i16 LE][isEstimate u8][lowAmount u8]
+    public static func insulinStatus(_ cargo: [UInt8]) -> InsulinStatus? {
+        guard cargo.count >= 4 else { return nil }
+        let raw = Int16(bitPattern: UInt16(cargo[0]) | UInt16(cargo[1]) << 8)
+        return InsulinStatus(units: Double(raw) / 1000.0,
+                             isEstimate: cargo[2] != 0,
+                             lowAmount: Double(cargo[3]))
+    }
+
+    // MARK: 基础率 0x29
+
+    public struct BasalStatus: Equatable, Sendable {
+        /// 当前基础率（U/h）。Control-IQ 调整、临时基础率期间，这个值可能与配置文件不同
+        public let current: Double
+        /// 当前时段配置文件里的基础率（U/h）
+        public let profile: Double
+        /// 非 0 表示基础率被改过（临时率、Control-IQ、暂停）
+        public let modified: UInt8
+
+        /// 泵屏幕上的基础率就是 current；它和 profile 不等时说明正被调整。
+        public var isModified: Bool { modified != 0 }
+    }
+
+    /// cargo = [profile u32 LE][current u32 LE][modified u8]
+    public static func currentBasal(_ cargo: [UInt8]) -> BasalStatus? {
+        guard cargo.count >= 9 else { return nil }
+        return BasalStatus(current: Double(readU32(cargo, 4)) / 1000.0,
+                           profile: Double(readU32(cargo, 0)) / 1000.0,
+                           modified: cargo[8])
+    }
+
+    // MARK: 活性胰岛素 0x6D
+
+    public struct IOB: Equatable, Sendable {
+        /// 0 = Mudaliar 曲线，1 = Swan 6hr；未知值只在固件改版时出现
+        public let type: Int
+        public let mudaliar: Double
+        public let swan6hr: Double
+
+        /// 泵屏幕上显示的那个数。
+        ///
+        /// 这里必须按 type 取，不能一律读 mudaliar：两种曲线在胰岛素还在起效时
+        /// 能差 0.03 U 以上，够让「建议补多少」偏一档。类型未知时取两者较大值——
+        /// 宁可高估在体内的胰岛素（少建议），也不要低估。
+        public var displayed: Double {
+            switch type {
+            case 0: return mudaliar
+            case 1: return swan6hr
+            default: return max(mudaliar, swan6hr)
+            }
+        }
+
+        public var typeName: String {
+            switch type {
+            case 0: return "Mudaliar"
+            case 1: return "Swan 6hr"
+            default: return "未知(\(type))"
+            }
+        }
+    }
+
+    /// cargo = [mudaliar u32][timeRemaining u32][mudaliarTotal u32][swan6hr u32][type u8]
+    public static func controlIQIOB(_ cargo: [UInt8]) -> IOB? {
+        guard cargo.count >= 17 else { return nil }
+        return IOB(type: Int(cargo[16]),
+                   mudaliar: Double(readU32(cargo, 0)) / 1000.0,
+                   swan6hr: Double(readU32(cargo, 12)) / 1000.0)
+    }
+
+    // MARK: 电量 0x35
+
+    /// cargo = [abc u8][ibc u8]；泵屏幕上那个百分比是**第二个**字节。
+    /// 第一个字节是另一个口径（Mobi 的 DailyBasalHistoryLog 用它），拿错会显示成看似合理的错数。
+    public static func batteryPercent(_ cargo: [UInt8]) -> Int? {
+        guard cargo.count >= 2 else { return nil }
+        return Int(cargo[1])
+    }
+
+    // MARK: 血糖 0x23
+
+    public struct EGV: Equatable, Sendable {
+        /// 泵自己的计时起点（不是 Unix 时间）
+        public let timestamp: UInt32
+        public let mgdl: Int
+        /// 0=无效 1=有效 2=低 3=高 4=不可用
+        public let status: Int
+        /// 0–9，与泵屏幕箭头对应
+        public let trend: Int
+
+        /// LOW / HIGH 时泵给的是一个夹紧的边界值（40 / 400），要标出来
+        public var isClamped: Bool { status == 2 || status == 3 }
+        public var statusName: String {
+            switch status {
+            case 0: return "无效"
+            case 1: return "有效"
+            case 2: return "低（夹到下限）"
+            case 3: return "高（夹到上限）"
+            case 4: return "不可用"
+            default: return "未知(\(status))"
+            }
+        }
+    }
+
+    /// cargo = [timestamp u32][mgdl i16][status u8][trend i8]
+    public static func egv(_ cargo: [UInt8]) -> EGV? {
+        guard cargo.count >= 8 else { return nil }
+        let raw = Int16(bitPattern: UInt16(cargo[4]) | UInt16(cargo[5]) << 8)
+        return EGV(timestamp: readU32(cargo, 0),
+                   mgdl: Int(raw),
+                   status: Int(cargo[6]),
+                   trend: Int(Int8(bitPattern: cargo[7])))
+    }
+
+    // MARK: 字节序
+
+    /// 小端 u32。公开是因为 App 层要在核对页上显示泵计时这两个字段的原值。
+    public static func readU32(_ b: [UInt8], _ o: Int) -> UInt32 {
+        UInt32(b[o]) | UInt32(b[o + 1]) << 8 | UInt32(b[o + 2]) << 16 | UInt32(b[o + 3]) << 24
+    }
+}

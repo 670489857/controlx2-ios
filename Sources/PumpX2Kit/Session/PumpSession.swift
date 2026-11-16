@@ -24,17 +24,32 @@ public actor PumpSession {
         public var apiVersion: ApiVersion?
         public var insulinUnits: Double?
         public var insulinIsEstimate: Bool = false
+        /// 泵上设的低余量提醒阈值（U）。和 `insulinUnits` 一起看才知道「0 U 是不是真的空」
+        public var insulinLowAmount: Double?
         public var pumpTimeSinceReset: UInt64?
         /// 最近一次 CGM 读数（mg/dL），来自 CurrentEGVGuiData
         public var glucoseMgdl: Int?
         /// 趋势方向原始码（0–9），与泵屏幕箭头对应
         public var glucoseTrend: Int?
+        /// EGV 状态：0 无效 / 1 有效 / 2 低 / 3 高 / 4 不可用
+        public var glucoseStatus: Int?
         /// 活性胰岛素（U）
         public var iobUnits: Double?
+        /// 泵当前用的 IOB 曲线（Mudaliar / Swan 6hr）。两种曲线给出的数不同，必须记下来
+        public var iobTypeName: String?
+        public var iobMudaliar: Double?
+        public var iobSwan6hr: Double?
         public var batteryPercent: Int?
         /// 当前基础率（U/h）
         public var basalRate: Double?
+        /// 当前时段配置文件里的基础率（U/h）。与 `basalRate` 不等说明正被 Control-IQ 或临时率调整
+        public var basalProfile: Double?
+        public var basalModified: Bool = false
         public var lastUpdated: Date?
+        /// 最近一次读取的原始 cargo，按响应 opCode 索引。
+        /// 只给「读数核对」页用：界面上的数字一旦和泵屏幕不一致，唯一能判断
+        /// 「是解析错了还是泵就这么报的」的证据就是这几个字节。
+        public var rawCargo: [UInt8: [UInt8]] = [:]
 
         /// mg/dL → mmol/L，仅用于展示切换
         public var glucoseMmol: Double? {
@@ -330,43 +345,75 @@ public actor PumpSession {
     public func refresh() async throws {
         if let v = try? await readApiVersion() { snapshot.apiVersion = v }
 
-        // 药筒余量（InsulinStatus，0x24 → 0x25）：前 2 字节是 0.001 U 为单位的 i16
-        let insulin = PumpMessage.request(characteristic: .currentStatus, opCode: 0x24)
-        if let frame = try? await request(insulin, expecting: 0x25), frame.cargo.count >= 4 {
-            let raw = Int16(bitPattern: UInt16(frame.cargo[0]) | UInt16(frame.cargo[1]) << 8)
-            snapshot.insulinUnits = Double(raw) / 1000.0
-            snapshot.insulinIsEstimate = frame.cargo[2] != 0
+        // 以下每条都是「先问、再解析、并留下原始字节」。
+        // 解析交给 StatusDecoder，偏移量在那里有抓包向量对上，这里只负责搬运。
+
+        // 药筒余量（InsulinStatus，0x24 → 0x25）
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x24),
+                                          expecting: 0x25) {
+            snapshot.rawCargo[0x25] = frame.cargo
+            if let s = StatusDecoder.insulinStatus(frame.cargo) {
+                snapshot.insulinUnits = s.units
+                snapshot.insulinIsEstimate = s.isEstimate
+                snapshot.insulinLowAmount = s.lowAmount
+            }
         }
 
-        // 血糖（CurrentEGVGuiData，0x22 → 0x23）：u32 时间戳 + i16 mg/dL + 状态 + i8 趋势
-        let egv = PumpMessage.request(characteristic: .currentStatus, opCode: 0x22)
-        if let frame = try? await request(egv, expecting: 0x23), frame.cargo.count >= 8 {
-            let mgdl = Int16(bitPattern: u16(frame.cargo, 4))
-            snapshot.glucoseMgdl = mgdl > 0 ? Int(mgdl) : nil
-            snapshot.glucoseTrend = Int(Int8(bitPattern: frame.cargo[7]))
+        // 血糖（CurrentEGVGuiData，0x22 → 0x23）
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x22),
+                                          expecting: 0x23) {
+            snapshot.rawCargo[0x23] = frame.cargo
+            if let e = StatusDecoder.egv(frame.cargo) {
+                // 0 和夹紧边界都不能当成真读数：0 是「没有 CGM」，夹紧值是 40/400
+                snapshot.glucoseMgdl = e.mgdl > 0 ? e.mgdl : nil
+                snapshot.glucoseTrend = e.trend
+                snapshot.glucoseStatus = e.status
+            }
         }
 
-        // 活性胰岛素（ControlIQIOB，0x6C → 0x6D）：mudaliarIOB 为 0.001 U
-        let iob = PumpMessage.request(characteristic: .currentStatus, opCode: 0x6C)
-        if let frame = try? await request(iob, expecting: 0x6D), frame.cargo.count >= 17 {
-            snapshot.iobUnits = Double(u32(frame.cargo, 0)) / 1000.0
+        // 活性胰岛素（ControlIQIOB，0x6C → 0x6D）
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x6C),
+                                          expecting: 0x6D) {
+            snapshot.rawCargo[0x6D] = frame.cargo
+            if let iob = StatusDecoder.controlIQIOB(frame.cargo) {
+                snapshot.iobUnits = iob.displayed
+                snapshot.iobTypeName = iob.typeName
+                snapshot.iobMudaliar = iob.mudaliar
+                snapshot.iobSwan6hr = iob.swan6hr
+            }
         }
 
-        // 电量（CurrentBatteryV1，0x34 → 0x35）：第 2 字节为泵屏幕显示的百分比
-        let battery = PumpMessage.request(characteristic: .currentStatus, opCode: 0x34)
-        if let frame = try? await request(battery, expecting: 0x35), frame.cargo.count >= 2 {
-            snapshot.batteryPercent = Int(frame.cargo[1])
+        // 电量（CurrentBatteryV1，0x34 → 0x35）
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x34),
+                                          expecting: 0x35) {
+            snapshot.rawCargo[0x35] = frame.cargo
+            if let p = StatusDecoder.batteryPercent(frame.cargo) {
+                snapshot.batteryPercent = p
+            }
         }
 
-        // 基础率（CurrentBasalStatus，0x28 → 0x29）：当前基础率 u32 @4，单位 0.001 U/h
-        let basal = PumpMessage.request(characteristic: .currentStatus, opCode: 0x28)
-        if let frame = try? await request(basal, expecting: 0x29), frame.cargo.count >= 9 {
-            snapshot.basalRate = Double(u32(frame.cargo, 4)) / 1000.0
+        // 基础率（CurrentBasalStatus，0x28 → 0x29）
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x28),
+                                          expecting: 0x29) {
+            snapshot.rawCargo[0x29] = frame.cargo
+            if let b = StatusDecoder.currentBasal(frame.cargo) {
+                snapshot.basalRate = b.current
+                snapshot.basalProfile = b.profile
+                snapshot.basalModified = b.isModified
+            }
         }
 
         // 泵计时（TimeSinceReset，0x36 → 0x37）：currentTime(4) + sinceReset(4)
-        let time = PumpMessage.request(characteristic: .currentStatus, opCode: 0x36)
-        if let frame = try? await request(time, expecting: 0x37), frame.cargo.count >= 8 {
+        if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
+                                                              opCode: 0x36),
+                                          expecting: 0x37),
+           frame.cargo.count >= 8 {
+            snapshot.rawCargo[0x37] = frame.cargo
             let sinceReset = u32(frame.cargo, 4)
             pumpTimeSinceReset = sinceReset
             snapshot.pumpTimeSinceReset = UInt64(sinceReset)

@@ -50,10 +50,19 @@ enum BuildInfo {
     static var full: String { gitSHA == "local" ? display : "\(display) · \(gitSHA)" }
 }
 
+/// 一行读数核对。「泵就这么报的」和「我们解析错了」的分界线全在 `hex` 这一列。
+struct ReadingRow: Identifiable {
+    let id = UUID()
+    let opCode: String
+    let name: String
+    let value: String
+    let hex: String
+    let note: String
+}
+
 /// UI 层状态机。只负责展示与用户动作，协议细节全部在 PumpX2Kit。
 @MainActor
-final class AppModel: ObservableObject {
-    enum Phase: Equatable {
+final class AppModel: ObservableObject {    enum Phase: Equatable {
         case disclaimer
         case discovery
         case pairing
@@ -93,6 +102,11 @@ final class AppModel: ObservableObject {
     @Published var shadowCount: Int = 0
     /// IOB 读不到时预测无意义，UI 需要据此降级而不是显示 0
     @Published var iobUnavailable = false
+
+    /// 基础率卡片的副标题：当前值与配置值不一致时把配置值写出来
+    @Published var basalHint: String = "basal"
+    /// 读数核对表
+    @Published var readingRows: [ReadingRow] = []
 
     /// 正在自动连回上次那台泵。状态页顶部据此显示一条进度，而不是空白等 20 秒。
     @Published var autoConnecting = false
@@ -559,7 +573,8 @@ final class AppModel: ObservableObject {
         apiVersion = snap.apiVersion?.description
 
         if let units = snap.insulinUnits {
-            insulinUnits = String(format: "%.0f U", units)
+            // 泵在换筒/回抽途中会把剩余量标成估算，直接显示成精确值会误导
+            insulinUnits = String(format: snap.insulinIsEstimate ? "≈%.0f U" : "%.0f U", units)
         }
         if let g = snap.glucoseMgdl, let mmol = snap.glucoseMmol {
             glucoseText = "\(g)"
@@ -575,11 +590,108 @@ final class AppModel: ObservableObject {
         }
         if let rate = snap.basalRate {
             basalText = String(format: "%.2f U/h", rate)
+            // 「当前 0」和「配置 0」是两件事：前者多半是 Control-IQ 把它压到 0 了，
+            // 光看 0.00 会以为泵停了。把配置值并排写出来。
+            if snap.basalModified, let p = snap.basalProfile, abs(p - rate) > 0.001 {
+                basalHint = String(format: "basal · 配置 %.2f", p)
+            } else {
+                basalHint = "basal"
+            }
         }
         if let t = snap.lastUpdated {
             lastUpdated = t.formatted(date: .omitted, time: .standard)
         }
+        readingRows = Self.buildReadingRows(snap)
         updateAdvisor(with: snap)
+    }
+
+    /// 读数核对表：一行一个字段，附原始字节。
+    ///
+    /// 界面上的数字和泵屏幕不一致时，需要能立刻分清三种情况：泵就这么报的、
+    /// 我们解析错了、报文根本没回来（没回来的那一行整行缺席）。
+    static func buildReadingRows(_ snap: PumpSession.Snapshot) -> [ReadingRow] {
+        var rows: [ReadingRow] = []
+
+        if let cargo = snap.rawCargo[0x25] {
+            let s = StatusDecoder.insulinStatus(cargo)
+            rows.append(ReadingRow(
+                opCode: "0x25",
+                name: "药筒余量",
+                value: s.map { String(format: "%.3f U", $0.units) } ?? "解析失败",
+                hex: Hex.encode(cargo),
+                note: s.map { st in
+                    "第 1–2 字节：0.001 U 整数；第 3 字节 isEstimate=\(st.isEstimate ? 1 : 0)；"
+                    + String(format: "第 4 字节低余量阈值=%.0f U", st.lowAmount)
+                } ?? "载荷 \(cargo.count) 字节，期望 4"
+            ))
+        }
+
+        if let cargo = snap.rawCargo[0x23] {
+            let e = StatusDecoder.egv(cargo)
+            rows.append(ReadingRow(
+                opCode: "0x23",
+                name: "血糖",
+                value: e.map { "\($0.mgdl) mg/dL · 趋势 \($0.trend) · \($0.statusName)" } ?? "解析失败",
+                hex: Hex.encode(cargo),
+                note: e.map { ev in
+                    "时间戳 \(ev.timestamp)（泵自身计时，非 Unix）"
+                    + (ev.isClamped ? "；读数被泵夹在边界上，不是真实测量值" : "")
+                } ?? "载荷 \(cargo.count) 字节，期望 8"
+            ))
+        }
+
+        if let cargo = snap.rawCargo[0x6D] {
+            let iob = StatusDecoder.controlIQIOB(cargo)
+            rows.append(ReadingRow(
+                opCode: "0x6D",
+                name: "活性胰岛素",
+                value: iob.map { String(format: "%.3f U（%@）", $0.displayed, $0.typeName) } ?? "解析失败",
+                hex: Hex.encode(cargo),
+                note: iob.map { v in
+                    String(format: "Mudaliar %.3f U · Swan 6hr %.3f U；泵屏幕显示的是当前曲线那个",
+                           v.mudaliar, v.swan6hr)
+                } ?? "载荷 \(cargo.count) 字节，期望 17"
+            ))
+        }
+
+        if let cargo = snap.rawCargo[0x35] {
+            rows.append(ReadingRow(
+                opCode: "0x35",
+                name: "电量",
+                value: StatusDecoder.batteryPercent(cargo).map { "\($0)%" } ?? "解析失败",
+                hex: Hex.encode(cargo),
+                note: "第 2 字节（ibc）才是泵屏幕上的百分比，第 1 字节是另一个口径"
+            ))
+        }
+
+        if let cargo = snap.rawCargo[0x29] {
+            let b = StatusDecoder.currentBasal(cargo)
+            rows.append(ReadingRow(
+                opCode: "0x29",
+                name: "基础率",
+                value: b.map { String(format: "当前 %.3f · 配置 %.3f U/h", $0.current, $0.profile) } ?? "解析失败",
+                hex: Hex.encode(cargo),
+                note: b.map { v in
+                    "modified=\(v.modified)"
+                    + (v.isModified ? "（正被 Control-IQ / 临时率调整，所以当前值与配置值可能不等）"
+                                    : "（配置原样执行）")
+                } ?? "载荷 \(cargo.count) 字节，期望 9"
+            ))
+        }
+
+        if let cargo = snap.rawCargo[0x37], cargo.count >= 8 {
+            let since = StatusDecoder.readU32(cargo, 4)
+            let days = since / 86400, hours = (since % 86400) / 3600
+            rows.append(ReadingRow(
+                opCode: "0x37",
+                name: "泵计时",
+                value: "\(days) 天 \(hours) 小时",
+                hex: Hex.encode(cargo),
+                note: "sinceReset=\(since) 秒；签名报文要用它，值不对会导致所有写操作被拒"
+            ))
+        }
+
+        return rows
     }
 
     /// 把一次快照喂给预测与建议层。
@@ -978,7 +1090,7 @@ struct DashboardView: View {
                     MetricCard(title: "药筒余量", value: model.insulinUnits, caption: "reservoir")
                 }
                 HStack(spacing: 12) {
-                    MetricCard(title: "基础率", value: model.basalText, caption: "basal")
+                    MetricCard(title: "基础率", value: model.basalText, caption: model.basalHint)
                     MetricCard(title: "电量", value: model.batteryText, caption: "battery")
                 }
 
@@ -1001,6 +1113,7 @@ struct DashboardView: View {
                 .controlSize(.large)
 
                 HStack(spacing: 16) {
+                    NavigationLink("读数核对") { ReadingsCheckView() }
                     NavigationLink("安全说明") { SafetyView() }
                     NavigationLink("诊断日志") { DiagnosticView() }
                 }
@@ -1322,6 +1435,73 @@ struct SafetyView: View {
 }
 
 // MARK: - 诊断
+
+/// 读数核对。
+///
+/// 唯一目的：拿泵屏幕上的数字逐项对照。每一项都同时给出「解析结果」和「原始字节」，
+/// 这样数字对不上时不用猜——字节一致就是泵这么报的，字节不一样就是解析偏了，
+/// 而整行缺席意味着这条报文压根没回来。
+struct ReadingsCheckView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        List {
+            Section {
+                if model.readingRows.isEmpty {
+                    Text("还没有读数。先连上泵，再点「立即刷新」。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+                ForEach(model.readingRows) { row in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text(row.name).font(.subheadline.weight(.semibold))
+                            Text(row.opCode)
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.tertiary)
+                            Spacer()
+                            Text(row.value)
+                                .font(.system(.subheadline, design: .monospaced))
+                        }
+                        Text(row.hex)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        Text(row.note)
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.vertical, 2)
+                }
+            } header: {
+                Text("最近一次读取")
+            } footer: {
+                Text("这是小端字节序，前面两位是帧头，已去掉。数字与泵屏幕不一致时，把这一行整条发出来即可定位。")
+            }
+
+            Section("对照泵屏幕的顺序") {
+                ForEach([
+                    "① 泵上先看药筒：屏幕上那个「剩余 xx U」应与「药筒余量」一致（估值时会显示 ≈）",
+                    "② 泵上的基础率是「当前」值；若与配置值不同，说明 Control-IQ 或临时率正在调整，属正常",
+                    "③ 泵上活性胰岛素取当前曲线的数（Mudaliar / Swan 6hr），两者相差可达 0.03 U",
+                    "④ 电量按泵屏幕百分比核对；泵重启后的短时间读数会跳",
+                ], id: \.self) { line in
+                    Text(line).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            Section {
+                Button {
+                    model.refresh()
+                } label: {
+                    Label("重新读取", systemImage: "arrow.clockwise")
+                }
+            } footer: {
+                Text("刷新会依次发 0x20 / 0x24 / 0x22 / 0x6C / 0x34 / 0x28 / 0x36，全部是只读请求。")
+            }
+        }
+        .navigationTitle("读数核对")
+    }
+}
 
 struct DiagnosticView: View {
     @EnvironmentObject var model: AppModel
