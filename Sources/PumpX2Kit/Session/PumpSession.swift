@@ -143,6 +143,12 @@ public actor PumpSession {
         }
     }
 
+    private func hex(_ v: UInt8) -> String { String(format: "%02x", v) }
+
+    private func hex(prefix bytes: [UInt8], _ n: Int) -> String {
+        bytes.prefix(n).map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+
     private func takePending(_ opCode: UInt8) -> CheckedContinuation<AssembledFrame, Error>? {
         pending.removeValue(forKey: opCode)
     }
@@ -153,18 +159,37 @@ public actor PumpSession {
     private func runAuth(_ auth: JPAKEAuth,
                          progress: @escaping @Sendable (Int) -> Void) async throws {
         var stepIndex = 0
+        var lastZKPWarning: String?
+        link.note("auth: 开始，mode=\(auth.modeDescription)，appInstance=\(appInstanceId)")
         while let next = try auth.nextRequest() {
             stepIndex += 1
+            link.note("auth \(stepIndex): 发送 0x\(hex(next.opCode)) cargo=\(next.cargo.count)B")
             let frame: AssembledFrame
             do {
                 frame = try await request(next, expecting: next.opCode &+ 1)
             } catch {
                 // 把「第几步、哪个 opCode」一起抛出去。泵在授权中途断链时，
                 // 界面只能看到「超时」；没有轮次信息就分不清是密码错还是链路断。
+                link.note("auth \(stepIndex): 0x\(hex(next.opCode)) 没拿到回复：\(error)")
                 throw ProtocolError.authStepFailed(step: stepIndex, opCode: next.opCode,
                                                    reason: error.localizedDescription)
             }
-            try auth.process(opCode: frame.opCode, cargo: frame.cargo)
+            link.note("auth \(stepIndex): 收到 0x\(hex(frame.opCode)) cargo=\(frame.cargo.count)B")
+            do {
+                try auth.process(opCode: frame.opCode, cargo: frame.cargo)
+            } catch {
+                // 这一层之前完全静默：解析/ZKP 校验失败时日志停在 RX 那一行，
+                // 现场只能猜是「泵没回」还是「回了但没用」。现在把具体原因和
+                // 载荷开头一起留下，一眼能分清是长度不够、点解码失败、还是校验不过。
+                link.note("auth \(stepIndex): 0x\(hex(frame.opCode)) 处理失败：\(error)"
+                          + "（cargo=\(frame.cargo.count)B 首 12 字节 \(hex(prefix: frame.cargo, 12))）")
+                throw error
+            }
+            if let w = auth.zkpWarning, w != lastZKPWarning {
+                lastZKPWarning = w
+                link.note("auth \(stepIndex): 告警 \(w)（继续走，由 0x28 定成败）")
+            }
+            link.note("auth \(stepIndex): ok -> \(auth.stepDescription)")
             progress(min(95, auth.step.rawValue * 6))
         }
         guard auth.isComplete, let key = auth.authenticationKey else {

@@ -123,8 +123,7 @@ public final class BLETransport: NSObject, PumpLink {
 
     /// 收发记录。排障用，正常路径不读它。
     public let trace = ProtocolTrace()
-    private var pendingWrites: [(data: [UInt8], characteristic: Characteristic,
-                                 cont: CheckedContinuation<Void, Error>)] = []
+    private var pendingWrites: [PendingWrite] = []
     private var currentWrite: CheckedContinuation<Void, Error>?
     private var isWriting = false
 
@@ -245,6 +244,11 @@ public final class BLETransport: NSObject, PumpLink {
         trace.add(.note, note)
     }
 
+    /// PumpLink 要求：把会话层的事件也写进同一份日志
+    public func note(_ text: String) {
+        trace.add(.note, text)
+    }
+
     /// 轮询等待链路可用。
     ///
     /// 默认给 45 秒：iOS 的蓝牙配对弹窗需要用户手动点，等 8 秒必然超时，
@@ -281,14 +285,25 @@ public final class BLETransport: NSObject, PumpLink {
     public func write(_ packets: [[UInt8]], to characteristic: Characteristic) async throws {
         // 一旦断开就快速失败：这里再等 45 秒只会让用户对着转圈发呆
         try await waitUntilReady(timeout: .seconds(5))
-        for packet in packets {
+        for (index, packet) in packets.enumerated() {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
                 queue.async {
-                    self.pendingWrites.append((packet, characteristic, cont))
+                    self.pendingWrites.append(PendingWrite(data: packet,
+                                                           characteristic: characteristic,
+                                                           // 只有首片带 opCode，续片的第三个字节是载荷
+                                                           isFirst: index == 0,
+                                                           cont: cont))
                     self.drain()
                 }
             }
         }
+    }
+
+    private struct PendingWrite {
+        let data: [UInt8]
+        let characteristic: Characteristic
+        let isFirst: Bool
+        let cont: CheckedContinuation<Void, Error>
     }
 
     /// 串行出队：一次只发一个包，收到 `didWriteValueFor`（或已交给系统）后再发下一个。
@@ -302,10 +317,13 @@ public final class BLETransport: NSObject, PumpLink {
         isWriting = true
         currentWrite = item.cont
         let type: CBCharacteristicWriteType = ch.properties.contains(.write) ? .withResponse : .withoutResponse
-        // packet 布局是 [remaining, txId, opCode, ...]，opCode 在第三字节
-        let opCode = item.data.count > 2 ? String(format: "0x%02x", item.data[2]) : "?"
+        // 包布局是 [remaining, txId] + 帧体，帧体前三字节是 [opCode, txId, len]。
+        // 只有首片的第三字节才是 opCode；续片那是载荷，按 opCode 打印会显示成
+        // 0x71、0x0f 这类假值，排障时极易被当成「发错了命令」。
+        let head = item.isFirst && item.data.count > 2
+            ? String(format: "0x%02x ", item.data[2]) : ""
         trace.addPacket(.tx, item.data,
-                        note: "\(opCode) \(item.characteristic.rawValue.prefix(8)) \(type == .withResponse ? "resp" : "noresp")")
+                        note: "\(head)r=\(item.data.first ?? 0) \(item.characteristic.rawValue.prefix(8)) \(type == .withResponse ? "resp" : "noresp")")
         p.writeValue(Data(item.data), for: ch, type: type)
         if type == .withoutResponse {
             // 无响应写没有系统回调，交给系统即视为完成
@@ -510,7 +528,10 @@ extension BLETransport: CBPeripheralDelegate {
                     self.frameContinuation.yield(frame)
                 }
             } catch {
-                // 坏包丢弃，由上层请求超时兜底；不在此处重试，避免打乱事务 ID
+                // 坏包仍要丢弃（重试会打乱事务号），但**必须留下证据**。
+                // 原来是空 catch：0x21 若因长度/CRC 不匹配被丢掉，日志里只剩一行
+                // RX，随后静默等满 8 秒超时，现场看起来就是「泵回了但我们没反应」。
+                self.trace.add(.note, "收包丢弃 \(bytes.count)B r=\(bytes.first ?? 0)：\(error)")
             }
         }
     }

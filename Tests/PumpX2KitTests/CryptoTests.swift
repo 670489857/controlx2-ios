@@ -212,4 +212,32 @@ final class CryptoTests: XCTestCase {
         XCTAssertEqual(Hex.encode(HMAC.sha256(key: okm, message: nonce4)),
                        "60416617f993a8871a4c80d5d2d83c549644774be11dcb03c3d75c7a5aa60020")
     }
+
+
+    /// 第一轮被切成任意长度的两段（包括切在字段中间）都必须能拼回来。
+    ///
+    /// 泵的 ZKP 标量按最小长度编码，pumpX2 的注释写明「大约每个标量 1/256 的概率」
+    /// 会让整轮短 1 字节，于是所谓「半轮」并不是干净的 165 字节。原实现要求半轮
+    /// 边界正好落在字段边界上，短一个字节就在读下一个字段时越界抛错，整次配对
+    /// 卡死在第一条回复之后——症状就是日志停在 RX 0x21、之后什么都没有。
+    func testRound1AcceptsArbitrarySplit() throws {
+        let srv = try Hex.decode(Self.serverRound1Hex)
+        XCTAssertEqual(srv.count, 330)
+        // 只取三个有代表性的切点：点在点编码中间、半轮少 1 字节（标量短编码的实际形态）、
+        // 最后一个字节。每个切点都要校验两个 ZKP，纯 Swift 下每次点乘不便宜，
+        // 切点多了会把 CI 拖到几十秒。
+        for cut in [66, 164, 329] {
+            // 解析对端第一轮不需要本地密钥，跳过 round1() 可省四次点乘
+            let client = ECJPAKE(role: .client,
+                                 secret: Array("passw0rd".utf8),
+                                 random: FixedRandomSource(hex: String(repeating: "ab", count: 64)))
+            try client.readRound1(Array(srv[0..<cut]))
+            XCTAssertFalse(client.peerRound1Complete, "切在 \(cut) 时不该已经完成")
+            try client.readRound1(Array(srv[cut...]))
+            XCTAssertTrue(client.peerRound1Complete, "切在 \(cut) 时应能拼回")
+        }
+    }
+
+    static let serverRound1Hex =
+        "4104e7c5d0684bb95148e935d86377befafeb346036808c8ce70f295ba471bafffeef40c462dd49716f13d2ff82f4365d4429d9280caf443dcd0ec79161b0d9ce4cd4104a3b138f08ac33bd583035bec94575073245eb08d7b3aebfb948d139fb8504b67167a9c6ff8dfca50787f5a3e31ed8ddb4af5d717456aa6f3ac8ddbbc9d1a2cba20459cdfbcaae4e8b1017df914f01848eb40149188a3cfc2a988e03d794df6ba1e41040f825be5af5c808c38e0e8878751b07d4bddd372df34a1c64ffeb5a1e8b97fad413c18bd62a55b02fad86b1cef68b6cce71daf3c932f3bf15c5e57dca9dd15b34104d057ea7f55f38a200966ff4ac8fddc1fd8a6021e6ee2f50739e61c6bfca0bcb28b92b964ca24f846327695d654ba1f363cbf8b9ba67b12c61d4c58e34e2176f4201e77da3bb44e301aac88dc3749ff33d1f78ce1a73afc7de414e584bca28c37ab"
 }

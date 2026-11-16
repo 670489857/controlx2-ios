@@ -300,9 +300,19 @@ final class AppModel: ObservableObject {
             3. 不要离开 App，直接输入、点「开始配对」
 
             别复用上一次的数字：泵每失败一次就会换码，重连也会换。
+
+            这一版起，失败原因写在「诊断日志」里了（哪一步、哪个 opCode、解析到哪一字节）。
+            点诊断页右上角的分享按钮可以导出成文件。
             """
         }
-        return "配对失败：\(error.localizedDescription)\n\n请逐项确认：泵上「移动连接」已开、泵上原有的配对设备已解除、t:connect 已彻底退出、输入的是泵屏幕当前显示的码。"
+        return """
+        配对失败：\(error.localizedDescription)
+
+        请逐项确认：泵上「移动连接」已开、泵上原有的配对设备已解除、t:connect 已彻底退出、输入的是泵屏幕当前显示的码。
+
+        「诊断日志」里有每一步的细节（发到哪条、收到什么、解析结果），
+        右上角分享按钮可导出成文件。
+        """
     }
 
     /// 诊断日志：把最近几百条收发原样导出。排障时这是唯一能区分
@@ -1057,6 +1067,9 @@ struct DiagnosticView: View {
     @EnvironmentObject var model: AppModel
     @State private var text = ""
     @State private var copied = false
+    /// 导出用的临时文件。截图受屏幕宽度限制，长报文会被截断、字也会糊，
+    /// 排障时经常只能看到半行十六进制；弄成文件后可以直接整份发出来。
+    @State private var exportURL: URL?
 
     var body: some View {
         ScrollView {
@@ -1069,8 +1082,13 @@ struct DiagnosticView: View {
         .navigationTitle("诊断日志")
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
+                if let exportURL {
+                    ShareLink(item: exportURL) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
                 Button(copied ? "已复制" : "复制") {
-                    UIPasteboard.general.string = text
+                    UIPasteboard.general.string = document
                     copied = true
                     Task {
                         try? await Task.sleep(for: .seconds(2))
@@ -1083,7 +1101,27 @@ struct DiagnosticView: View {
         .onAppear(perform: load)
     }
 
+    /// 文件头带上版本号：排障时最怕收到一份不知道来自哪个构建的日志
+    private var document: String {
+        """
+        ControlX2 诊断日志
+        版本：\(BuildInfo.full)
+        导出：\(ISO8601DateFormatter().string(from: Date()))
+        ────────────────────────────
+        \(text)
+        """
+    }
+
     private func load() {
         text = model.traceDump()
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let name = "ControlX2-\(BuildInfo.version)-\(stamp).txt"
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: " ", with: "_")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(name)
+        if (try? document.write(to: url, atomically: true, encoding: .utf8)) != nil {
+            exportURL = url
+        }
     }
 }

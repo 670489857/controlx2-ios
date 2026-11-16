@@ -120,6 +120,34 @@ public final class JPAKEAuth {
         self.step = (derivedSecret?.isEmpty ?? true) ? .bootstrapInitial : .confirmInitial
     }
 
+    /// 对端零知识证明校验的告警（为空表示全部通过）
+    public var zkpWarning: String? { jpake.peerZKPWarning }
+
+    /// 本次是完整配对还是快速重连，只用于日志
+    public var modeDescription: String {
+        pairingCode.isEmpty ? "快速重连 0x26 起" : "完整配对 0x20 起"
+    }
+
+    /// 当前步骤的可读名，失败时能一眼看出停在哪一轮
+    public var stepDescription: String {
+        switch step {
+        case .bootstrapInitial: return "准备"
+        case .round1aSent: return "1a 已发"
+        case .round1aReceived: return "1a 已收"
+        case .round1bSent: return "1b 已发"
+        case .round1bReceived: return "1b 已收"
+        case .round2Sent: return "2 已发"
+        case .round2Received: return "2 已收"
+        case .confirmInitial: return "确认准备"
+        case .confirm3Sent: return "3 已发"
+        case .confirm3Received: return "3 已收"
+        case .confirm4Sent: return "4 已发"
+        case .confirm4Received: return "4 已收"
+        case .complete: return "完成"
+        case .invalid: return "已作废"
+        }
+    }
+
     /// 快速重连：跳过 1a/1b/2，用已保存的派生密钥直接做第 3、4 步确认。
     /// 此时 JPAKE 计算不参与，pairingCode 为空串。
     public init(derivedSecret: [UInt8], appInstanceId: UInt16 = 0,

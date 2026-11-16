@@ -8,6 +8,17 @@ public protocol PumpLink: AnyObject {
     var frames: AsyncStream<AssembledFrame> { get }
     /// 配对完成后注入会话密钥，用于校验签名报文
     func updateAuthenticationKey(_ key: [UInt8]?)
+    /// 往收发日志里写一条自由文本。
+    ///
+    /// 之前只有 GATT 收发会进日志，而解析失败、校验失败、状态机卡住都发生在报文
+    /// 之后，日志里一片空白——现场只能看到「发了一条、回了一条、然后就没了」，
+    /// 分不清是没解析、解析错、还是解析完没发下一条。
+    func note(_ text: String)
+}
+
+public extension PumpLink {
+    /// 默认空实现：Mock 与其他测试替身不必关心日志
+    func note(_ text: String) {}
 }
 
 /// 无硬件环境下的回环实现：按注册表合成响应，用于跑通状态机与 UI。

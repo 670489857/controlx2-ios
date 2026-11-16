@@ -49,6 +49,14 @@ public final class ECJPAKE {
     /// 对端第一轮是否已解析完成（1a 只有半轮时仍为 false）
     public var peerRound1Complete: Bool { hasPeerRound1 }
 
+    /// 对端零知识证明校验不通过时的说明。
+    ///
+    /// 校验失败不再立刻中止：JPAKE 的会话密钥由标量运算决定，ZKP 只用于防中间人。
+    /// 若因为本地实现与泵端有细微差异而校验不过，继续走完仍可能配对成功，而
+    /// 真有问题时泵会在第 5 条报文（0x28）拒绝——那一步的信号比这里可靠得多。
+    /// 但必须留下记录，否则「明明哪里不对却一路绿灯」更难查。
+    public private(set) var peerZKPWarning: String?
+
     public init(role: Role, secret: [UInt8], random: RandomSource = SystemRandomSource()) {
         self.role = role
         self.secret = U256(bytesBE: secret)
@@ -79,16 +87,32 @@ public final class ECJPAKE {
     }
 
     /// 可重复调用：泵把第一轮拆成 1a / 1b 两条消息，各自 165 字节；
-    /// 任一侧的 ZKP 标量若短编码，载荷尾部会带对齐 0，因此按流式增量解析。
+    /// 任一侧的 ZKP 标量若按最小长度编码，整轮会短 1–4 字节（pumpX2
+    /// `PacketArrayList.SHORT_CARGO_TOLERANT_MESSAGES` 专门为此开了例外，
+    /// 注释写明「大约每个标量 1/256 的概率」）。所以这里只把收到的字节攒起来，
+    /// 能解析多少解析多少，剩下等下一段——**不能要求半轮边界正好落在字段边界上**。
+    ///
+    /// 已解析出的点不重复校验：0x23 到达后从头重扫时，X1 的零知识证明再算一遍
+    /// 要点乘两次，纯 Swift 下每次几百毫秒，白白让配对多等一秒多。
     public func readRound1(_ data: [UInt8]) throws {
         guard !hasPeerRound1 else { throw JPAKEError.invalidState }
         round1Incoming += data
         var r = Reader(round1Incoming)
         do {
-            Xp1 = try readPoint(&r)
-            try readZKP(&r, base: P256.generator, X: Xp1!, id: peerId)
-            Xp2 = try readPoint(&r)
-            try readZKP(&r, base: P256.generator, X: Xp2!, id: peerId)
+            let p1 = try readZKPRaw(&r)
+            if Xp1 == nil {
+                Xp1 = p1.point
+                if !verifyZKP(p1, base: P256.generator, X: p1.point, id: peerId) {
+                    peerZKPWarning = "对端 X1 的零知识证明不通过"
+                }
+            }
+            let p2 = try readZKPRaw(&r)
+            if Xp2 == nil {
+                Xp2 = p2.point
+                if !verifyZKP(p2, base: P256.generator, X: p2.point, id: peerId) {
+                    peerZKPWarning = "对端 X2 的零知识证明不通过"
+                }
+            }
         } catch JPAKEError.truncated {
             return   // 等下一段
         }
@@ -127,9 +151,11 @@ public final class ECJPAKE {
         guard let Xm1, let Xm2, let Xp1 else { throw JPAKEError.invalidState }
         let g = P256.add(P256.add(P256.toJacobian(Xm1), Xm2), Xp1)
         guard let gAffine = P256.toAffine(g) else { throw JPAKEError.malformed }
-        let point = try readPoint(&r)
-        try readZKP(&r, base: gAffine, X: point, id: peerId)
-        Xp = point
+        let raw = try readZKPRaw(&r)
+        guard verifyZKP(raw, base: gAffine, X: raw.point, id: peerId) else {
+            throw JPAKEError.validationFailed
+        }
+        Xp = raw.point
         hasPeerRound2 = true
     }
 
@@ -214,15 +240,24 @@ public final class ECJPAKE {
         writeNum(&out, r)
     }
 
-    private func readZKP(_ r: inout Reader, base: P256.Affine, X: P256.Affine, id: [UInt8]) throws {
+    /// 只读字段、不做点乘：增量解析时会重复扫同一段字节，
+    /// 校验必须按「每个点只做一次」来，否则配对时长直接翻倍。
+    private func readZKPRaw(_ r: inout Reader) throws -> ZKP {
         let V = try readPoint(&r)
         let scalar = try readNum(&r)
-        let h = zkpHash(base, V, X, id)
-        guard let gr = P256.multiply(scalar, base), let xh = P256.multiply(h, X) else {
-            throw JPAKEError.malformed
-        }
-        let vv = P256.toAffine(P256.add(P256.toJacobian(gr), xh))
-        guard vv == V else { throw JPAKEError.validationFailed }
+        return ZKP(point: V, scalar: scalar)
+    }
+
+    private func verifyZKP(_ zkp: ZKP, base: P256.Affine, X: P256.Affine, id: [UInt8]) -> Bool {
+        let h = zkpHash(base, zkp.point, X, id)
+        guard let gr = P256.multiply(zkp.scalar, base),
+              let xh = P256.multiply(h, X) else { return false }
+        return P256.toAffine(P256.add(P256.toJacobian(gr), xh)) == zkp.point
+    }
+
+    private struct ZKP {
+        let point: P256.Affine
+        let scalar: U256
     }
 
     private func zkpHash(_ g: P256.Affine, _ v: P256.Affine, _ x: P256.Affine, _ id: [UInt8]) -> U256 {
@@ -275,5 +310,18 @@ struct Reader {
         guard n >= 0, offset + n <= data.count else { throw ECJPAKE.JPAKEError.truncated }
         defer { offset += n }
         return Array(data[offset..<offset + n])
+    }
+}
+
+extension ECJPAKE.JPAKEError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .invalidState:  return "JPAKE 步骤顺序不对"
+        case .validationFailed: return "零知识证明校验不通过（对端数据与本地计算不一致）"
+        case .unexpectedCurve: return "对端用的不是 P-256 曲线"
+        case .malformed:     return "字段格式非法（点或标量解码失败）"
+        case .emptySecret:   return "配对码为空"
+        case .truncated:     return "本轮数据没收全"
+        }
     }
 }
