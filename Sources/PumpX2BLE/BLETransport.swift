@@ -110,6 +110,15 @@ public final class BLETransport: NSObject, PumpLink {
     private var reconnectAttempts = 0
     private var autoReconnect = false
 
+    /// 授权进行中由上层关掉自动重连。
+    ///
+    /// 泵的配对码与当次连接绑定：链路一断，屏幕上那个码基本就作废了。若这里静默重连，
+    /// 界面会停在配对页、用户以为还在等回包，实际上重连后泵已经换了一个码——
+    /// 于是「输对了码却永远卡在密钥确认」。宁可直接报错让用户重新读码。
+    public func setAutoReconnect(_ on: Bool) {
+        queue.async { self.autoReconnect = on }
+    }
+
     public private(set) var phase: LinkPhase = .idle
 
     /// 收发记录。排障用，正常路径不读它。

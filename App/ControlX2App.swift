@@ -53,6 +53,8 @@ final class AppModel: ObservableObject {
     @Published var isScanning = false
     /// 打开后连非泵设备也列出来，用于区分「蓝牙没工作」和「泵没在广播」
     @Published var showAllDevices = false
+    /// 配对页上发生过断链 → 泵屏幕上的码大概率已作废，界面要提示重新读
+    @Published var codeLikelyStale = false
     @Published var pairingCode = ""
     @Published var pairingProgress = 0
     @Published var errorText: String?
@@ -119,6 +121,9 @@ final class AppModel: ObservableObject {
                 // 断开本身不弹框：要不要报错由 linkPhase 决定，
                 // 否则自动重连的每一次断开都会打断用户一次
                 self?.connectedName = nil
+                // 配对页上断过链：泵那边的码基本已经换了，得提醒重新读，
+                // 否则用户会拿着旧码一直重试，每次都在第 6 条报文被拒
+                if self?.phase == .pairing { self?.codeLikelyStale = true }
             }
             // 会话级状态（instanceId、密钥）必须一起清掉，否则重连后会沿用旧值
             Task { await self?.session.resetSession() }
@@ -249,7 +254,12 @@ final class AppModel: ObservableObject {
         }
         errorText = nil
         pairingProgress = 0
+        codeLikelyStale = false
+        // 授权期间关掉自动重连：泵的配对码跟当次连接绑定，静默重连会让六位数字
+        // 悄悄失效，而界面还停在配对页等着，看起来就像"码对了还是不认"。
+        transport.setAutoReconnect(false)
         Task {
+            defer { transport.setAutoReconnect(true) }
             do {
                 // 链路可能在输码期间断掉（系统配对未完成时泵会主动断开），
                 // 这里再确认一次，避免把"链路已断"报成"配对码错误"
@@ -266,9 +276,33 @@ final class AppModel: ObservableObject {
                 phase = .dashboard
                 startPolling()
             } catch {
-                errorText = "配对失败：\(error.localizedDescription)\n\n请逐项确认：泵上「移动连接」已开、泵上原有的配对设备已解除、t:connect 已彻底退出、输入的是泵屏幕当前显示的码。"
+                errorText = pairingFailureText(error)
             }
         }
+    }
+
+    /// 配对失败文案。
+    ///
+    /// 第 5 条报文（0x28 密钥确认）被拒是唯一有明确含义的失败：泵算出的会话密钥
+    /// 和我们不同，也就是两边手里不是同一个 6 位码。其它步骤失败多半是链路问题，
+    /// 提示必须分开写，否则用户只会反复重输同一个已经作废的码。
+    private func pairingFailureText(_ error: Error) -> String {
+        if let pe = error as? ProtocolError,
+           case let .authStepFailed(step, opCode, _) = pe, step == 5, opCode == 0x28 {
+            return """
+            泵在最后一步「密钥确认」拒绝了这次配对。
+
+            含义：泵算出的会话密钥和我们发过去的不一致，说明两边手里不是同一个 6 位码，最常见的原因是码已经作废。
+
+            请按这个顺序重来（顺序很关键）：
+            1. 留在本页，等上面显示「链路已就绪」；若已断开，先连回去
+            2. 这时再去泵上点「配对设备 / Pair Device」，读新出现的 6 位数字
+            3. 不要离开 App，直接输入、点「开始配对」
+
+            别复用上一次的数字：泵每失败一次就会换码，重连也会换。
+            """
+        }
+        return "配对失败：\(error.localizedDescription)\n\n请逐项确认：泵上「移动连接」已开、泵上原有的配对设备已解除、t:connect 已彻底退出、输入的是泵屏幕当前显示的码。"
     }
 
     /// 诊断日志：把最近几百条收发原样导出。排障时这是唯一能区分
@@ -631,10 +665,13 @@ struct PairingView: View {
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("先在泵上做这三步").font(.headline)
+                Text("按这个顺序做").font(.headline)
                 Label("设置 → 蓝牙：打开「移动连接 / Mobile Connection」", systemImage: "1.circle.fill")
                 Label("同一页里若显示已配对的手机，先「解除配对」（泵只记一台）", systemImage: "2.circle.fill")
-                Label("点「配对设备 / Pair Device」，屏幕会显示 6 位数字", systemImage: "3.circle.fill")
+                Label("先让本页显示「链路已就绪」，再点泵上的「配对设备 / Pair Device」", systemImage: "3.circle.fill")
+                Label("读泵屏幕上的 6 位数字，30 秒内输入并开始配对", systemImage: "4.circle.fill")
+                Text("顺序尽量别颠倒：泵的码通常只对当次连接有效，先读码再连、或者中途断线重连，这个码可能就作废了。")
+                    .font(.caption).foregroundStyle(.secondary)
                 Text("另外：如果装着 t:connect，先彻底退出（后台也要杀掉），它和本 App 会抢同一台泵。")
                     .font(.caption).foregroundStyle(.secondary)
             }
@@ -642,6 +679,14 @@ struct PairingView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+            if model.codeLikelyStale {
+                Label("刚才链路断过一次，泵上的码很可能已经换了。请回泵上重按「配对设备」读新码再输入。",
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             Text("输入泵屏幕上显示的配对码").font(.headline)
             TextField("000000 或 A1B2-C3D4-E5F6-7890", text: $model.pairingCode)
