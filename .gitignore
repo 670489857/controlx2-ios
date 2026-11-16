@@ -17,3 +17,4 @@ xcuserdata/
 # 打包产物
 *.ipa
 *.dSYM.zip
+.github-token
