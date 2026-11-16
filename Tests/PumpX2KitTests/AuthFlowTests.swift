@@ -57,15 +57,20 @@ final class ScriptedLink: PumpLink {
 
 final class AuthFlowTests: XCTestCase {
 
-    /// 等到链路记录里出现第一条报文（最多 2 秒）
+    /// 等到链路记录里出现第一条报文。
+    ///
+    /// 不能用 2 秒：`pair()` 会先跑 EC-JPAKE 第一轮，纯 Swift 的 P-256 在 debug
+    /// 构建 + CI 冷启动下可以到好几秒（同文件里那条已知答案用例单跑就 6 秒），
+    /// 窗口太窄会把「算得慢」误报成「没发报文」。
     private func waitForFirstFrame(_ link: ScriptedLink,
+                                   seconds: Int = 20,
                                    _ file: StaticString = #filePath,
                                    _ line: UInt = #line) async {
-        for _ in 0..<100 {
+        for _ in 0..<(seconds * 50) {
             if !link.records.isEmpty { return }
             try? await Task.sleep(for: .milliseconds(20))
         }
-        XCTFail("2 秒内没有发出任何报文", file: file, line: line)
+        XCTFail("\(seconds) 秒内没有发出任何报文", file: file, line: line)
     }
 
     /// 6 位码必须直接进 JPAKE：首条报文是 0x20（Jpake1a），且全程不能出现 0x10。
@@ -81,7 +86,7 @@ final class AuthFlowTests: XCTestCase {
         Task { try? await session.pair(code: "123456") }
         await waitForFirstFrame(link)
 
-        let first = link.records[0]
+        guard let first = link.records.first else { return XCTFail("没有发出任何报文") }
         XCTAssertEqual(first.op, 0x20, "6 位码的第一条必须是 Jpake1a")
         XCTAssertFalse(link.ops.contains(0x10), "6 位码路径不允许出现 CentralChallenge")
         XCTAssertEqual(first.txId, 0, "新连接首帧事务号必须是 0")
@@ -102,7 +107,7 @@ final class AuthFlowTests: XCTestCase {
         Task { _ = try? await session.resume(with: saved) }
         await waitForFirstFrame(link)
 
-        let first = link.records[0]
+        guard let first = link.records.first else { return XCTFail("没有发出任何报文") }
         XCTAssertEqual(first.op, 0x26)
         XCTAssertFalse(link.ops.contains(0x10))
         XCTAssertEqual(first.cargo.count, 2, "Jpake3SessionKey cargo 只有 appInstanceId")
