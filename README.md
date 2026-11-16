@@ -23,6 +23,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 | 药筒余量 | ✅ 已实现 | `InsulinStatus(0x24/0x25)` |
 | 电量 / 基础率 | ✅ 已实现 | `BatteryV1(0x34/0x35)`、`BasalStatus(0x28/0x29)` |
 | 配对密钥持久化（免重复输入配对码） | ✅ 已实现 | Keychain 存 `derivedSecret` + `appInstanceId`，重连走 `0x26` 快速确认 |
+| 启动即连（打开就是状态页） | ✅ 已实现 | 记住上次那台泵，`retrievePeripherals` 直连，不扫描、不点列表 |
 | 血糖预测（4 小时）与建议剂量 | ✅ 已实现 | `Sources/X2Advisor`，44 项测试；**只算不发**，见 [半闭环说明](docs/x2-semi-closed-loop.md) |
 | 影子模式记录 | ✅ 已实现 | 每 5 分钟落一条「如果自动会给多少」，JSONL + CSV 导出 |
 | 历史曲线（内存 60 小时） | ✅ 已实现 | 环形缓冲 720 条，进程重启从磁盘恢复 |
@@ -32,7 +33,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 已验证的部分
 
-在 Linux 上跑通 115 个单元测试（`swift test`）：
+在 Linux 上跑通 119 个单元测试（`swift test`）：
 
 - SHA-256 / SHA-1 / HMAC-SHA1 / HMAC-SHA256：RFC 2202、RFC 4231、NIST 向量
 - CRC16 与组包：与 pumpX2 `BTResponseParserTest` 的真实抓包十六进制逐字节一致

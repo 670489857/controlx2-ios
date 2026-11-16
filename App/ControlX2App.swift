@@ -10,8 +10,20 @@ import UIKit
 @main
 struct ControlX2App: App {
     @StateObject private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
+
     var body: some Scene {
-        WindowGroup { RootView().environmentObject(model) }
+        WindowGroup {
+            RootView()
+                .environmentObject(model)
+                // 启动即连：有「上次那台泵 + 凭据」就直接连回去
+                .task { model.autoConnectIfPossible() }
+        }
+        .onChange(of: scenePhase) { phase in
+            // 从后台回来也一样。iOS 会让 App 在挂起期间丢掉链路，
+            // 回来时如果不主动补一次，界面就停在「未连接」等用户点。
+            if phase == .active { model.autoConnectIfPossible() }
+        }
     }
 }
 
@@ -82,9 +94,17 @@ final class AppModel: ObservableObject {
     /// IOB 读不到时预测无意义，UI 需要据此降级而不是显示 0
     @Published var iobUnavailable = false
 
+    /// 正在自动连回上次那台泵。状态页顶部据此显示一条进度，而不是空白等 20 秒。
+    @Published var autoConnecting = false
+    /// 自动连接没成功的原因。只挂在页面上，不弹框——刚打开 App 就被弹窗挡住，
+    /// 比多等几秒更难受。
+    @Published var connectionNote: String?
+
     private let transport = BLETransport()
     private lazy var session = PumpSession(link: transport)
     private let store: CredentialStore = KeychainCredentialStore()
+    /// 上次连上的泵，用来在启动时直接连回去
+    private let lastPumpStore: LastPumpStore = UserDefaultsLastPumpStore()
     private let glucoseStore: GlucoseHistoryStore
     private let shadowLog: ShadowLog
     private var currentPumpID: UUID?
@@ -104,9 +124,20 @@ final class AppModel: ObservableObject {
         samples = glucoseStore.recent(minutes: 180)
         shadowCount = shadowLog.summarize().total
 
-        // 已接受过免责声明就直接进扫描页；未接受则每次启动都要求确认
+        // 已接受过免责声明时：有「上次那台泵 + 凭据」就直接落到状态页，连接在后台补；
+        // 只有确实没法自动连（没记设备、或凭据被删）才退回扫描页。
         if UserDefaults.standard.bool(forKey: "disclaimerAccepted") {
-            phase = .discovery
+            let saved = lastPumpStore.load()
+            let hasCredentials = saved.map { store.load(for: $0.id.uuidString) != nil } ?? false
+            switch LaunchRouter.destination(lastPump: saved, hasCredentials: hasCredentials) {
+            case let .dashboard(pump):
+                currentPumpID = pump.id
+                connectedName = pump.name
+                phase = .dashboard
+                autoConnecting = true
+            case .discovery:
+                phase = .discovery
+            }
         }
         transport.onDiscover = { [weak self] pump in
             Task { @MainActor in
@@ -122,8 +153,11 @@ final class AppModel: ObservableObject {
         transport.onDisconnect = { [weak self] in
             Task { @MainActor in
                 // 断开本身不弹框：要不要报错由 linkPhase 决定，
-                // 否则自动重连的每一次断开都会打断用户一次
-                self?.connectedName = nil
+                // 否则自动重连的每一次断开都会打断用户一次。
+                // 状态页上连名字都留着——它仍然是「目标泵」，只是暂时没连上。
+                if self?.phase != .dashboard {
+                    self?.connectedName = nil
+                }
                 // 配对页上断过链：泵那边的码基本已经换了，得提醒重新读，
                 // 否则用户会拿着旧码一直重试，每次都在第 6 条报文被拒
                 if self?.phase == .pairing { self?.codeLikelyStale = true }
@@ -135,7 +169,19 @@ final class AppModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.linkPhase = p
-                if case let .failed(message) = p {
+                if self.phase == .dashboard {
+                    // 状态页上只把「传输层正在自己重连」画成进度；失败则收起进度、写原因。
+                    // 这里不处理 .failed 以外的跳转——状态页不因为一次断链就把人赶回列表。
+                    switch p {
+                    case .reconnecting:
+                        self.autoConnecting = true
+                    case let .failed(message):
+                        self.autoConnecting = false
+                        self.connectionNote = message
+                    default:
+                        break
+                    }
+                } else if case let .failed(message) = p {
                     self.phase = .discovery
                     self.errorText = message
                 }
@@ -188,59 +234,134 @@ final class AppModel: ObservableObject {
         startScan()
     }
 
+    /// 手动从列表里选了一台泵
     func connect(_ pump: BLETransport.DiscoveredPump) {
         transport.stopScan()
         isScanning = false
         connectedName = pump.name
         currentPumpID = pump.id
         linkPhase = .connecting
-        transport.connect(pump.id)
         phase = .pairing
         pairingProgress = 0
-        Task {
-            await session.start()
-            do {
-                // 先确认链路真的可用再让用户输码。iOS 的系统配对弹窗需要用户手动
-                // 点一下，这期间链路是"连上但未加密"的状态，写什么都失败。
-                try await transport.waitReady()
-            } catch {
-                await MainActor.run {
-                    self.errorText = "\(pump.name) 未能建立连接：\(error.localizedDescription)"
-                    self.phase = .discovery
-                    self.connectedName = nil
-                    self.currentPumpID = nil
-                    self.transport.disconnect()
-                    self.startScan()
-                }
-                return
-            }
-            // 有保存的凭据就先做 JPAKE 确认（不需要配对码）；
-            // 没有就停在配对页，等用户从泵屏幕上读出 6 位码。
-            await attemptResume()
-        }
+        autoConnecting = false
+        connectionNote = nil
+        Task { await performConnect(id: pump.id, name: pump.name, isAuto: false) }
     }
 
-    /// 连接后优先用已保存的凭据恢复会话；泵不认才退回输入配对码。
-    private func attemptResume() async {
-        guard let id = currentPumpID, let saved = store.load(for: id.uuidString) else { return }
+    /// 启动 / 回到前台时自动连回上次那台泵。
+    ///
+    /// 之前每次打开 App 都停在「选择泵」列表，必须手点一下设备名才继续——
+    /// 可那一下不传递任何新信息：设备是同一台，凭据早就在 Keychain 里。
+    /// 更要命的是列表要等广播，泵的广播间隔 1–2 秒，经常是空白几秒之后
+    /// 才发现自己还得再点一次。现在打开就是状态页，连接在后台补。
+    func autoConnectIfPossible() {
+        guard phase == .dashboard, let id = currentPumpID else { return }
+        if linkPhase.isReady {
+            autoConnecting = false
+            return
+        }
+        // 已经在连（含传输层自己的自动重连）就别叠第二次 connect
+        switch linkPhase {
+        case .connecting, .discovering, .waitingForPairing, .reconnecting:
+            autoConnecting = true
+            return
+        case .idle, .ready, .failed:
+            break
+        }
+        connectionNote = nil
+        autoConnecting = true
+        Task { await performConnect(id: id, name: connectedName ?? "泵", isAuto: true) }
+    }
+
+    /// 自动连接失败后回到扫描页（用户主动要求时才走这条）
+    func goToDiscovery() {
+        connectionNote = nil
+        autoConnecting = false
+        phase = .discovery
+        startScan()
+    }
+
+    private func performConnect(id: UUID, name: String, isAuto: Bool) async {
+        await session.start()
+        // 用 UUID 直连，不需要先扫描：iOS 保留了见过的设备，
+        // retrievePeripherals(withIdentifiers:) 能直接拿到它。
+        transport.connect(id)
         do {
+            // 自动连接给 20 秒：等不到就该把「没连上」写出来，
+            // 而不是让用户盯着一个转圈以为还在努力。手动连接沿用 45 秒，
+            // 那时用户正在系统弹窗上点配对，急不得。
+            try await transport.waitReady(timeout: isAuto ? .seconds(20) : .seconds(45))
+        } catch {
+            let detail = error.localizedDescription
+            transport.disconnect()
+            autoConnecting = false
+            if isAuto {
+                // 留在状态页，只挂一条提示 + 两个按钮
+                connectionNote = "没连上 \(name)：\(detail)"
+            } else {
+                errorText = "\(name) 未能建立连接：\(detail)"
+                phase = .discovery
+                connectedName = nil
+                currentPumpID = nil
+                startScan()
+            }
+            return
+        }
+        await attemptResume()
+    }
+
+    /// 连上之后优先用已保存的凭据恢复会话；泵不认才退回输入配对码。
+    ///
+    /// 与 `resumeAfterReconnectIfNeeded` 互斥：链路刚就绪时两个入口会同时被触发
+    /// （一个是这里，一个是 `onPhase(.ready)`）。并发跑两次 JPAKE，泵会当成
+    /// 两个客户端抢同一台设备，直接断链。
+    private func attemptResume() async {
+        guard !isResuming else { return }
+        guard let id = currentPumpID, let saved = store.load(for: id.uuidString) else {
+            // 没有凭据：只能让用户从泵屏幕上读码
+            autoConnecting = false
+            if phase == .dashboard { phase = .pairing }
+            return
+        }
+        do {
+            isResuming = true
+            defer { isResuming = false }
             let result = try await session.resume(with: saved) { p in
                 Task { @MainActor in self.pairingProgress = p }
             }
             switch result {
             case .resumed:
                 resumeAttempts = 0
+                rememberCurrentPump()
+                autoConnecting = false
+                connectionNote = nil
                 try? await session.refresh()
                 await refreshFromSession()
                 phase = .dashboard
                 startPolling()
             case .needsPairing:
                 store.delete(for: id.uuidString)
+                lastPumpStore.clear()
+                autoConnecting = false
+                connectionNote = nil
                 errorText = "泵未认可已保存的凭据（可能重置过或换了泵），请重新输入配对码"
+                phase = .pairing
             }
         } catch {
-            errorText = "自动恢复失败：\(error)"
+            autoConnecting = false
+            if phase == .dashboard {
+                // 自动连接途中失败：页面上写一句，别弹框
+                connectionNote = "自动恢复会话失败：\(error.localizedDescription)"
+            } else {
+                errorText = "自动恢复失败：\(error)"
+            }
         }
+    }
+
+    /// 记住这台泵，下次启动直接连回去
+    private func rememberCurrentPump() {
+        guard let id = currentPumpID else { return }
+        lastPumpStore.save(LastPump(id: id, name: connectedName ?? "泵"))
     }
 
     /// 重连后自动补认证。
@@ -266,8 +387,13 @@ final class AppModel: ObservableObject {
             }
             if case .resumed = result {
                 resumeAttempts = 0
+                autoConnecting = false
+                connectionNote = nil
                 try? await session.refresh()
                 await refreshFromSession()
+                // 启动路径上会先走到这里（onPhase(.ready) 比 waitReady 返回得早），
+                // 所以轮询也必须在这儿拉起来，否则这一路连上是「只刷一次」
+                startPolling()
             } else {
                 await giveUpSession(reason: "泵不再认可这台设备保存的配对凭据")
             }
@@ -284,6 +410,8 @@ final class AppModel: ObservableObject {
         resumeAttempts = 0
         pollTask?.cancel()
         transport.setAutoReconnect(false)
+        autoConnecting = false
+        connectionNote = nil
         errorText = "\(reason)。请回到配对页，重新输入泵屏幕上的 6 位码"
         phase = .pairing
     }
@@ -291,10 +419,15 @@ final class AppModel: ObservableObject {
     /// 删除本机保存的配对凭据，并断开当前连接
     func forgetPump() {
         if let id = currentPumpID { store.delete(for: id.uuidString) }
+        // 「上次是哪台」也要一起清：只删凭据不清它，下次启动会去连一台没有凭据的泵，
+        // 连上也只能停在配对页，白等 20 秒
+        lastPumpStore.clear()
         pollTask?.cancel()
         transport.disconnect()
         connectedName = nil
         currentPumpID = nil
+        autoConnecting = false
+        connectionNote = nil
         hasLiveData = false
         glucoseText = "—"
         phase = .discovery
@@ -326,8 +459,12 @@ final class AppModel: ObservableObject {
                 // 配对成功即刻落盘：下次连接用 derivedSecret 做快速确认
                 if let creds = await session.credentials, let id = currentPumpID {
                     store.save(creds, for: id.uuidString)
+                    // 只有拿到凭据才记「上次是哪台」，否则下次启动会去连一台连上也进不去的泵
+                    rememberCurrentPump()
                 }
                 resumeAttempts = 0
+                autoConnecting = false
+                connectionNote = nil
                 try await session.refresh()
                 await refreshFromSession()
                 phase = .dashboard
@@ -388,6 +525,13 @@ final class AppModel: ObservableObject {
                 try? await Task.sleep(for: .seconds(60))
                 // 链路可能在两个 cycle 之间断过又自动连回来，那时 onPhase 的
                 // ready 回调早过去了。每轮先确认会话还在，再读数据。
+                if !linkPhase.isReady {
+                    // 传输层的自动重连只试两次，放弃之后不会自己再起。
+                    // 放在这里补一次：泵走远再回来、或者 App 在后台待了很久，
+                    // 都靠这个周期自己长回来，不用用户手动点。
+                    autoConnectIfPossible()
+                    continue
+                }
                 await resumeAfterReconnectIfNeeded()
                 try? await session.refresh()
                 await refreshFromSession()
@@ -396,6 +540,11 @@ final class AppModel: ObservableObject {
     }
 
     func refresh() {
+        // 链路本身没通时，读数据是空转：先连回去，连上后 attemptResume 会刷新一次
+        guard linkPhase.isReady else {
+            autoConnectIfPossible()
+            return
+        }
         Task {
             // 断线重连后 authKey 已被清空，此时直接 refresh 一条报文都发不出去
             //（会话层会拦下未认证的状态请求）。先补认证，再读。
@@ -798,6 +947,8 @@ struct DashboardView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 14) {
+                ConnectionBanner()
+
                 // 血糖主卡
                 VStack(spacing: 6) {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -891,8 +1042,54 @@ struct DashboardView: View {
     }
 }
 
-// MARK: - 预测与建议
+/// 状态页顶部的连接条。
+///
+/// 打开 App 就落到这一页，所以这里必须能回答两个问题：「现在连到哪一步了」
+/// 和「我该做什么」。连上之后整条都不显示，不留一行常驻噪音。
+struct ConnectionBanner: View {
+    @EnvironmentObject var model: AppModel
 
+    var body: some View {
+        if model.autoConnecting {
+            HStack(spacing: 10) {
+                ProgressView().controlSize(.small)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("正在连接 \(model.connectedName ?? "泵")")
+                        .font(.footnote.weight(.semibold))
+                    Text(model.linkPhase.text)
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        } else if let note = model.connectionNote {
+            VStack(alignment: .leading, spacing: 10) {
+                Label(note, systemImage: "exclamationmark.triangle.fill")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack(spacing: 12) {
+                    Button("重试连接") { model.autoConnectIfPossible() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    Button("选择其他泵") { model.goToDiscovery() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    Spacer()
+                }
+
+                Text("泵不在附近、被 t:connect 占着、或者泵上的蓝牙关掉了，都会这样。数据停在断开前那一刻，请以泵屏幕为准。")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
+}
+
+// MARK: - 预测与建议
 struct PredictionCard: View {
     @EnvironmentObject var model: AppModel
 
