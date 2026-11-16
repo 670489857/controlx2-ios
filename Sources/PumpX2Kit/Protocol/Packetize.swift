@@ -1,9 +1,16 @@
 import Foundation
 
-/// 组包：opCode | txId | len | cargo [| timeSinceReset | hmac-sha1] | crc16，按 18/40 字节切片并逆序编号。
+/// 组包：opCode | txId | len | cargo [| timeSinceReset | hmac-sha1] | crc16，按 18 字节切片并逆序编号。
 public enum Packetize {
     public static let defaultMaxChunk = 18
-    public static let controlMaxChunk = 40
+    /// 控制请求的切片大小。
+    ///
+    /// upstream 里写的是 40，但源码注释自己标了 "this is a guess"。真实抓包
+    /// （t:connect 与 controlX2 导出的十六进制）里，控制请求一律按 18 字节切片，
+    /// 包括 61 字节的 `InitiateBolusRequest`。40 需要 ATT MTU ≥ 43 才能一次写完，
+    /// 而泵端重组只看「剩余片数」这一字节，18 在任何 MTU 下都成立。
+    /// 第一条真机签名写的报文不该同时赌两件没验证过的事，所以跟抓包保持一致。
+    public static let controlMaxChunk = 18
 
     public static func maxChunkSize(for message: PumpMessage) -> Int {
         if message.characteristic == .control && message.meta.type == .request {
@@ -31,8 +38,14 @@ public enum Packetize {
 
         if message.signed {
             guard !authKey.isEmpty else { throw ProtocolError.notAuthenticated }
-            // 时间戳位于 hmac 之前，参与签名
-            let time = ByteUtil.u32be(pumpTimeSinceReset)
+            // 时间戳位于 hmac 之前，参与签名。**小端**。
+            //
+            // 这里原来写的是大端，而且因为此前从没有真正发出过签名报文（读状态不需要签名，
+            // 配对阶段用的是 0x28 自带的摘要），单测只跟自己校验、怎么都能过。
+            // 抓包向量一对照就露了：泵计时 461510642（0x1B8217F2）在 `InitiateBolusRequest`
+            // 的签名尾里是 `f2 17 82 1b`，小端。写大端的话泵按自己的时钟解读会得到一个
+            // 离谱的时间值，签名即使算对也会被判为重放/过期。
+            let time = ByteUtil.u32le(pumpTimeSinceReset)
             frame.replaceSubrange((header - 24)..<(header - 20), with: time)
             let signedData = Array(frame[0..<(header - 20)])
             let hmac = HMAC.sha1(key: authKey, message: signedData)

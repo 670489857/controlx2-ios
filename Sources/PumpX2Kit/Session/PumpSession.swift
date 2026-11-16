@@ -1,10 +1,13 @@
 import Foundation
 
-/// 泵会话：事务 ID 管理、请求/响应配对、配对流程、只读状态刷新。
+/// 泵会话：事务 ID 管理、请求/响应配对、配对流程、只读状态刷新、大剂量。
 ///
 /// 配对成功后 `credentials` 会带上派生密钥；把它持久化（App 侧用 Keychain），
 /// 下次连接时调用 `resume(with:)` 即可跳过完整 JPAKE，不必再在泵上输配对码。
-/// 目前只实现「配对 + 读取」；给药指令（bolus / 基础率）在硬件验证通过前不启用。
+///
+/// 写入方向只开放了大剂量（授权 → 发起 → 取消 → 释放），基础率与暂停仍是
+/// `MOBI_ONLY`，X2 固件不接受。所有输注指令的剂量边界由上层 `BolusGuard` 负责，
+/// 这一层只管「把报文发对、把回包读懂」。
 public actor PumpSession {
 
     public enum SessionState: Equatable, Sendable {
@@ -46,6 +49,8 @@ public actor PumpSession {
         public var basalProfile: Double?
         public var basalModified: Bool = false
         public var lastUpdated: Date?
+        /// 当前/最近一次大剂量（CurrentBolusStatus 0x2D）。输注过程中靠它判断进度。
+        public var currentBolus: BolusMessages.BolusState?
         /// 最近一次读取的原始 cargo，按响应 opCode 索引。
         /// 只给「读数核对」页用：界面上的数字一旦和泵屏幕不一致，唯一能判断
         /// 「是解析错了还是泵就这么报的」的证据就是这几个字节。
@@ -408,6 +413,16 @@ public actor PumpSession {
             }
         }
 
+        // 当前大剂量（CurrentBolusStatus，0x2C → 0x2D）
+        // 有进行中的大剂量时，界面和「最近一次输注」都以这条为准，
+        // 而不是靠我们本地记的意图——泵才是事实来源。
+        if let frame = try? await request(BolusMessages.currentBolusStatusRequest(), expecting: 0x2D) {
+            snapshot.rawCargo[0x2D] = frame.cargo
+            if let b = BolusMessages.parseCurrentBolus(frame.cargo) {
+                snapshot.currentBolus = b
+            }
+        }
+
         // 泵计时（TimeSinceReset，0x36 → 0x37）：currentTime(4) + sinceReset(4)
         if let frame = try? await request(PumpMessage.request(characteristic: .currentStatus,
                                                               opCode: 0x36),
@@ -421,8 +436,97 @@ public actor PumpSession {
         snapshot.lastUpdated = Date()
     }
 
-    private func u16(_ b: [UInt8], _ o: Int) -> UInt16 {
-        UInt16(b[o]) | UInt16(b[o + 1]) << 8
+    // MARK: 大剂量
+
+    /// 申请一次输注许可。泵回一个 bolusId，后续 `InitiateBolus` 必须带着它。
+    ///
+    /// 这一步本身不输注。它的作用是让泵知道「这台设备要打，先占住这次输注」，
+    /// 避免两台手机同时下发。拿到号却不用，必须 `releaseBolusPermission`，
+    /// 否则泵那边会一直认为许可在被占用（另一处再来要，会收到 nackReason=3）。
+    public func requestBolusPermission() async throws -> BolusMessages.Permission {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let frame = try await request(BolusMessages.permissionRequest(), expecting: 0xA3,
+                                      timeout: .seconds(12))
+        snapshot.rawCargo[0xA3] = frame.cargo
+        guard let permission = BolusMessages.parsePermission(frame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        link.note("bolus: 授权 status=\(permission.status) bolusId=\(permission.bolusId)"
+                  + " nack=\(permission.nackReason)（\(permission.nackDescription)）")
+        guard permission.granted else {
+            throw BolusMessages.BolusError.permissionDenied(reason: permission.nackDescription)
+        }
+        return permission
+    }
+
+    /// 真正下发输注。返回泵的受理结果；`accepted == false` 表示泵没有接受。
+    ///
+    /// 这条报文会改变胰岛素输注，签名与泵计时必须都对：签名密钥错、
+    /// 或者 4 字节泵计时字节序错，泵都会直接拒。
+    public func initiateBolus(units: Double,
+                              permission: BolusMessages.Permission,
+                              typeBitmask: UInt8 = BolusMessages.TypeMask.now,
+                              carbsGrams: Int = 0,
+                              bgMgdl: Int = 0,
+                              iobUnits: Double = 0) async throws -> BolusMessages.InitiateResult {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let message = try BolusMessages.initiateBolus(units: units,
+                                                      bolusId: permission.bolusId,
+                                                      typeBitmask: typeBitmask,
+                                                      carbsGrams: carbsGrams,
+                                                      bgMgdl: bgMgdl,
+                                                      iobUnits: iobUnits)
+        link.note("bolus: 发起 \(units) U，bolusId=\(permission.bolusId)，"
+                  + "报文 \(message.cargo.count)B 载荷 + 24B 签名")
+        // 泵受理后会立刻开始推注，回包可能比写完还快，所以用较短超时；
+        // 超时也不能当成「没打」——剂量可能已经进去，界面上必须写「状态未知，去泵上核对」。
+        let frame = try await request(message, expecting: 0x9F, timeout: .seconds(12))
+        snapshot.rawCargo[0x9F] = frame.cargo
+        guard let result = BolusMessages.parseInitiate(frame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        link.note("bolus: 泵受理结果 status=\(result.status) type=\(result.statusType)"
+                  + " bolusId=\(result.bolusId)（accepted=\(result.accepted)）")
+        return result
+    }
+
+    /// 取消一次进行中的大剂量。泵上的取消同样是大剂量报文，需要签名。
+    public func cancelBolus(bolusId: Int) async throws -> BolusMessages.CancelResult {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let message = try BolusMessages.cancelBolus(bolusId: bolusId)
+        link.note("bolus: 取消 bolusId=\(bolusId)")
+        let frame = try await request(message, expecting: 0xA1, timeout: .seconds(10))
+        snapshot.rawCargo[0xA1] = frame.cargo
+        guard let result = BolusMessages.parseCancel(frame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        link.note("bolus: 取消结果 status=\(result.status) reason=\(result.reason)"
+                  + "（cancelled=\(result.cancelled)）")
+        return result
+    }
+
+    /// 把没用掉的输注许可还给泵。失败不致命，只留日志。
+    public func releaseBolusPermission(bolusId: Int) async throws {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let message = try BolusMessages.releasePermission(bolusId: bolusId)
+        let frame = try await request(message, expecting: 0xF1, timeout: .seconds(8))
+        let status = BolusMessages.parseRelease(frame.cargo)
+        link.note("bolus: 释放许可 bolusId=\(bolusId) status=\(status.map(String.init) ?? "解析失败")")
+    }
+
+    /// 读当前大剂量状态。输注过程中每 2 秒调一次，用来判断已经开始/已经结束。
+    public func readCurrentBolus() async throws -> BolusMessages.BolusState {
+        let frame = try await request(BolusMessages.currentBolusStatusRequest(), expecting: 0x2D,
+                                      timeout: .seconds(8))
+        snapshot.rawCargo[0x2D] = frame.cargo
+        guard let state = BolusMessages.parseCurrentBolus(frame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        snapshot.currentBolus = state
+        return state
+    }
+
+    private func u16(_ b: [UInt8], _ o: Int) -> UInt16 {        UInt16(b[o]) | UInt16(b[o + 1]) << 8
     }
 
     private func u32(_ b: [UInt8], _ o: Int) -> UInt32 {

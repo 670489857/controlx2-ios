@@ -60,6 +60,24 @@ struct ReadingRow: Identifiable {
     let note: String
 }
 
+/// 输注界面状态机。只描述「界面走到了哪一步」，不代表泵那边的真实状态——
+/// 泵的真实状态永远以 0x2D 与泵屏幕为准。
+enum BolusPhase: Equatable {
+    case idle
+    case requesting
+    case delivering
+    case cancelling
+    case done
+    case failed
+
+    var isBusy: Bool {
+        switch self {
+        case .requesting, .delivering, .cancelling: return true
+        case .idle, .done, .failed: return false
+        }
+    }
+}
+
 /// UI 层状态机。只负责展示与用户动作，协议细节全部在 PumpX2Kit。
 @MainActor
 final class AppModel: ObservableObject {    enum Phase: Equatable {
@@ -113,6 +131,29 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// 自动连接没成功的原因。只挂在页面上，不弹框——刚打开 App 就被弹窗挡住，
     /// 比多等几秒更难受。
     @Published var connectionNote: String?
+
+    // MARK: 大剂量（输注）
+    /// 输注总开关，默认关。第一次打开要走一遍风险确认。
+    @Published var bolusEnabled: Bool = UserDefaults.standard.bool(forKey: "bolusEnabled")
+    /// 是否已确认过「这是真泵、真会打进去」的那段说明
+    @Published var bolusRiskAccepted: Bool = UserDefaults.standard.bool(forKey: "bolusRiskAccepted")
+    /// 输入框里的剂量（U）。实际下发前会向下取整到 0.05 U。
+    @Published var bolusUnits: Double = 0.5
+    @Published var bolusPhase: BolusPhase = .idle
+    /// 面向用户的一句话，成功与失败都写在这里
+    @Published var bolusMessage: String?
+    /// 当前输入对应的闸门结论，界面逐条显示
+    @Published var bolusDecision: BolusDecision?
+    /// 泵报告的进行中大剂量（0x2D）
+    @Published var activeBolus: BolusMessages.BolusState?
+    /// 本机台账：只记这个 App 发出去的针
+    @Published var ledger: BolusLedger = BolusLedger.decode(UserDefaults.standard.data(forKey: "bolusLedger"))
+    @Published var bolusPolicy: BolusPolicy = AppModel.loadBolusPolicy()
+
+    /// 数值型读数：闸门要用数，不能拿格式化后的字符串去比
+    @Published var reservoirValue: Double?
+    @Published var glucoseValue: Int?
+    @Published var iobValue: Double?
 
     private let transport = BLETransport()
     private lazy var session = PumpSession(link: transport)
@@ -575,16 +616,21 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         if let units = snap.insulinUnits {
             // 泵在换筒/回抽途中会把剩余量标成估算，直接显示成精确值会误导
             insulinUnits = String(format: snap.insulinIsEstimate ? "≈%.0f U" : "%.0f U", units)
+            reservoirValue = units
         }
         if let g = snap.glucoseMgdl, let mmol = snap.glucoseMmol {
             glucoseText = "\(g)"
             glucoseSub = String(format: "%.1f mmol/L", mmol)
+            glucoseValue = g
             hasLiveData = true
         }
         trendSymbol = Self.trendSymbol(for: snap.glucoseTrend)
         if let iob = snap.iobUnits {
             iobText = String(format: "%.2f U", iob)
+            iobValue = iob
         }
+        activeBolus = snap.currentBolus
+        if snap.lastUpdated != nil { reviewBolus() }
         if let b = snap.batteryPercent {
             batteryText = "\(b)%"
         }
@@ -774,6 +820,180 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         }
     }
 
+    // MARK: 大剂量
+
+    static func loadBolusPolicy() -> BolusPolicy {
+        guard let data = UserDefaults.standard.data(forKey: "bolusPolicy"),
+              let p = try? JSONDecoder().decode(BolusPolicy.self, from: data)
+        else { return BolusPolicy() }
+        return p
+    }
+
+    func saveBolusPolicy() {
+        if let data = try? JSONEncoder().encode(bolusPolicy) {
+            UserDefaults.standard.set(data, forKey: "bolusPolicy")
+        }
+        reviewBolus()
+    }
+
+    func bolusContext() -> BolusContext {
+        let now = Date()
+        return BolusContext(requestedUnits: bolusUnits,
+                            now: now,
+                            policy: bolusPolicy,
+                            lastBolusAt: ledger.last(now: now)?.at,
+                            delivered24h: ledger.delivered(now: now),
+                            reservoirUnits: reservoirValue,
+                            glucoseMgdl: glucoseValue,
+                            iobUnits: iobValue)
+    }
+
+    /// 重新算一遍闸门。剂量、读数、参数任一变化都要调。
+    func reviewBolus() {
+        bolusDecision = BolusGuard.evaluate(bolusContext())
+    }
+
+    func setBolusEnabled(_ on: Bool) {
+        bolusEnabled = on
+        UserDefaults.standard.set(on, forKey: "bolusEnabled")
+        if !on { bolusUnits = 0.5 }
+        reviewBolus()
+    }
+
+    func acceptBolusRisk() {
+        bolusRiskAccepted = true
+        UserDefaults.standard.set(true, forKey: "bolusRiskAccepted")
+    }
+
+    func adjustBolusUnits(by delta: Double) {
+        bolusUnits = min(max(0, ((bolusUnits + delta) * 1000).rounded() / 1000), 20)
+        reviewBolus()
+    }
+
+    private func persistLedger() {
+        if let data = ledger.jsonData() {
+            UserDefaults.standard.set(data, forKey: "bolusLedger")
+        }
+    }
+
+    /// 输注：授权 → 发起 → 轮询状态。任何一步出错都要把已拿到的许可还回去。
+    func startBolus() {
+        let decision = BolusGuard.evaluate(bolusContext())
+        bolusDecision = decision
+        guard bolusEnabled, bolusRiskAccepted else {
+            bolusMessage = "请先打开「允许输注」并确认风险说明"
+            return
+        }
+        guard decision.allowed else {
+            bolusMessage = decision.blocks
+                .map { "\($0.reason.explanation)：\($0.detail)" }
+                .joined(separator: "\n")
+            return
+        }
+        guard linkPhase.isReady else {
+            bolusMessage = "链路未就绪，先等连接恢复再试"
+            return
+        }
+        let units = decision.units
+        bolusPhase = .requesting
+        bolusMessage = "正在向泵申请输注授权…"
+        Task {
+            var granted: BolusMessages.Permission?
+            do {
+                // 重连后 authKey 会被清掉，没补认证就发控制报文，泵会直接 Nack
+                await resumeAfterReconnectIfNeeded()
+                let permission = try await session.requestBolusPermission()
+                granted = permission
+                bolusMessage = "泵已给出 bolusId=\(permission.bolusId)，正在下发输注…"
+
+                let result = try await session.initiateBolus(
+                    units: units,
+                    permission: permission,
+                    carbsGrams: 0,
+                    bgMgdl: glucoseValue ?? 0,
+                    iobUnits: iobValue ?? 0
+                )
+                guard result.accepted else {
+                    bolusPhase = .failed
+                    bolusMessage = "泵没有接受这次输注：status=\(result.status)，statusType=\(result.statusType)。剂量没有下发。"
+                    try? await session.releaseBolusPermission(bolusId: permission.bolusId)
+                    return
+                }
+                bolusPhase = .delivering
+                bolusMessage = "泵已受理 \(String(format: "%.2f", units)) U，开始输注"
+                ledger.append(units: units, at: Date())
+                persistLedger()
+                reviewBolus()
+                await pollBolus(bolusId: permission.bolusId)
+            } catch {
+                bolusPhase = .failed
+                // 超时不能断言「没打」：报文可能已经到了泵，剂量正在进。
+                bolusMessage = "输注没有走完：\(error.localizedDescription)。请立刻到泵屏幕核对实际输注量。"
+                if let g = granted {
+                    try? await session.releaseBolusPermission(bolusId: g.bolusId)
+                }
+            }
+        }
+    }
+
+    /// 每 2 秒读一次当前大剂量状态。连续三次读不到进行中的大剂量才算结束，
+    /// 因为泵在受理后要先切状态，第一次读很可能还是旧的空值。
+    private func pollBolus(bolusId: Int) async {
+        var emptyReads = 0
+        for _ in 0..<300 {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            guard let state = try? await session.readCurrentBolus() else { continue }
+            activeBolus = state
+            let idle = state.bolusId == 0 || state.statusId == 0
+            emptyReads = idle ? emptyReads + 1 : 0
+            if emptyReads >= 3 {
+                activeBolus = nil
+                bolusPhase = .done
+                bolusMessage = "泵已不再报告进行中的大剂量，本次输注结束"
+                try? await session.releaseBolusPermission(bolusId: bolusId)
+                return
+            }
+        }
+        bolusMessage = "10 分钟内没等到结束。请到泵屏幕核对剩余量，不要凭界面判断。"
+    }
+
+    /// 取消进行中的输注。取消是另一条签名报文，泵不认就只能在泵屏幕上按。
+    func cancelActiveBolus() {
+        guard let id = activeBolus?.bolusId, id > 0 else {
+            bolusMessage = "没有正在进行的输注（泵没有报告 bolusId）"
+            return
+        }
+        guard linkPhase.isReady else {
+            bolusMessage = "链路已断，取消发不出去。立即在泵屏幕上按「取消」"
+            return
+        }
+        bolusPhase = .cancelling
+        bolusMessage = "正在请求泵取消 bolusId=\(id)…"
+        Task {
+            do {
+                let result = try await session.cancelBolus(bolusId: id)
+                if result.cancelled {
+                    bolusPhase = .done
+                    bolusMessage = "泵已取消，剩余剂量不会再进。已经进到体内的部分收不回来。"
+                    activeBolus = nil
+                } else {
+                    bolusPhase = .delivering
+                    bolusMessage = "泵没有确认取消（status=\(result.status)，reason=\(result.reason)），立即在泵屏幕上按取消"
+                }
+            } catch {
+                bolusPhase = .delivering
+                bolusMessage = "取消失败：\(error.localizedDescription)。立即在泵屏幕上按取消"
+            }
+        }
+    }
+
+    func resetBolusState() {
+        bolusPhase = .idle
+        bolusMessage = nil
+        activeBolus = nil
+    }
+
     // MARK: 设置
 
     static func loadSettings() -> AdvisorSettings {
@@ -786,6 +1006,9 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     func saveSettings() {
         guard let data = try? JSONEncoder().encode(advisorSettings) else { return }
         UserDefaults.standard.set(data, forKey: Self.settingsKey)
+        // 大剂量的边界也在这里落盘：它在设置页上与 ISF/CR 同一屏，用户按一次「保存」
+        // 就该把这一屏的改动全部记住，不该分两次。
+        saveBolusPolicy()
         // 参数一改就要重算，否则界面还挂着旧参数算出来的剂量
         Task {
             let snap = await session.snapshot
@@ -858,7 +1081,7 @@ struct DisclaimerView: View {
                 Text("控制胰岛素泵是一个高风险操作").font(.title2).bold()
                 Group {
                     Text("本应用是实验性研究工具，未经任何监管机构批准，与 Tandem、Dexcom 无关联。")
-                    Text("本版本只提供「配对」与「读取状态」，不包含任何输注指令（大剂量、基础率）。")
+                    Text("本版本提供「配对」「读取状态」与「大剂量输注」。大剂量会真的把胰岛素打进体内；基础率、暂停、闭环仍然不可用。")
                     Text("读数可能滞后或错误，任何治疗决定都必须以泵屏幕为准。")
                     Text("继续使用即表示你理解并自担全部风险。")
                 }
@@ -1085,6 +1308,16 @@ struct DashboardView: View {
                 PredictionCard()
                 AdviceCard()
 
+                NavigationLink {
+                    BolusView()
+                } label: {
+                    Label(model.bolusEnabled && model.bolusRiskAccepted ? "大剂量 · 输注已启用" : "大剂量",
+                          systemImage: "drop.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
                 HStack(spacing: 12) {
                     MetricCard(title: "活性胰岛素", value: model.iobText, caption: "IOB")
                     MetricCard(title: "药筒余量", value: model.insulinUnits, caption: "reservoir")
@@ -1133,7 +1366,7 @@ struct DashboardView: View {
                     Text("凭据只存在本机 Keychain，删除后不影响泵上的其他配对设备。")
                 }
 
-                Text("本版本只读取状态，不含任何输注指令。")
+                Text("本版本包含大剂量输注；基础率、暂停、闭环仍然不可用。")
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.top, 4)
 
@@ -1379,6 +1612,33 @@ struct AdvisorSettingsView: View {
             }
 
             Section {
+                LabeledContent("单次上限（U）") {
+                    TextField("5", value: $model.bolusPolicy.maxSingleUnits, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("24 小时上限（U）") {
+                    TextField("12", value: $model.bolusPolicy.max24hUnits, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("最小间隔（分）") {
+                    TextField("60", value: $model.bolusPolicy.minIntervalMinutes, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+                LabeledContent("低血糖阈值") {
+                    TextField("80", value: $model.bolusPolicy.lowGlucoseThreshold, format: .number)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.decimalPad)
+                }
+            } header: {
+                Text("大剂量边界")
+            } footer: {
+                Text("这几条是 App 侧闸门，命中任一条就不发输注报文。泵自己的单次上限另算。改完点右上角「保存」，否则下次进大剂量页还是旧值。")
+            }
+
+            Section {
                 LabeledContent("影子记录条数", value: "\(model.shadowCount)")
                 Button("清空记录", role: .destructive) { showClearShadow = true }
             } header: {
@@ -1422,15 +1682,268 @@ struct SafetyView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
-                Text("为什么只读").font(.headline)
-                Text("输注指令必须在真实泵上逐条验证（配对、权限握手、签名、剂量边界、断连恢复）。在这些验证完成前开放给药，风险不可接受。")
+                Text("现在能做什么").font(.headline)
+                Text("""
+                读取：血糖、趋势、IOB、药筒余量、基础率、电量、泵计时。
+                写入：只有大剂量（bolus），走「申请授权 → 发起 → 轮询状态 → 可取消」。
+                不能写入：基础率（0xA4/0xA6）、暂停与恢复（0x9C/0x9A）——这些在 X2 固件里是 MOBI_ONLY，泵不接受。
+                """)
+                Text("打药前拦六道").font(.headline)
+                Text("""
+                • 剂量小于 0.05 U：不发
+                • 超过单次上限（默认 5 U，可改）：不发
+                • 与上次间隔不足（默认 60 分钟）：不发
+                • 24 小时累计超上限（默认 12 U）：不发
+                • 当前血糖低于阈值（默认 80 mg/dL）：不发
+                • 药筒余量不够，或余量读不到：不发
+
+                IOB 偏高、没有血糖读数只会提示，不会拦住——因为它们是推断，不是事实。
+                """)
                 Text("已知限制").font(.headline)
-                Text("• iOS 无长驻后台服务，息屏后连接可能被系统挂起\n• 泵若在另一台手机上配对，需先解绑\n• 固件升级可能改变报文长度与语义")
+                Text("""
+                • iOS 无长驻后台服务，息屏后连接可能被系统挂起；挂起期间泵会照常推完，App 看不到进度
+                • 「24 小时累计」只统计这个 App 发出的针，泵上直接按的不在内
+                • 授权与发起的报文已按抓包逐字节核对，但泵是否受理、推注速度、取消时序仍需真机确认
+                • 固件升级可能改变报文长度与语义
+                """)
             }
             .font(.callout)
             .padding()
         }
         .navigationTitle("安全说明")
+    }
+}
+
+// MARK: - 大剂量
+
+/// 输注页。
+///
+/// 这一页和「建议」是两件不同的事：建议页算的是「该不该补」，这一页做的是
+/// 「把剂量真的送进泵」。所以这里没有推荐值，只有用户自己输的数，
+/// 加闸门、加二次确认、加取消，每一步都把「泵说的」和「我们以为的」分开写。
+struct BolusView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var showConfirm = false
+    @State private var showCancelConfirm = false
+
+    private var decision: BolusDecision {
+        model.bolusDecision ?? BolusGuard.evaluate(model.bolusContext())
+    }
+
+    private var canDeliver: Bool {
+        model.bolusEnabled && model.bolusRiskAccepted && decision.allowed
+            && !model.bolusPhase.isBusy && model.linkPhase.isReady
+    }
+
+    var body: some View {
+        Form {
+            if !model.bolusRiskAccepted {
+                riskSection
+            } else {
+                enableSection
+                doseSection
+                gateSection
+                actionSection
+                ledgerSection
+            }
+        }
+        .navigationTitle("大剂量")
+        .onAppear { model.reviewBolus() }
+        .confirmationDialog(
+            "确认输注 \(String(format: "%.2f", decision.units)) U？",
+            isPresented: $showConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("输注 \(String(format: "%.2f", decision.units)) U", role: .destructive) {
+                model.startBolus()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("泵收到后立刻开始推注，App 断线也不会停。要停只能在泵屏幕上按取消，或在本页点「取消输注」。")
+        }
+    }
+
+    private var riskSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 10) {
+                Label("这一段会真的把胰岛素打进身体里", systemImage: "exclamationmark.triangle.fill")
+                    .font(.headline)
+                    .foregroundStyle(.red)
+                Text("""
+                大剂量报文已按 pumpX2 的抓包向量逐字节核对（含签名与泵计时），但「泵在真机上是否受理、推注速度是否符合预期」只能由你自己确认。
+
+                第一次使用请按这个顺序：
+                • 手边备好急救糖，别在无人看护时试
+                • 先打 0.05 U 最小剂量，核对泵屏幕上的大剂量记录与这里一致
+                • 任何一次出现「输注没有走完」「没有确认取消」，立刻到泵屏幕核对实际输注量，不要凭界面判断
+
+                这不是医疗器械，未经任何监管批准。
+                """)
+                .font(.callout)
+                Button("我已理解，启用输注") { model.acceptBolusRisk() }
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    private var enableSection: some View {
+        Section {
+            Toggle("允许输注", isOn: Binding(get: { model.bolusEnabled },
+                                          set: { model.setBolusEnabled($0) }))
+            LabeledContent("链路", value: model.linkPhase.text)
+            LabeledContent("泵回报的当前大剂量", value: model.activeBolus?.statusName ?? "无")
+        } footer: {
+            Text("关掉后界面不会再发 0x9E / 0xA0 这类会改变输注的报文。")
+        }
+    }
+
+    private var doseSection: some View {
+        Section {
+            HStack {
+                Button { model.adjustBolusUnits(by: -0.05) } label: {
+                    Image(systemName: "minus.circle.fill").font(.title2)
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
+
+                Spacer()
+                Text(String(format: "%.2f U", model.bolusUnits))
+                    .font(.system(size: 42, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                Spacer()
+
+                Button { model.adjustBolusUnits(by: 0.05) } label: {
+                    Image(systemName: "plus.circle.fill").font(.title2)
+                }
+                .buttonStyle(.plain)
+                .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
+            }
+            .padding(.vertical, 6)
+
+            HStack(spacing: 10) {
+                ForEach([0.5, 1.0, 2.0, 3.0], id: \.self) { preset in
+                    Button(String(format: "%.1f", preset)) {
+                        model.bolusUnits = preset
+                        model.reviewBolus()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
+                }
+            }
+        } header: {
+            Text("剂量")
+        } footer: {
+            Text("步进 0.05 U。实际下发前会再向下取整一次，只会少不会多。")
+        }
+    }
+
+    private var gateSection: some View {
+        Section {
+            if decision.allowed {
+                Label("全部闸门通过，将下发 \(String(format: "%.2f", decision.units)) U",
+                      systemImage: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            }
+            ForEach(decision.blocks, id: \.detail) { block in
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(block.reason.explanation, systemImage: "xmark.octagon.fill")
+                        .foregroundStyle(.red)
+                    Text(block.detail).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            ForEach(decision.warnings, id: \.self) { warning in
+                Label(warning, systemImage: "exclamationmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+            Button("重新检查") { model.refresh(); model.reviewBolus() }
+                .font(.footnote)
+        } header: {
+            Text("输注前检查")
+        } footer: {
+            Text(String(format: "单次上限 %.2f U · 24 小时上限 %.2f U · 最小间隔 %.0f 分钟 · 低血糖阈值 %.0f mg/dL。上限在「建议参数」里改。",
+                        model.bolusPolicy.maxSingleUnits,
+                        model.bolusPolicy.max24hUnits,
+                        model.bolusPolicy.minIntervalMinutes,
+                        model.bolusPolicy.lowGlucoseThreshold))
+        }
+    }
+
+    private var actionSection: some View {
+        Section {
+            if let message = model.bolusMessage {
+                Text(message)
+                    .font(.callout)
+                    .foregroundStyle(model.bolusPhase == .failed ? Color.red : Color.secondary)
+            }
+
+            if model.bolusPhase == .delivering || model.bolusPhase == .cancelling {
+                if let active = model.activeBolus {
+                    LabeledContent("正在输注", value: String(format: "%.2f U", active.requestedUnits))
+                }
+                Button(role: .destructive) {
+                    showCancelConfirm = true
+                } label: {
+                    Label("取消输注", systemImage: "stop.circle.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(model.bolusPhase == .cancelling)
+            } else if model.bolusPhase == .requesting {
+                HStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("正在与泵交互…").font(.footnote)
+                }
+            } else {
+                Button {
+                    showConfirm = true
+                } label: {
+                    Label("请求授权并输注", systemImage: "drop.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(!canDeliver)
+            }
+
+            if model.bolusPhase == .done || model.bolusPhase == .failed {
+                Button("回到初始状态") { model.resetBolusState() }
+                    .font(.footnote)
+            }
+        }
+        .confirmationDialog("取消这次输注？", isPresented: $showCancelConfirm,
+                            titleVisibility: .visible) {
+            Button("取消输注", role: .destructive) { model.cancelActiveBolus() }
+            Button("继续输注", role: .cancel) {}
+        } message: {
+            Text("只能取消还没推进去的部分；已经进到体内的收不回来。泵若没有回应取消，必须去泵屏幕上按。")
+        }
+    }
+
+    private var ledgerSection: some View {
+        Section {
+            LabeledContent("本机 24 小时累计",
+                           value: String(format: "%.2f U", model.ledger.delivered(now: Date())))
+            if model.ledger.records.isEmpty {
+                Text("还没有记录").font(.footnote).foregroundStyle(.secondary)
+            } else {
+                ForEach(model.ledger.records.suffix(5).reversed(), id: \.at) { record in
+                    HStack {
+                        Text(record.at.formatted(date: .omitted, time: .shortened))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "%.2f U", record.units))
+                            .font(.system(.caption, design: .monospaced))
+                    }
+                }
+            }
+        } header: {
+            Text("台账")
+        } footer: {
+            Text("只记这个 App 发出去的针。在泵上直接按的大剂量不在这里，所以 24 小时累计只是下限，不是总量。")
+        }
     }
 }
 
