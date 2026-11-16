@@ -822,7 +822,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 
     // MARK: 大剂量
 
-    static func loadBolusPolicy() -> BolusPolicy {
+    nonisolated static func loadBolusPolicy() -> BolusPolicy {
         guard let data = UserDefaults.standard.data(forKey: "bolusPolicy"),
               let p = try? JSONDecoder().decode(BolusPolicy.self, from: data)
         else { return BolusPolicy() }
@@ -898,6 +898,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         bolusPhase = .requesting
         bolusMessage = "正在向泵申请输注授权…"
         Task {
+            // 声明放在 Task 里面：拿到授权后要跨 catch 复用，放在外面会被并发闭包捕获
             var granted: BolusMessages.Permission?
             do {
                 // 重连后 authKey 会被清掉，没补认证就发控制报文，泵会直接 Nack

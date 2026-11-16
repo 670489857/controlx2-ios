@@ -27,16 +27,18 @@ final class BolusMessageTests: XCTestCase {
     }
 
     func testPermissionResponseFromCapture() throws {
-        // 同一段抓包里泵的回复：status=30, bolusId=10652, nackReason=0
-        let permission = try XCTUnwrap(BolusMessages.parsePermission(try Hex.decode("1e009c290000")))
-        XCTAssertEqual(permission.status, 30)
+        // 同一段抓包里泵的回复。cargo 从帧长度字节之后才开始，
+        // 「1e」是 len(30) 不是 status，这一点看错会把 status 读成 30。
+        let permission = try XCTUnwrap(BolusMessages.parsePermission(try Hex.decode("009c29000000")))
+        XCTAssertEqual(permission.status, 0)
         XCTAssertEqual(permission.bolusId, 10652)
         XCTAssertEqual(permission.nackReason, 0)
         XCTAssertTrue(permission.granted, "nackReason=0 且给了 bolusId，泵是给这次输注发号了")
     }
 
     func testPermissionDeniedWhenNack() throws {
-        let busy = try XCTUnwrap(BolusMessages.parsePermission(try Hex.decode("000000000300")))
+        // status=0, bolusId=0, 保留 0,0, nackReason=3（泵上已有另一处持有许可）
+        let busy = try XCTUnwrap(BolusMessages.parsePermission(try Hex.decode("000000000003")))
         XCTAssertEqual(busy.nackReason, 3)
         XCTAssertFalse(busy.granted)
         XCTAssertTrue(busy.nackDescription.contains("另一处"))
@@ -76,15 +78,24 @@ final class BolusMessageTests: XCTestCase {
     }
 
     func testInitiateBolusCarriesMetadataWithoutChangingVolume() throws {
+        // 对应抓包 testInitiateBolusRequest_ID10652_013u_13g_carbs_142mgdl：
+        // 0.13 U、13 g 碳水、142 mg/dL、bolusId=10652。
+        // 逐字段断言而不是整段比字符串——偏移错一位时，报错会直接指到是哪个字段。
         let msg = try BolusMessages.initiateBolus(units: 0.13,
                                                   bolusId: 10652,
                                                   typeBitmask: BolusMessages.TypeMask.now,
                                                   foodVolumeUnits: 0.13,
                                                   carbsGrams: 13,
                                                   bgMgdl: 142)
-        XCTAssertEqual(Hex.encode(Array(msg.cargo[0..<21])), "820000009c29000001820000000000000d008e00")
-        XCTAssertEqual(InsulinUnit.fromMilli(BolusMessages.leU16(msg.cargo, 17)), 13)
+        XCTAssertEqual(msg.cargo.count, 37)
+        XCTAssertEqual(BolusMessages.leU32(msg.cargo, 0), 130)
+        XCTAssertEqual(BolusMessages.leU16(msg.cargo, 4), 10652)
+        XCTAssertEqual(msg.cargo[8], BolusMessages.TypeMask.now)
+        XCTAssertEqual(BolusMessages.leU32(msg.cargo, 9), 130)
+        XCTAssertEqual(BolusMessages.leU32(msg.cargo, 13), 0)
+        XCTAssertEqual(BolusMessages.leU16(msg.cargo, 17), 13)
         XCTAssertEqual(BolusMessages.leU16(msg.cargo, 19), 142)
+        XCTAssertEqual(BolusMessages.leU32(msg.cargo, 21), 0)
     }
 
     func testInitiateBolusRoundTripsVolume() throws {
@@ -126,7 +137,7 @@ final class BolusMessageTests: XCTestCase {
         XCTAssertTrue(ok.cancelled)
         XCTAssertEqual(ok.bolusId, 10650)
 
-        let alreadyDone = try XCTUnwrap(BolusMessages.parseCancel(try Hex.decode("019a290002")))
+        let alreadyDone = try XCTUnwrap(BolusMessages.parseCancel(try Hex.decode("019a290200")))
         XCTAssertFalse(alreadyDone.cancelled)
         XCTAssertEqual(alreadyDone.reason, 2)
     }
