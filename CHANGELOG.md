@@ -6,6 +6,50 @@
 
 产物命名：`ControlX2-<版本>-b<构建号>-<短SHA>.ipa`。
 
+## 0.2.6 — 2026-11-16
+
+### 现场日志定位：前四轮全部通过，卡在第 6 条报文
+
+0.2.5 的日志终于完整了：`0x20→0x21`、`0x22→0x23`、`0x24→0x25`、`0x26→0x27` 一来一回全对，
+泵在第 5 条 `0x27` 里给出 8 字节 nonce，随后我们发 `0x28`，**1.2 秒后泵主动断开，连 0x29 都不给**。
+
+这条路径上没有 CRC 错误、没有超时、没有事务号错位的痕迹——泵是「验过摘要，不认，直接掐线」。
+所以问题只可能在 `0x28` 的 50 字节内容里，而其中唯一依赖密码学计算的就是那 32 字节摘要。
+
+### 根因：HKDF 的密钥与消息写反了
+
+pumpX2 的私有方法是 `updateMacWithKeyMaterial(byte[] keyMaterial, byte[] data)`，
+调用处却写成 `updateMacWithKeyMaterial(nonce, keyMaterial)`——于是：
+
+```
+PRK = HMAC-SHA256(key = nonce3, data = derivedSecret)     ← 本实现写成了反过来
+OKM = HMAC-SHA256(key = PRK,   data = 0x01)[0..32]
+digest = HMAC-SHA256(key = OKM, data = clientNonce4)
+```
+
+写反了同样输出 32 字节，同样能通过任何「双方都用自己实现」的自测，但泵算出的摘要不同。
+用 JDK 直接跑 pumpX2 的 `Hkdf.java` 取到确定值：
+
+| 输入 | 正确输出 | 本实现（写反） |
+|---|---|---|
+| nonce `e734344901549417`、key `e7343449…83aa` | `c47d71d7…f03e9` | `d0aba68b…71432` |
+
+### 同时修掉：配对后的签名密钥用错了
+
+pumpX2 `PumpStateSupplier.determinePumpAuthKey` 对 v7.7+ 固件返回的是
+`HKDF(nonce3, derivedSecret)`，不是 JPAKE 原始派生值。原来把派生值直接当签名密钥，
+配对一旦成功，第一条带签名的请求（大剂量、暂停、设置基础率）都会因 HMAC 不匹配被拒。
+现在 `0x27` 收到 nonce 的当口就把签名密钥换成 HKDF 结果。
+
+### 测试
+
+- `testHKDFMatchesPumpX2`：用 JDK 实跑 pumpX2 原码得到的向量钉死参数顺序。
+- `testKeyConfirmationDigest`：钉死 `0x28` 的 32 字节摘要。
+- `testResumeKeyConfirmationDigest`：快速重连走完 `0x26 → 0x27 → 0x28`，
+  逐字段校验 50 字节载荷与签名密钥。
+
+这三个用例在修复前全部失败，是这次唯一能证明「泵会认」的东西——真机之前的每一轮都是猜。
+
 ## 0.2.5 — 2026-11-16
 
 ### 根因：0x10 是旧固件协议，v7.7+ 的泵只认 JPAKE

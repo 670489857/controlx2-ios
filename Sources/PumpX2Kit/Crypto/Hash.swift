@@ -121,11 +121,20 @@ public enum HMAC {
 // MARK: - HKDF（与 pumpX2 `Hkdf.build` 等价）
 
 public enum HKDF {
-    /// pumpX2: build(nonce, keyMaterial) = HMAC-SHA256(key: keyMaterial, data: nonce) 作为 PRK，
-    /// 再用 expand(PRK, nonce: [], 32) 输出 32 字节。注意其 expand 的 block 计数器从 1 开始、用 hex 解码。
+    /// pumpX2 `Hkdf.build(nonce, keyMaterial)`：PRK = HMAC-SHA256(**key: nonce**, data: keyMaterial)，
+    /// 再用 expand(PRK, info: [], 32) 输出 32 字节。expand 的 block 计数器从 1 开始。
+    ///
+    /// 参数顺序是这里唯一的坑：pumpX2 的私有方法签名是
+    /// `updateMacWithKeyMaterial(byte[] keyMaterial, byte[] data)`，调用处写的是
+    /// `updateMacWithKeyMaterial(nonce, keyMaterial)`——于是 HMAC 的**密钥**是 nonce，
+    /// **消息**才是派生密钥。写反了照样输出 32 字节、照样能通过自测，但泵算出的
+    /// 摘要不同，第 6 步（0x28）会被静默拒绝并断链，日志上看不出任何错误码。
+    /// 用 JDK 实跑 pumpX2 原码校验：nonce=e734344901549417、
+    /// key=e7343449…83aa 时输出 c47d71d77ff8a9001f53ee15fcdccfc0b3bd85232e8be18ec431f2f5f16f03e9。
     public static func build(nonce: [UInt8], keyMaterial: [UInt8]) -> [UInt8] {
-        let key = keyMaterial.isEmpty ? [UInt8](repeating: 0, count: 32) : keyMaterial
-        let prk = HMAC.sha256(key: key, message: nonce)
+        // pumpX2 的 newSecretKeySpec 对空密钥补 32 个 0；补的是 HMAC 的密钥，也就是 nonce
+        let key = nonce.isEmpty ? [UInt8](repeating: 0, count: 32) : nonce
+        let prk = HMAC.sha256(key: key, message: keyMaterial)
         return expand(prk: prk, info: [], length: 32)
     }
 

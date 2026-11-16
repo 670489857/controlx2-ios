@@ -151,4 +151,37 @@ final class AuthFlowTests: XCTestCase {
         }
         XCTAssertEqual(link.ops.filter { $0 == 0x20 }.count, 1)
     }
+
+    /// 快速重连的第 4 步摘要必须能被泵验过。
+    ///
+    /// 现场日志里 0x20→0x21…0x26→0x27 全部正常，唯独 0x28 发出后 1.2 秒被泵断开、
+    /// 连 0x29 都不给——原因就是摘要的 HKDF 把 nonce 和密钥材料的角色弄反了。
+    func testResumeKeyConfirmationDigest() throws {
+        let secret = (0...31).map { UInt8($0) }
+        let auth = try JPAKEAuth(derivedSecret: secret, appInstanceId: 0,
+                                 random: FixedRandomSource(hex: "99aabbccddeeff00"))
+
+        let first = try XCTUnwrap(try auth.nextRequest())
+        XCTAssertEqual(first.opCode, 0x26)
+
+        // 泵的 0x27：appInstanceId(2) + deviceKeyNonce(8) + reserved(8)
+        var resp: [UInt8] = [0, 0]
+        resp += Hex.decode("1122334455667788")
+        resp += [UInt8](repeating: 0, count: 8)
+        try auth.process(opCode: 0x27, cargo: resp)
+
+        let fourth = try XCTUnwrap(try auth.nextRequest())
+        XCTAssertEqual(fourth.opCode, 0x28)
+        XCTAssertEqual(fourth.cargo.count, 50, "0x28 固定 50 字节")
+        XCTAssertEqual(Array(fourth.cargo[2..<10]), Hex.decode("99aabbccddeeff00"), "客户端 nonce 在前")
+        XCTAssertEqual(Array(fourth.cargo[10..<18]), [UInt8](repeating: 0, count: 8), "reserved 全 0")
+        XCTAssertEqual(Hex.encode(Array(fourth.cargo[18..<50])),
+                       "60416617f993a8871a4c80d5d2d83c549644774be11dcb03c3d75c7a5aa60020",
+                       "摘要 = HMAC-SHA256(key: HKDF(nonce3, secret), data: nonce4)")
+
+        // 配对后的签名密钥同样是 HKDF(nonce3, secret)，不是 JPAKE 原始派生值。
+        // 用错了，配对照样显示成功，但第一条签名报文必被泵拒。
+        XCTAssertEqual(Hex.encode(try XCTUnwrap(auth.authenticationKey)),
+                       "9975790885aa35399285519cf4c1e0413487fbdf92ceb3d7910383cb1b49e67f")
+    }
 }

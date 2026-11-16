@@ -170,7 +170,6 @@ public final class JPAKEAuth {
 
         case .round2Received:
             derivedSecret = try jpake.deriveSecret()
-            authenticationKey = derivedSecret
             step = .confirm3Sent
             return AuthMessages.jpake(0x26, payload: [])
 
@@ -226,6 +225,7 @@ public final class JPAKEAuth {
         case 0x27: // Jpake3SessionKeyResponse
             guard cargo.count >= 18 else { throw ProtocolError.truncated }
             serverNonce3 = Array(cargo[2..<10])
+            refreshAuthenticationKey()
             step = .confirm3Received
 
         case 0x29: // Jpake4KeyConfirmationResponse
@@ -237,6 +237,17 @@ public final class JPAKEAuth {
         default:
             break
         }
+    }
+
+    /// 签名报文的密钥。**不是** JPAKE 的原始派生值，而是再套一次 HKDF：
+    /// `HKDF(nonce: serverNonce3, keyMaterial: derivedSecret)`，与 pumpX2
+    /// `PumpStateSupplier.determinePumpAuthKey` 一致。
+    ///
+    /// 之前把原始派生值当签名密钥，配对即使成功，第一条带签名的请求（剂量、暂停、
+    /// 设置基础率）也会因为 HMAC 不匹配被泵拒绝。
+    private func refreshAuthenticationKey() {
+        guard let secret = derivedSecret, serverNonce3.count == 8 else { return }
+        authenticationKey = HKDF.build(nonce: serverNonce3, keyMaterial: secret)
     }
 
     /// 旧固件（16 位字母数字码）第二步：对中央挑战的 hmacKey 做 HMAC-SHA1
