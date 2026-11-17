@@ -155,7 +155,7 @@ private struct LockScreenCard: View {
 
             VStack(alignment: .trailing, spacing: 5) {
                 HStack(spacing: 6) {
-                    Sparkline(values: state.spark, color: Palette.accent(for: state.glucoseValue))
+                    Sparkline(values: state.spark)
                         .stroke(Palette.accent(for: state.glucoseValue).opacity(0.85), lineWidth: 2)
                         .frame(width: 84, height: 22)
                     Text(timeText)
