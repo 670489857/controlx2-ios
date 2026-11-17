@@ -154,7 +154,6 @@ final class BolusSafetyTests: XCTestCase {
         XCTAssertTrue(decoded.records.isEmpty)
         XCTAssertTrue(BolusLedger.decode(nil).records.isEmpty)
     }
-}
 
     // MARK: 闸门可关闭（0 = 不限）
 
