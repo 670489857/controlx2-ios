@@ -121,6 +121,13 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// IOB 读不到时预测无意义，UI 需要据此降级而不是显示 0
     @Published var iobUnavailable = false
 
+    /// 泵自带 Control-IQ 的状态（只读）。这里刻意不叫「闭环」：
+    /// 跑算法的是泵，App 不改任何输注参数，叫闭环会让人以为是我们控的。
+    @Published var controlIQ: ControlIQMessages.Info?
+    @Published var controlIQSleep: ControlIQMessages.SleepSchedule?
+    @Published var controlIQError: String?
+    @Published var controlIQLoading = false
+
     /// 基础率卡片的副标题：当前值与配置值不一致时把配置值写出来
     @Published var basalHint: String = "basal"
     /// 读数核对表
@@ -650,6 +657,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
                 basalHint = "basal"
             }
         }
+        controlIQ = snap.controlIQ
         if let t = snap.lastUpdated {
             lastUpdated = t.formatted(date: .omitted, time: .standard)
         }
@@ -844,6 +852,25 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             basalProfileError = nil
         } catch {
             basalProfileError = error.localizedDescription
+        }
+    }
+
+    // MARK: 闭环状态（只读，读泵自带 Control-IQ）
+
+    func loadControlIQ() async {
+        guard linkPhase.isReady else {
+            controlIQError = "链路未就绪，先等连接恢复"
+            return
+        }
+        controlIQLoading = true
+        defer { controlIQLoading = false }
+        do {
+            controlIQ = try await session.readControlIQ()
+            // 睡眠表是 2 条报文，读失败不影响主状态
+            controlIQSleep = try? await session.readSleepSchedule()
+            controlIQError = nil
+        } catch {
+            controlIQError = error.localizedDescription
         }
     }
 
@@ -1335,6 +1362,13 @@ struct DashboardView: View {
                 AdviceCard()
 
                 NavigationLink {
+                    ControlIQView()
+                } label: {
+                    ControlIQSummaryCard()
+                }
+                .buttonStyle(.plain)
+
+                NavigationLink {
                     BolusView()
                 } label: {
                     Label(model.bolusEnabled && model.bolusRiskAccepted ? "大剂量 · 输注已启用" : "大剂量",
@@ -1393,7 +1427,7 @@ struct DashboardView: View {
                     Text("凭据只存在本机 Keychain，删除后不影响泵上的其他配对设备。")
                 }
 
-                Text("本版本包含大剂量输注；基础率、暂停、闭环仍然不可用。")
+                Text("本版本包含大剂量输注；基础率与暂停仍由泵固件拒绝写入。闭环状态只读——跑 Control-IQ 的是泵，不是本 App。")
                     .font(.caption2).foregroundStyle(.secondary)
                     .padding(.top, 4)
 
@@ -1702,6 +1736,162 @@ struct AdvisorSettingsView: View {
         } message: {
             Text("这条不可撤销，两周的数据会一起没。")
         }
+    }
+}
+
+/// 状态页上的闭环状态卡。只回答一个问题：泵自带的 Control-IQ 现在是什么状态。
+/// 刻意不叫「闭环」——叫闭环会让人以为是本 App 在自动调剂量。
+struct ControlIQSummaryCard: View {
+    @EnvironmentObject var model: AppModel
+
+    private var tint: Color {
+        guard let info = model.controlIQ else { return .secondary }
+        return info.closedLoopEnabled ? .green : .orange
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Circle().fill(tint).frame(width: 8, height: 8)
+                Text("Control-IQ（泵自带）").font(.subheadline.weight(.semibold))
+                Spacer()
+                Image(systemName: "chevron.right")
+                    .font(.caption).foregroundStyle(.tertiary)
+            }
+
+            if let info = model.controlIQ {
+                Text(info.headline).font(.callout)
+                HStack(spacing: 16) {
+                    Text("每日总量 \(info.totalDailyInsulinUnits) U")
+                    Text("体重 \(info.weight) \(info.weightUnit?.text ?? "")")
+                    if info.version == 2, let remain = info.exerciseRemainingSeconds {
+                        Text("运动剩 \(remain / 60) 分")
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+
+                if !info.closedLoopEnabled {
+                    Text("算法关着时，血糖往下掉泵不会自己减量——只剩基础率在走。")
+                        .font(.caption2).foregroundStyle(.orange)
+                }
+            } else {
+                Text(model.controlIQError ?? "还没读到 Control-IQ 状态，进来看详情或下拉刷新。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+}
+
+/// 闭环状态详情：Control-IQ 的读数 + 睡眠时段表 + 这条边界到底在哪。
+///
+/// 这一页的全部内容是**只读**的。页面上没有任何开关能改闭环参数，
+/// 因为 X2 固件不接受第三方改基础率（见 SafetyView 与 README 的证据）。
+struct ControlIQView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                if let info = model.controlIQ {
+                    infoSection(info)
+                } else {
+                    Text(model.controlIQError ?? "还没读到。点下面的「重新读取」。")
+                        .font(.callout).foregroundStyle(.secondary)
+                }
+                sleepSection
+                boundarySection
+
+                Button {
+                    Task { await model.loadControlIQ() }
+                } label: {
+                    Label(model.controlIQLoading ? "读取中…" : "重新读取",
+                          systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.controlIQLoading)
+            }
+            .padding(16)
+        }
+        .navigationTitle("闭环状态（只读）")
+        .task { await model.loadControlIQ() }
+    }
+
+    @ViewBuilder
+    private func infoSection(_ info: ControlIQMessages.Info) -> some View {
+        VStack(spacing: 0) {
+            row("闭环算法", info.closedLoopEnabled ? "开启" : "关闭",
+                info.closedLoopEnabled ? .green : .orange)
+            Divider()
+            row("当前模式", info.userModeText, .primary)
+            Divider()
+            row("控制状态码", "\(info.controlStateRaw)", .secondary)
+            Divider()
+            row("每日胰岛素总量", "\(info.totalDailyInsulinUnits) U", .primary)
+            Divider()
+            row("体重", "\(info.weight) \(info.weightUnit?.text ?? "")", .primary)
+            if info.version == 2 {
+                Divider()
+                row("运动剩余", "\((info.exerciseRemainingSeconds ?? 0) / 60) 分钟", .primary)
+            }
+        }
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+
+        Text("读到的是 V\(info.version) 报文。控制状态码是泵自己报的数字，公开资料里没有确证含义，所以这里原样显示、不翻译成「正在减量」之类的结论。")
+            .font(.caption2).foregroundStyle(.secondary)
+    }
+
+    private var sleepSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("睡眠时段（泵上设的）").font(.subheadline.weight(.semibold))
+            if let schedule = model.controlIQSleep {
+                ForEach(Array(schedule.windows.enumerated()), id: \.offset) { _, w in
+                    HStack {
+                        Text("\(w.startText) – \(w.endText)").monospacedDigit()
+                        Spacer()
+                        Text(w.daysText).foregroundStyle(.secondary)
+                        Text(w.enabled ? "启用" : "未用")
+                            .font(.caption2)
+                            .foregroundStyle(w.enabled ? .green : .tertiary)
+                    }
+                    .font(.callout)
+                    if w != schedule.windows.last { Divider() }
+                }
+            } else {
+                Text("还没读到睡眠表。").font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var boundarySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("为什么这一页只能看").font(.subheadline.weight(.semibold))
+            Text("""
+            Control-IQ 跑在泵里。改它的目标、体重、睡眠表，以及改基础率、临时率、暂停，\
+            在 t:slim X2 上都是固件拒绝的写入路径（pumpX2 标 MOBI_ONLY，controlX2 的\
+            功能表写着 Temp Basal / Profile 仅 Mobi）。所以本 App 不提供这些按钮：\
+            放一个按下去没反应、或者按下去把泵发断线的键，比没有这个键更糟。
+            """)
+            .font(.caption).foregroundStyle(.secondary)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+    }
+
+    private func row(_ title: String, _ value: String, _ color: Color) -> some View {
+        HStack {
+            Text(title).font(.callout).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).font(.callout.weight(.medium)).foregroundStyle(color).monospacedDigit()
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
     }
 }
 

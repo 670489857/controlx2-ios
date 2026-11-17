@@ -87,6 +87,11 @@ public actor PumpSession {
         public var currentBolus: BolusMessages.BolusState?
         /// 最近一次读到的当前基础率计划（只读）
         public var basalProfileSchedule: BasalProfile?
+        /// 泵自带 Control-IQ 的当前状态（只读）。注意这是**泵的算法**在跑，
+        /// 不是本 App 在闭环；App 只读不写。
+        public var controlIQ: ControlIQMessages.Info?
+        /// Control-IQ 的睡眠时段表（只读）
+        public var controlIQSleep: ControlIQMessages.SleepSchedule?
         /// 最近一次读取的原始 cargo，按响应 opCode 索引。
         /// 只给「读数核对」页用：界面上的数字一旦和泵屏幕不一致，唯一能判断
         /// 「是解析错了还是泵就这么报的」的证据就是这几个字节。
@@ -449,6 +454,10 @@ public actor PumpSession {
             }
         }
 
+        // 泵自带闭环状态（ControlIQInfo，0x68 → 0x69；运动模式再补 0xB2 → 0xB3）
+        // 这条是「泵的算法现在在干嘛」，不是我们在控泵。读失败不影响其他读数。
+        _ = try? await readControlIQ()
+
         // 当前大剂量（CurrentBolusStatus，0x2C → 0x2D）
         // 有进行中的大剂量时，界面和「最近一次输注」都以这条为准，
         // 而不是靠我们本地记的意图——泵才是事实来源。
@@ -613,6 +622,49 @@ public actor PumpSession {
         link.note("基础率: 计划「\(settings.name)」idpId=\(idpId) \(segments.count) 段"
                   + " 单次上限 \(settings.maxBolusUnits) U")
         return profile
+    }
+
+    // MARK: Control-IQ 监视（只读）
+
+    /// 读泵自带 Control-IQ 的状态。
+    ///
+    /// 先发 V1（0x68）。V1 是所有带 Control-IQ 的 X2 固件都认的；只有在泵报告
+    /// 「正处在运动模式」时才去问 V2（0xB2）拿剩余时间——老固件不认 0xB2，
+    /// 会回 Nack，没必要每次刷新都去撞一次。V2 失败就保留 V1 的结果，不抛错。
+    public func readControlIQ() async throws -> ControlIQMessages.Info {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+
+        let frame = try await request(ControlIQMessages.infoV1Request(),
+                                      expecting: 0x69, timeout: .seconds(8))
+        snapshot.rawCargo[0x69] = frame.cargo
+        guard var info = ControlIQMessages.parseInfoV1(frame.cargo) else {
+            throw ControlIQMessages.ControlIQError.badInfoCargo
+        }
+
+        if info.userMode == .exercise,
+           let v2 = try? await request(ControlIQMessages.infoV2Request(),
+                                       expecting: 0xB3, timeout: .seconds(8)),
+           let parsed = ControlIQMessages.parseInfoV2(v2.cargo) {
+            snapshot.rawCargo[0xB3] = v2.cargo
+            info = parsed
+        }
+
+        snapshot.controlIQ = info
+        link.note("Control-IQ: 闭环\(info.closedLoopEnabled ? "开" : "关") 模式=\(info.userModeText)")
+        return info
+    }
+
+    /// 读 Control-IQ 的四条睡眠时段（0x6A → 0x6B）。比刷新重，推荐和基础率计划一起按需读。
+    public func readSleepSchedule() async throws -> ControlIQMessages.SleepSchedule {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let frame = try await request(ControlIQMessages.sleepScheduleRequest(),
+                                      expecting: 0x6B, timeout: .seconds(8))
+        snapshot.rawCargo[0x6B] = frame.cargo
+        guard let schedule = ControlIQMessages.parseSleepSchedule(frame.cargo) else {
+            throw ControlIQMessages.ControlIQError.badSleepCargo
+        }
+        snapshot.controlIQSleep = schedule
+        return schedule
     }
 
     private func u16(_ b: [UInt8], _ o: Int) -> UInt16 {        UInt16(b[o]) | UInt16(b[o + 1]) << 8
