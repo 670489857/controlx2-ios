@@ -184,7 +184,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var iobValue: Double?
 
     private let transport = BLETransport()
-    private lazy var session = PumpSession(link: transport)
+    lazy var session = PumpSession(link: transport)
     private let store: CredentialStore = KeychainCredentialStore()
     /// 上次连上的泵，用来在启动时直接连回去
     private let lastPumpStore: LastPumpStore = UserDefaultsLastPumpStore()
@@ -648,7 +648,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         }
     }
 
-    private func refreshFromSession() async {
+    func refreshFromSession() async {
         let snap = await session.snapshot
         apiVersion = snap.apiVersion?.description
 

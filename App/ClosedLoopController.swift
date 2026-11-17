@@ -1,4 +1,7 @@
 import Foundation
+import PumpX2Kit
+import PumpX2BLE
+import X2Advisor
 
 /// 闭环的执行层。算法在 `ClosedLoop.decide`，这里只负责三件事：
 /// 攒输入 → 调用判断 → 真发的时候把针发出去、并记账。
