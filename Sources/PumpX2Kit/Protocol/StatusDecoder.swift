@@ -26,10 +26,19 @@ public enum StatusDecoder {
     }
 
     /// cargo = [amount i16 LE][isEstimate u8][lowAmount u8]
+    ///
+    /// **刻度是 1 LSB = 1 U，不是 0.001 U。** 真机标定：泵屏幕显示「+60 u」，
+    /// 同一条 0x25 的原始值是 60。按 0.001 解释会把 60 U 读成 0.06 U，
+    /// 大剂量闸门于是认为药筒空了，把一针 0.5 U 直接拦掉——界面上一句
+    /// 「药筒余量不够这一针」，但泵上明明还有 60 U。
+    ///
+    /// 两个旁证：同一报文里的 `lowAmount` 是低余量阈值（默认 35 U），也是整单位，
+    /// 一条报文里不可能有两套刻度；另外 i16 上限 32767，一整筒 300 U 按 0.001
+    /// 存根本装不下。所以这里不做任何除法。
     public static func insulinStatus(_ cargo: [UInt8]) -> InsulinStatus? {
         guard cargo.count >= 4 else { return nil }
         let raw = Int16(bitPattern: UInt16(cargo[0]) | UInt16(cargo[1]) << 8)
-        return InsulinStatus(units: Double(raw) / 1000.0,
+        return InsulinStatus(units: Double(raw),
                              isEstimate: cargo[2] != 0,
                              lowAmount: Double(cargo[3]))
     }

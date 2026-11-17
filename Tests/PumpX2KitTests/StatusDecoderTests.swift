@@ -29,26 +29,30 @@ final class StatusDecoderTests: XCTestCase {
         XCTAssertEqual(s.lowAmount, 35)
     }
 
-    /// 泵报的是 0.001 U 的整数。这一条防止有人把它当整数 U 直接除个 100 之类的改法。
-    func testInsulinStatusScaling() throws {
-        // amount = 0x0BB8 = 3000 → 3.000 U
-        let s = try XCTUnwrap(StatusDecoder.insulinStatus([0xB8, 0x0B, 0x00, 0x23]))
-        XCTAssertEqual(s.units, 3.0, accuracy: 0.0001)
+    /// 真机标定：泵屏幕「+60 u」，同一条 0x25 的原始值是 60。
+    ///
+    /// 这条以前写的是「按 0.001 U 解释」，结果 60 U 被读成 0.06 U，闸门判定药筒
+    /// 不够、把针拦掉。低余量阈值（lowAmount=35）与它同报文同刻度，也是整单位，
+    /// 一条报文两套刻度本来就讲不通。
+    func testInsulinStatusRealMachine60Units() throws {
+        let s = try XCTUnwrap(StatusDecoder.insulinStatus([60, 0, 0, 35]))
+        XCTAssertEqual(s.units, 60.0, accuracy: 1e-9)
+        XCTAssertFalse(s.isEstimate)
         XCTAssertEqual(s.lowAmount, 35)
     }
 
     /// 正在装筒/回抽时泵会标 isEstimate，界面要能说出「这是估算」。
     func testInsulinStatusEstimateFlag() throws {
-        let s = try XCTUnwrap(StatusDecoder.insulinStatus([0xE8, 0x03, 0x01, 0x14]))
+        let s = try XCTUnwrap(StatusDecoder.insulinStatus([5, 0, 1, 20]))
         XCTAssertTrue(s.isEstimate)
-        XCTAssertEqual(s.units, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(s.units, 5.0, accuracy: 1e-9)
         XCTAssertEqual(s.lowAmount, 20)
     }
 
     /// 负数：药筒被抽空之后泵可能给出一个负的估计值，不能当成巨大的正数。
     func testInsulinStatusNegativeIsPreserved() throws {
         let s = try XCTUnwrap(StatusDecoder.insulinStatus([0x18, 0xFC, 0x00, 0x23]))  // -1000
-        XCTAssertEqual(s.units, -1.0, accuracy: 0.0001)
+        XCTAssertEqual(s.units, -1000.0, accuracy: 1e-9)
     }
 
     // MARK: 基础率（0x29）
