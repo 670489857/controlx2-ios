@@ -117,11 +117,9 @@ extension AppModel {
     /// 只更新显示，不动历史
     func applyNightscoutDisplay() {
         guard let ns = nsLatestMgdl else { return }
-        glucoseText = "\(ns)"
-        glucoseSub = String(format: "%.1f mmol/L", Double(ns) / 18.0182)
-        glucoseValue = ns
+        applyGlucoseDisplay(mgdl: ns)
         hasLiveData = true
         trendSymbol = Self.trendSymbol(for: nsTrendCode)
-        glucoseSourceHint = "mg/dL · Nightscout " + nsAgeText
+        glucoseSourceHint = "mmol/L · Nightscout " + nsAgeText
     }
 }

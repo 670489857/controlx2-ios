@@ -681,6 +681,22 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         }
     }
 
+    /// 血糖的显示格式跟着来源走：
+    /// - 泵 CGM：主数字 mg/dL（和泵屏幕一致，方便逐位核对）
+    /// - Nightscout：主数字 mmol/L（NS 用户看的就是这个单位）
+    /// `glucoseValue` 永远存 mg/dL——闸门、预测、闭环全都按 mg/dL 算，
+    /// 显示单位只在最后一层换，绝不参与计算。
+    func applyGlucoseDisplay(mgdl: Int) {
+        glucoseValue = mgdl
+        if cgmSource == .nightscout {
+            glucoseText = String(format: "%.1f", Double(mgdl) / 18.0182)
+            glucoseSub = "\(mgdl) mg/dL"
+        } else {
+            glucoseText = "\(mgdl)"
+            glucoseSub = String(format: "%.1f mmol/L", Double(mgdl) / 18.0182)
+        }
+    }
+
     func refreshFromSession() async {
         let snap = await session.snapshot
         apiVersion = snap.apiVersion?.description
@@ -690,10 +706,8 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             insulinUnits = String(format: snap.insulinIsEstimate ? "≈%.0f U" : "%.0f U", units)
             reservoirValue = units
         }
-        if let g = snap.glucoseMgdl, let mmol = snap.glucoseMmol {
-            glucoseText = "\(g)"
-            glucoseSub = String(format: "%.1f mmol/L", mmol)
-            glucoseValue = g
+        if let g = snap.glucoseMgdl {
+            applyGlucoseDisplay(mgdl: g)
             hasLiveData = true
         }
         trendSymbol = Self.trendSymbol(for: snap.glucoseTrend)
@@ -701,12 +715,10 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         // Nightscout 作为来源时，界面上的血糖必须换成 NS 的：泵的 EGV 可能根本没数据，
         // 也可能比 NS 旧。以「用户选定的来源」为唯一准星，避免两个数字打架。
         if cgmSource == .nightscout, let ns = nsLatestMgdl {
-            glucoseText = "\(ns)"
-            glucoseSub = String(format: "%.1f mmol/L", Double(ns) / 18.0182)
-            glucoseValue = ns
+            applyGlucoseDisplay(mgdl: ns)
             hasLiveData = true
             trendSymbol = Self.trendSymbol(for: nsTrendCode)
-            glucoseSourceHint = "mg/dL · Nightscout " + nsAgeText
+            glucoseSourceHint = "mmol/L · Nightscout " + nsAgeText
         } else {
             glucoseSourceHint = "mg/dL · 以泵屏幕为准"
         }
@@ -2737,11 +2749,27 @@ struct CGMSourceView: View {
                     .keyboardType(.URL)
                     .multilineTextAlignment(.trailing)
             }
-            LabeledContent("只读 token") {
-                TextField("可留空", text: $model.nsConfig.token)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .multilineTextAlignment(.trailing)
+            Picker("认证方式", selection: $model.nsConfig.authMode) {
+                ForEach(NightscoutAuthMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .pickerStyle(.inline)
+
+            if model.nsConfig.authMode == .secret {
+                LabeledContent("密码") {
+                    SecureField("API Secret", text: $model.nsConfig.secret)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                }
+            } else {
+                LabeledContent("访问令牌") {
+                    SecureField("token", text: $model.nsConfig.token)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .multilineTextAlignment(.trailing)
+                }
             }
 
             Button {
@@ -2761,7 +2789,7 @@ struct CGMSourceView: View {
         } header: {
             Text("Nightscout")
         } footer: {
-            Text("地址填站点根即可（例如 https://ns.example.com 或 https://ns.example.com/ns），把整条 API 地址粘进来也能识别。token 存在本机 UserDefaults，不是 Keychain——它只有读权限。")
+            Text("地址填站点根即可（例如 https://ns.example.com 或 https://ns.example.com/ns），把整条 API 地址粘进来也能识别。密码就是 NS 后台的 API Secret：App 只发送它的 SHA1，不发明文。密码存在本机 UserDefaults，不是 Keychain。")
         }
     }
 

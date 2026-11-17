@@ -100,4 +100,49 @@ final class NightscoutClientTests: XCTestCase {
         XCTAssertNil(NightscoutClient.trendCode(for: "NOT COMPUTED"))
         XCTAssertNil(NightscoutClient.trendCode(for: nil))
     }
+
+    // MARK: 密码（API Secret）模式
+
+    /// NS 的标准向量：sha1("abc")
+    func testSHA1KnownVectors() {
+        XCTAssertEqual(SHA1.hex("abc"), "a9993e364706816aba3e25717850c26c9cd0d89d")
+        XCTAssertEqual(SHA1.hex(""), "da39a3ee5e6b4b0d3255bfef95601890afd80709")
+        XCTAssertEqual(SHA1.hex("MyV3ry53cr37"), SHA1.hex("MyV3ry53cr37"),
+                       "同一个密码算两次必须一样")
+        XCTAssertNotEqual(SHA1.hex("MyV3ry53cr37"), SHA1.hex("myv3ry53cr37"),
+                          "API Secret 区分大小写，哈希也必须区分")
+        // 长度跨 64 字节分组边界的情形
+        let long = String(repeating: "a", count: 1000)
+        XCTAssertEqual(SHA1.hex(long).count, 40)
+    }
+
+    func testSecretModeDoesNotPutPasswordInURL() throws {
+        let cfg = NightscoutConfig(baseURL: "https://ns.example.com", authMode: .secret,
+                                   secret: "MyV3ry53cr37", enabled: true)
+        let url = try XCTUnwrap(NightscoutClient.entriesURL(base: cfg.normalizedBase, token: nil, count: 24))
+        XCTAssertFalse(url.absoluteString.contains("MyV3ry53cr37"), "密码原文不应该出现在 URL 里")
+        XCTAssertEqual(SHA1.hex(cfg.trimmedSecret).count, 40)
+    }
+
+    func testTokenModeStillUsesQueryToken() throws {
+        let cfg = NightscoutConfig(baseURL: "https://ns.example.com", authMode: .token,
+                                   token: "abc123", enabled: true)
+        let url = try XCTUnwrap(NightscoutClient.entriesURL(base: cfg.normalizedBase, token: cfg.trimmedToken, count: 24))
+        XCTAssertTrue(url.absoluteString.contains("token=abc123"))
+    }
+
+    func testSecretTrimsWhitespace() {
+        let cfg = NightscoutConfig(baseURL: "https://ns.example.com", secret: "  MyV3ry53cr37\n")
+        XCTAssertEqual(cfg.trimmedSecret, "MyV3ry53cr37", "从 NS 后台复制常带空格/换行，必须裁掉")
+    }
+
+    func testOldConfigDecodesWithDefaults() throws {
+        // 0.4.1 之前只存了 baseURL / token / enabled
+        let json = #"{"baseURL":"https://ns.example.com","token":"old","enabled":true}"#
+        let cfg = try JSONDecoder().decode(NightscoutConfig.self, from: Data(json.utf8))
+        XCTAssertEqual(cfg.baseURL, "https://ns.example.com")
+        XCTAssertEqual(cfg.authMode, .secret)
+        XCTAssertEqual(cfg.token, "old")
+        XCTAssertTrue(cfg.enabled)
+    }
 }

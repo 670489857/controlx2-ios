@@ -20,18 +20,58 @@ import FoundationNetworking
 ///
 /// 走 `?token=` 的只读 token（Nightscout 的 read-only token），不要求用户去算 SHA1。
 /// 支持在 base URL 里带路径前缀（很多人把 NS 挂在 `https://xxx/ns/` 下）。
+/// Nightscout 的两种认证方式。
+///
+/// - `secret`：网址 + 密码（就是 NS 后台那个 API Secret）。密码原文不上网，
+///   客户端先算 `sha1(密码)` 放进 `api-secret` 头——这是 NS 的约定，
+///   不是我们额外发明的。
+/// - `token`：NS 后台生成的访问令牌，走 `?token=`。留着是给已经建过只读令牌的人，
+///   默认不用。
+public enum NightscoutAuthMode: String, Codable, CaseIterable, Identifiable, Sendable {
+    case secret
+    case token
+
+    public var id: String { rawValue }
+
+    public var title: String {
+        switch self {
+        case .secret: return "密码（API Secret）"
+        case .token: return "访问令牌（token）"
+        }
+    }
+}
+
 public struct NightscoutConfig: Codable, Equatable, Sendable {
     /// 站点根地址，例如 `https://ns.example.com` 或 `https://ns.example.com/ns`
     public var baseURL: String
-    /// 只读访问 token。留空表示站点不需要认证（不建议）
+    public var authMode: NightscoutAuthMode
+    /// NS 后台的 API Secret（密码原文，本地保存）
+    public var secret: String
+    /// 可选的访问令牌
     public var token: String
     /// 是否启用。关掉时完全不请求网络
     public var enabled: Bool
 
-    public init(baseURL: String = "", token: String = "", enabled: Bool = false) {
+    public init(baseURL: String = "",
+                authMode: NightscoutAuthMode = .secret,
+                secret: String = "",
+                token: String = "",
+                enabled: Bool = false) {
         self.baseURL = baseURL
+        self.authMode = authMode
+        self.secret = secret
         self.token = token
         self.enabled = enabled
+    }
+
+    /// 旧版只存了 baseURL / token / enabled，读老配置时不能让缺字段直接解码失败
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        baseURL = try c.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        authMode = try c.decodeIfPresent(NightscoutAuthMode.self, forKey: .authMode) ?? .secret
+        secret = try c.decodeIfPresent(String.self, forKey: .secret) ?? ""
+        token = try c.decodeIfPresent(String.self, forKey: .token) ?? ""
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
     }
 
     /// 用户可能把整条 API 地址粘进来，这里统一裁到站点根
@@ -44,6 +84,9 @@ public struct NightscoutConfig: Codable, Equatable, Sendable {
         while s.hasSuffix("/") { s.removeLast() }
         return s
     }
+
+    public var trimmedSecret: String { secret.trimmingCharacters(in: .whitespacesAndNewlines) }
+    public var trimmedToken: String { token.trimmingCharacters(in: .whitespacesAndNewlines) }
 
     public var isConfigured: Bool {
         guard let url = URL(string: normalizedBase) else { return false }
@@ -75,12 +118,14 @@ public enum NightscoutError: Error, Equatable, LocalizedError {
     case badBaseURL
     case emptyPayload
     case badPayload
+    case unauthorized
 
     public var errorDescription: String? {
         switch self {
         case .badBaseURL: return "Nightscout 地址不正确（要带 https:// 和主机名）"
         case .emptyPayload: return "Nightscout 没有返回血糖记录"
         case .badPayload: return "Nightscout 返回的数据解析失败"
+        case .unauthorized: return "密码不对（Nightscout 拒绝了：401）。确认后台的 API Secret，注意大小写和末尾空格"
         }
     }
 }
@@ -96,16 +141,28 @@ public struct NightscoutClient: Sendable {
 
     /// 拉最近 N 条记录（5 分钟一条，24 条 ≈ 2 小时）
     public func entries(count: Int = 24) async throws -> [NightscoutEntry] {
-        guard let url = Self.entriesURL(base: config.normalizedBase, token: config.token, count: count) else {
+        guard let url = Self.entriesURL(base: config.normalizedBase,
+                                      token: config.authMode == .token ? config.trimmedToken : nil,
+                                      count: count) else {
             throw NightscoutError.badBaseURL
         }
         var request = URLRequest(url: url)
         request.timeoutInterval = 12
         // NS 常见部署在反代后面，缓存会让「最新血糖」变成十分钟前那条
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        if config.authMode == .secret {
+            // 密码原文不发出去，发的是 sha1(密码) 的十六进制
+            let secret = config.trimmedSecret
+            if !secret.isEmpty {
+                request.setValue(SHA1.hex(secret), forHTTPHeaderField: "api-secret")
+            }
+        }
 
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw NightscoutError.unauthorized
+            }
             throw NightscoutError.badPayload
         }
         return try Self.parseEntries(data)
