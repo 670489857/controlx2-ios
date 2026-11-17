@@ -22,6 +22,11 @@ struct LoopActivityAttributes: ActivityAttributes {
         var lastDoseText: String
         /// 数据来源标签
         var sourceText: String
+        /// 最近一小时的血糖点（mg/dL），给锁屏卡右下角的小趋势线用。
+        /// 传数值而不是路径：小组件里没法做复杂绘制，形状要在渲染时按可用高度再算
+        var spark: [Double]
+        /// 当前血糖数值（mg/dL），用来决定强调色（偏低 / 正常 / 偏高）
+        var glucoseValue: Double
         var updatedAt: Date
     }
 

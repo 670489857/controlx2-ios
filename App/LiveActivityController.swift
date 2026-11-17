@@ -36,6 +36,8 @@ extension AppModel {
         } else {
             loopText = "闭环 · 未启动"
         }
+        // 锁屏小趋势线：最近一小时的点，抽到 12 个左右就够画形状了
+        let recent = chartSamples.suffix(12).map { Double($0.mgdl) }
         return LoopActivityAttributes.ContentState(
             glucoseText: glucoseText,
             glucoseUnit: unitText,
@@ -44,6 +46,8 @@ extension AppModel {
             loopText: loopText,
             lastDoseText: lastDose,
             sourceText: cgmSource == .nightscout ? "Nightscout" : "泵 CGM",
+            spark: recent,
+            glucoseValue: Double(glucoseValue ?? 0),
             updatedAt: Date()
         )
     }
