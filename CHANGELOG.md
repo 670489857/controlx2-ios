@@ -881,3 +881,4 @@ pumpX2 `PumpStateSupplier.determinePumpAuthKey` 对 v7.7+ 固件返回的是
 - 16 位 / 6 位配对码两条路径
 - 配对凭据持久化到 Keychain，重连走 `0x26` 快速确认，不再重复输码
 - 读取血糖、IOB、药筒余量、基础率、电量、API 版本
+
