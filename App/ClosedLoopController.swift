@@ -49,7 +49,7 @@ extension AppModel {
             if controlIQ == nil {
                 return "还没读到 Control-IQ 状态。真发之前必须确认它在关着"
             }
-            if let maxBolus = basalProfileSchedule?.maxBolusUnits,
+            if let maxBolus = basalProfile?.maxBolusUnits,
                maxBolus < loopSettings.maxSingleMicroBolus {
                 return "泵上单次上限 \(maxBolus) U 小于闭环单次上限 \(loopSettings.maxSingleMicroBolus) U"
             }
@@ -183,9 +183,9 @@ extension AppModel {
         let tail = samples.suffix(3)
         guard tail.count == 3,
               let first = tail.first, let last = tail.last,
-              last.date > first.date
+              last.timestamp > first.timestamp
         else { return 0 }
-        let minutes = last.date.timeIntervalSince(first.date) / 60
+        let minutes = last.timestamp.timeIntervalSince(first.timestamp) / 60
         guard minutes > 0 else { return 0 }
         return (Double(last.mgdl) - Double(first.mgdl)) / minutes
     }
