@@ -64,18 +64,18 @@ public final class LoopLedger: @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
     }
 
+    /// 追加一条。**整文件重写**而不是 `FileHandle.seekToEnd`。
+    ///
+    /// 闭环每小时 12 条，跑一周也就 2000 行（几百 KB），重写的代价可以忽略；
+    /// 换来的是「写完就是写完」：不会再出现句柄复用、偏移没落盘这类丢行的情形。
+    /// 台账是额度的唯一来源，丢一行就等于额度算少一针，这笔账不能省。
     public func append(_ record: LoopRecord) {
         guard let url = fileURL, let data = try? encoder.encode(record) else { return }
         lock.lock(); defer { lock.unlock() }
-        var line = data
-        line.append(0x0A)
-        if let handle = try? FileHandle(forWritingTo: url) {
-            defer { try? handle.close() }
-            _ = try? handle.seekToEnd()
-            try? handle.write(contentsOf: line)
-        } else {
-            try? line.write(to: url, options: .atomic)
-        }
+        var merged = (try? Data(contentsOf: url)) ?? Data()
+        merged.append(data)
+        merged.append(0x0A)
+        try? merged.write(to: url, options: .atomic)
     }
 
     public func readAll() -> [LoopRecord] {
