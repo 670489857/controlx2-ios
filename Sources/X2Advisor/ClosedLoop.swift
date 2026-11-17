@@ -71,6 +71,13 @@ public enum ClosedLoop {
         /// App 只补差额——这样蓝牙断了也不会一点基础胰岛素都没有。
         public var pumpBasalUnitsPerHour: Double = 0
 
+        /// 体重（kg）。只用来在界面上和泵的参数对齐核对，算法本身不用它
+        public var weightKg: Double = 0
+        /// 每日胰岛素总量（U）。用来给 ISF / 单针上限一个合理起点，也能当 24h 上限的参照
+        public var totalDailyInsulinUnits: Double = 0
+        /// 24 小时内本 App 最多打多少 U。0 表示不限
+        public var maxDailyUnits: Double = 0
+
         public init() {}
 
         /// 参数合法性。返回 nil 表示可用；返回字符串就是不能启用的理由。
@@ -85,6 +92,10 @@ public enum ClosedLoop {
             if maxHourlyMicroBolus < maxSingleMicroBolus { return "每小时上限不能小于单次上限" }
             if tickSeconds != 300 { return "决策节拍固定 5 分钟：改成别的值会让基础率换算和泵的节奏错位" }
             if pumpBasalUnitsPerHour < 0 { return "泵自己跑的基础率不能是负数" }
+            if maxDailyUnits < 0 { return "24h 上限不能是负数" }
+            if maxDailyUnits > 0 && maxDailyUnits < maxHourlyMicroBolus {
+                return "24h 上限不能小于每小时上限"
+            }
             return nil
         }
     }
@@ -99,6 +110,8 @@ public enum ClosedLoop {
         public var iobUnits: Double
         /// 当前时段计划里的基础率（U/h）
         public var basalProfileUnitsPerHour: Double?
+        /// 今天（自然日）本 App 已经打出去的微剂量总额（U）
+        public var deliveredTodayUnits: Double = 0
         /// 最近 60 分钟内本 App 已经打出去的微剂量总额（U）
         public var deliveredLastHourUnits: Double
         /// 预测稳态血糖（来自 `BGPPredictor` 的 eventualBg）
@@ -150,6 +163,7 @@ public enum ClosedLoop {
         case fallingFast
         case iobAtCap
         case hourlyCap
+        case dailyCap
         case noBasalProfile
         case doseBelowStep
         case pumpBusy
@@ -165,6 +179,7 @@ public enum ClosedLoop {
             case .fallingFast: return "血糖下降太快，不出针"
             case .iobAtCap: return "活性胰岛素已到上限"
             case .hourlyCap: return "最近一小时微剂量已达上限"
+            case .dailyCap: return "今天用掉的量已到 24h 上限"
             case .noBasalProfile: return "没读到当前基础率，没有可换算的量"
             case .doseBelowStep: return "这一拍算出来不足 0.05 U，攒到下一拍"
             case .pumpBusy: return "上一针还在推注，不叠针"
@@ -235,6 +250,9 @@ public enum ClosedLoop {
         guard inputs.basalProfileUnitsPerHour != nil else { return hold(.noBasalProfile) }
         if inputs.deliveredLastHourUnits >= settings.maxHourlyMicroBolus {
             return hold(.hourlyCap, String(format: "近一小时 %.2f U", inputs.deliveredLastHourUnits))
+        }
+        if settings.maxDailyUnits > 0, inputs.deliveredTodayUnits >= settings.maxDailyUnits {
+            return hold(.dailyCap, String(format: "今天已打 %.1f U", inputs.deliveredTodayUnits))
         }
 
         // 血糖往目标以下走时，基线段不补——这是「只能减到 0」的物理边界。

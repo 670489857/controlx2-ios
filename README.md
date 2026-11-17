@@ -33,6 +33,8 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 | 14 天 AGP / TIR 报告 | ⛔ 未实现 | 需长期存储 + 报表 |
 | 基础率计划（IDP）读取 | ✅ 已实现 | 0x3E/0x40/0x42 → 计划名、各时段基础率/碳水比/目标/ISF；**只读** |
 | 血糖来源可选（泵 CGM / Nightscout） | ✅ 已实现 | 网址+密码（`api-secret: sha1`）；只读 `entries/sgv.json`；NS 来源默认 mmol/L，单位可在设置里手动固定 |
+| 设置总入口 | ✅ 已实现 | 分组列表 + 每行状态；闭环页收成「一个开关 + 三个数 + 四个读数」 |
+| 24h 累计上限 | ✅ 已实现 | 0 = 不限；到上限每拍拦 |
 | 首页血糖曲线 + NS 注射/碳水时间线 | ✅ 已实现 | 3 小时曲线，事件贴在曲线上；NS treatments 与本机台账合成一条时间线 |
 | 后台静音保活 | ✅ 已实现 | `UIBackgroundModes: audio` + 静音 WAV 循环；锁屏后闭环仍按 5 分钟一拍 |
 | 接管模式（泵基础率扣减） | ✅ 已实现 | 净补 = 计划 − 泵自己跑的；建议泵留 0.2–0.4 U/h 安全下限 |
@@ -45,7 +47,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 已验证的部分
 
-在 Linux 上跑通 252 个单元测试（`swift test`）：
+在 Linux 上跑通 255 个单元测试（`swift test`）：
 
 - SHA-256 / SHA-1 / HMAC-SHA1 / HMAC-SHA256：RFC 2202、RFC 4231、NIST 向量
 - CRC16 与组包：与 pumpX2 `BTResponseParserTest` 的真实抓包十六进制逐字节一致

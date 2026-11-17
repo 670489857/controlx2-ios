@@ -184,6 +184,7 @@ extension AppModel {
             cgmAgeMinutes: cgmAgeMinutes,
             iobUnits: snap.iobUnits ?? 0,
             basalProfileUnitsPerHour: snap.basalProfile ?? snap.basalRate,
+            deliveredTodayUnits: loopLedger.deliveredToday(),
             deliveredLastHourUnits: loopLedger.deliveredLastHour(),
             eventualBg: prediction?.eventualBg,
             minutesToLow: prediction?.minutesToLow,
@@ -267,4 +268,21 @@ extension AppModel {
 
     /// 台账导出成 CSV 文本，交给 `ShareLink` 或复制
     func loopCSV() -> String { loopLedger.exportCSV() }
+}
+
+extension AppModel {
+    /// 从泵里读体重和每日胰岛素总量，填进闭环参数。
+    /// 这两项泵里本来就有（Control-IQ 用它们算总剂量），让用户手抄一遍既没必要也容易抄错。
+    func adoptPumpProfileNumbers() {
+        guard let info = controlIQ else {
+            loopError = "还没读到泵里的 Control-IQ 参数，先刷新一次泵状态"
+            return
+        }
+        if info.weight > 0 { loopSettings.weightKg = Double(info.weight) }
+        if info.totalDailyInsulinUnits > 0 {
+            loopSettings.totalDailyInsulinUnits = Double(info.totalDailyInsulinUnits)
+        }
+        saveLoopSettings()
+        loopError = nil
+    }
 }

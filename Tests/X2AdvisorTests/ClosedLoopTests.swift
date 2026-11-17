@@ -235,4 +235,28 @@ final class ClosedLoopTests: XCTestCase {
         XCTAssertGreaterThan(d.correction, 0, "净补很小不代表不能纠正高血糖")
         XCTAssertGreaterThan(d.units, 0)
     }
+
+    // MARK: 24h 上限
+
+    func testDailyCapHolds() {
+        settings.maxDailyUnits = 10
+        var inputs = healthyInputs()
+        inputs.deliveredTodayUnits = 10
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.hold, .dailyCap)
+        XCTAssertEqual(d.units, 0)
+    }
+
+    func testDailyCapZeroMeansUnlimited() {
+        settings.maxDailyUnits = 0
+        var inputs = healthyInputs()
+        inputs.deliveredTodayUnits = 99
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.hold, nil, "0 表示不限，不该拦")
+    }
+
+    func testDailyCapBelowHourlyIsInvalid() {
+        settings.maxDailyUnits = 0.5      // 小于每小时上限 1.5
+        XCTAssertNotNil(settings.invalidReason)
+    }
 }

@@ -1606,10 +1606,13 @@ struct DashboardView: View {
         .navigationTitle("状态")
         .refreshable { model.refresh() }
         .toolbar {
-            NavigationLink {
-                AdvisorSettingsView()
-            } label: {
-                Image(systemName: "slider.horizontal.3")
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                NavigationLink { SettingsHubView() } label: {
+                    Image(systemName: "gearshape")
+                }
+                NavigationLink { AdvisorSettingsView() } label: {
+                    Image(systemName: "slider.horizontal.3")
+                }
             }
         }
     }
@@ -2589,16 +2592,23 @@ struct ClosedLoopView: View {
     var body: some View {
         Form {
             boundarySection
+            masterSection
+            readoutsSection
             statusSection
-            paramsSection
             decisionSection
             ledgerSection
+            Section {
+                NavigationLink("高级参数（ISF / 上限 / 泵基础率）") {
+                    LoopAdvancedView()
+                }
+            }
         }
         .navigationTitle("闭环")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
         .onAppear { model.refreshLoopTotals() }
-        .confirmationDialog("真的让它自己发针？", isPresented: $showLiveConfirm,
+        .confirmationDialog("闭环怎么跑？", isPresented: $showLiveConfirm,
                             titleVisibility: .visible) {
+            Button("开始演练（不发针）") { model.armLoop(live: false) }
             Button("开始真发", role: .destructive) { model.armLoop(live: true) }
             Button("取消", role: .cancel) {}
         } message: {
@@ -2666,34 +2676,41 @@ struct ClosedLoopView: View {
         }
     }
 
-    // MARK: 参数
+    // MARK: 闭环主开关
 
-    private var paramsSection: some View {
+    private var masterSection: some View {
         Section {
-            numberRow("目标下限 mg/dL", value: $model.loopSettings.targetLow)
-            numberRow("目标上限 mg/dL", value: $model.loopSettings.targetHigh)
-            numberRow("敏感系数 ISF", value: $model.loopSettings.isf)
-            numberRow("胰岛素作用时长（分钟）", value: $model.loopSettings.insulinDurationMinutes)
-            numberRow("单针上限 U", value: $model.loopSettings.maxSingleMicroBolus, step: 0.05)
-            numberRow("每小时上限 U", value: $model.loopSettings.maxHourlyMicroBolus, step: 0.05)
-            numberRow("IOB 上限 U", value: $model.loopSettings.maxIobUnits, step: 0.1)
-            numberRow("停止线 mg/dL", value: $model.loopSettings.lowSuspendThreshold)
-            numberRow("泵自己在跑的基础率 U/h", value: $model.loopSettings.pumpBasalUnitsPerHour, step: 0.05)
-            if model.loopSettings.pumpBasalUnitsPerHour >= 0.05 {
-                Text("泵留在 \(String(format: "%.2f", model.loopSettings.pumpBasalUnitsPerHour)) U/h 上自己跑，App 只补差额。蓝牙断了也不会一点基础胰岛素都没有——这是推荐的安全下限做法。")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                Text("0 表示泵的基础率已被设成 0：全部基础胰岛素都由 App 用微剂量补。断链时会完全没有基础胰岛素，风险最高。")
-                    .font(.caption).foregroundStyle(.orange)
+            Toggle(isOn: Binding(get: { model.loopArmed },
+                                 set: { on in
+                                     if on {
+                                         showLiveConfirm = true
+                                     } else {
+                                         model.disarmLoop(note: "你手动停止了闭环")
+                                     }
+                                 })) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("闭环").font(.headline)
+                    Text(model.loopArmed
+                         ? (model.loopLiveDosing ? "真发针运行中" : "演练中，只记账不发针")
+                         : "关闭：只显示血糖，不自动给药")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
-            Toggle("已确认泵的基础率已按上面的值设置", isOn: $model.loopZeroBasalConfirmed)
-            if let invalid = model.loopSettings.invalidReason {
-                Text(invalid).font(.footnote).foregroundStyle(.red)
+            .tint(.green)
+
+            numberRow("体重", value: $model.loopSettings.weightKg, step: 1)
+            numberRow("每日胰岛素 U", value: $model.loopSettings.totalDailyInsulinUnits, step: 0.5)
+            numberRow("24h 累计上限 U", value: $model.loopSettings.maxDailyUnits, step: 1)
+
+            Button {
+                model.adoptPumpProfileNumbers()
+            } label: {
+                Label("从泵重读体重和每日胰岛素", systemImage: "arrow.down.circle")
             }
         } header: {
-            Text("参数")
+            Text("闭环")
         } footer: {
-            Text("目标、ISF 应与你泵里个人计划一致。默认值只是保守起点，不是处方。")
+            Text("体重和每日总量泵里本来就有，抄一遍容易错，直接用上面的按钮从泵读。24h 上限填 0 表示不限。")
         }
     }
 
@@ -2703,6 +2720,27 @@ struct ClosedLoopView: View {
                 .multilineTextAlignment(.trailing)
                 .keyboardType(.decimalPad)
                 .monospacedDigit()
+        }
+    }
+
+    private var readoutsSection: some View {
+        Section {
+            LabeledContent("目前生效") {
+                Text(String(format: "目标 %.0f–%.0f", model.loopSettings.targetLow, model.loopSettings.targetHigh))
+            }
+            LabeledContent("单次最大") {
+                Text(String(format: "%.2f U", model.loopSettings.maxSingleMicroBolus))
+            }
+            LabeledContent("每小时上限") {
+                Text(String(format: "%.2f U", model.loopSettings.maxHourlyMicroBolus))
+            }
+            LabeledContent("近 24h 已用") {
+                Text(model.loopSettings.maxDailyUnits > 0
+                     ? String(format: "%.1f/%.0f U", model.loopTodayUnits, model.loopSettings.maxDailyUnits)
+                     : String(format: "%.1f U", model.loopTodayUnits))
+            }
+        } header: {
+            Text("当前")
         }
     }
 
