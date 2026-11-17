@@ -142,7 +142,7 @@ public struct NightscoutClient: Sendable {
             let ms: Int
             if let d = (obj["date"] as? NSNumber)?.intValue {
                 ms = d
-            } else if let ds = obj["dateString"] as? String, let parsed = ISO8601DateFormatter().date(from: ds) {
+            } else if let ds = obj["dateString"] as? String, let parsed = Self.parseISO8601(ds) {
                 ms = Int(parsed.timeIntervalSince1970 * 1000)
             } else {
                 return nil
@@ -152,6 +152,16 @@ public struct NightscoutClient: Sendable {
         }
         guard !entries.isEmpty else { throw NightscoutError.emptyPayload }
         return entries.sorted { $0.dateMs < $1.dateMs }
+    }
+
+    /// Nightscout 的 `dateString` 是 `2024-10-27T04:10:00.000Z`——**带毫秒**。
+    /// 默认的 `ISO8601DateFormatter` 不认小数秒，直接解析会得到 nil，
+    /// 于是整条记录被当成坏数据丢掉。先试带毫秒的，再退回不带毫秒的。
+    static func parseISO8601(_ text: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = fractional.date(from: text) { return d }
+        return ISO8601DateFormatter().date(from: text)
     }
 
     /// NS 的 8 档方向 → 泵的 7 个趋势码

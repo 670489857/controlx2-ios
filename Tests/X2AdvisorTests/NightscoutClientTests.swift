@@ -60,7 +60,8 @@ final class NightscoutClientTests: XCTestCase {
         XCTAssertEqual(entries.first?.sgv, 180)
         XCTAssertEqual(entries.last?.sgv, 120, "按时间升序排，最后一条是最新的")
         XCTAssertEqual(entries.last?.trendCode, 6)
-        XCTAssertEqual(entries.last?.date.timeIntervalSince1970, 1730000600, accuracy: 1)
+        let lastDate = try XCTUnwrap(entries.last?.date.timeIntervalSince1970)
+        XCTAssertEqual(lastDate, 1730000600, accuracy: 1)
     }
 
     func testParseSkipsBadRecords() throws {
