@@ -11,7 +11,7 @@ final class LoopLedgerTests: XCTestCase {
     override func setUp() {
         super.setUp()
         fileURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("loop-ledger-\\(UUID().uuidString).jsonl")
+            .appendingPathComponent("loop-ledger-\(UUID().uuidString).jsonl")
     }
 
     override func tearDown() {
