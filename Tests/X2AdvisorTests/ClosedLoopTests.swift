@@ -204,4 +204,35 @@ final class ClosedLoopTests: XCTestCase {
     func testDefaultSettingsAreValid() {
         XCTAssertNil(ClosedLoop.Settings().invalidReason)
     }
+
+    // MARK: 接管模式（泵自己也在跑基础率）
+
+    /// 泵在跑 1 U/h 的计划基础率时，App 不该再补一份基础率——否则两份叠加
+    func testPumpBasalIsSubtractedFromRequiredBasal() {
+        settings.pumpBasalUnitsPerHour = 1.0          // 泵自己跑满 1 U/h
+        var inputs = healthyInputs()                   // 计划基础率 1 U/h，血糖 120（目标内）
+        inputs.eventualBg = 120
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.basalEquiv, 0, accuracy: 1e-9, "泵已在跑满，净补应为 0")
+        XCTAssertEqual(d.units, 0)
+    }
+
+    /// 泵只留 0.3 U/h 的安全下限，App 补剩下的 0.7 U/h → 5 分钟 = 0.058 U
+    func testPumpSafetyFloorLeavesTopUpForApp() {
+        settings.pumpBasalUnitsPerHour = 0.3
+        let d = ClosedLoop.decide(settings, healthyInputs())
+        XCTAssertEqual(d.basalEquiv, 0.7 / 12, accuracy: 1e-9)
+        XCTAssertEqual(d.units, 0.05, accuracy: 1e-9, "0.058 U 向下取整到 0.05 的步进")
+    }
+
+    /// 净补被扣光时，高血糖追加仍然按「计划」算倍数上限，不会被压成 0
+    func testCorrectionCapUsesPlanNotNetBasal() {
+        settings.pumpBasalUnitsPerHour = 0.95
+        var inputs = healthyInputs()
+        inputs.cgmMgdl = 250
+        inputs.eventualBg = 260
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertGreaterThan(d.correction, 0, "净补很小不代表不能纠正高血糖")
+        XCTAssertGreaterThan(d.units, 0)
+    }
 }

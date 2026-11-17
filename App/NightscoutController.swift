@@ -67,11 +67,18 @@ extension AppModel {
         nsLatestDate.map { Date().timeIntervalSince($0) / 60 }
     }
 
-    /// 轮询里调用：NS 每 5 分钟才更新一次，没必要每 60 秒打一次请求
-    func maybeRefreshNightscout() async {
+    /// 轮询里调用：NS 每 5 分钟才更新一次，没必要每 60 秒打一次请求。
+    /// `force` 用在后台上限被挂起之后、或者用户手动点「拉取」时——那时节流没有意义。
+    func maybeRefreshNightscout(force: Bool = false) async {
         guard cgmSource == .nightscout, nsConfig.enabled else { return }
-        if let last = nsLastFetchAt, Date().timeIntervalSince(last) < 120 { return }
+        if !force, let last = nsLastFetchAt, Date().timeIntervalSince(last) < 120 { return }
         await refreshNightscout()
+    }
+
+    /// 回到前台/重新激活时要做的事：补 NS、把静音播放续上
+    func onAppForeground() async {
+        if backgroundAudioEnabled { _ = AudioKeepAlive.shared.start() }
+        await maybeRefreshNightscout(force: true)
     }
 
     func refreshNightscout() async {
@@ -87,8 +94,13 @@ extension AppModel {
         nsLoading = true
         defer { nsLoading = false }
         do {
-            let entries = try await NightscoutClient(config: nsConfig).entries(count: 24)
+            let client = NightscoutClient(config: nsConfig)
+            let entries = try await client.entries(count: 24)
             nsLastFetchAt = Date()
+            // 治疗记录单独拉：它失败不该让血糖也显示不出来
+            if let t = try? await client.treatments(count: 48) {
+                nsTreatments = t
+            }
             nsLastEntries = entries
             let latest = entries[entries.count - 1]
             nsLatestMgdl = latest.sgv

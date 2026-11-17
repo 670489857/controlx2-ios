@@ -56,6 +56,10 @@ extension AppModel {
                maxBolus < loopSettings.maxSingleMicroBolus {
                 return "泵上单次上限 \(maxBolus) U 小于闭环单次上限 \(loopSettings.maxSingleMicroBolus) U"
             }
+            // 泵的基础率如果没有被降下来，App 补的每一段都会和泵自己的基础率叠加
+            if loopSettings.pumpBasalUnitsPerHour < 0.05 && !loopZeroBasalConfirmed {
+                return "泵的基础率还在跑：先到泵上把基础率设成 0（或把 App 里「泵自己在跑的」填成实际值），再勾选确认。否则 App 补的会和泵叠加"
+            }
         }
         return nil
     }
@@ -119,6 +123,11 @@ extension AppModel {
         await refreshFromSession()
         let snap = await session.snapshot
 
+        if loopLiveDosing, controlIQ?.closedLoopEnabled == true {
+            disarmLoop(note: "泵的 Control-IQ 被重新打开了。闭环已自动停止，避免两个控制器同时调胰岛素。")
+            return
+        }
+
         let decision = ClosedLoop.decide(loopSettings, loopInputs(snap))
         loopLastDecision = decision
         loopCarried = decision.carriedOut
@@ -146,7 +155,7 @@ extension AppModel {
                                 units: decision.willDose ? decision.units : 0,
                                 accepted: decision.willDose ? accepted : nil,
                                 holdReason: decision.hold?.rawValue,
-                                bg: snap.glucoseMgdl,
+                                bg: glucoseValue ?? snap.glucoseMgdl,
                                 iob: snap.iobUnits ?? 0,
                                 basalEquiv: decision.basalEquiv,
                                 correction: decision.correction,

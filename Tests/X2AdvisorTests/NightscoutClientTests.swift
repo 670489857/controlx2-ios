@@ -145,4 +145,46 @@ final class NightscoutClientTests: XCTestCase {
         XCTAssertEqual(cfg.token, "old")
         XCTAssertTrue(cfg.enabled)
     }
+
+    // MARK: 治疗记录（NS 里的注射 / 碳水）
+
+    func testTreatmentsURLPointsToTreatmentsJSON() throws {
+        let url = try XCTUnwrap(NightscoutClient.treatmentsURL(base: "https://ns.example.com", token: nil, count: 48))
+        XCTAssertEqual(url.path, "/api/v1/treatments.json")
+        XCTAssertEqual(url.query, "count=48")
+    }
+
+    func testParseTreatmentsKeepsInsulinAndCarbs() throws {
+        let json = """
+        [
+          {"_id":"t1","eventType":"Bolus","insulin":2.45,"created_at":"2026-11-17T05:10:00.000Z"},
+          {"_id":"t2","eventType":"Carbs","carbs":15,"created_at":"2026-11-17T05:20:00.000Z"},
+          {"_id":"t3","eventType":"Bolus","insulin":1.65,"date":1730000000000},
+          {"_id":"t4","eventType":"Temp Basal","absolute":0.5,"created_at":"2026-11-17T05:30:00.000Z"}
+        ]
+        """
+        let list = try NightscoutClient.parseTreatments(Data(json.utf8))
+        XCTAssertEqual(list.count, 3, "Temp Basal 没有胰岛素/碳水/血糖数值，直接跳过")
+        XCTAssertEqual(list.last?.eventType, "Carbs")
+        XCTAssertEqual(list.map { $0.eventType }, ["Bolus", "Bolus", "Carbs"], "按时间升序")
+        let insulin = list.filter { $0.isInsulin }.map { $0.insulinUnits }
+        XCTAssertEqual(insulin, [1.65, 2.45], "按时间升序")
+        XCTAssertEqual(list.filter { $0.isCarbs }.map { $0.carbGrams }, [15])
+    }
+
+    func testParseTreatmentsEmptyIsValid() throws {
+        let list = try NightscoutClient.parseTreatments(Data("[]".utf8))
+        XCTAssertTrue(list.isEmpty, "从没记过碳水也必须算成功，不能报错")
+    }
+
+    func testParseTreatmentsSkipsRowsWithoutAmountOrTime() throws {
+        let json = """
+        [
+          {"_id":"a","eventType":"Bolus","created_at":"2026-11-17T05:10:00.000Z"},
+          {"_id":"b","eventType":"Bolus","insulin":1.0}
+        ]
+        """
+        let list = try NightscoutClient.parseTreatments(Data(json.utf8))
+        XCTAssertTrue(list.isEmpty)
+    }
 }

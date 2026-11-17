@@ -33,6 +33,9 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 | 14 天 AGP / TIR 报告 | ⛔ 未实现 | 需长期存储 + 报表 |
 | 基础率计划（IDP）读取 | ✅ 已实现 | 0x3E/0x40/0x42 → 计划名、各时段基础率/碳水比/目标/ISF；**只读** |
 | 血糖来源可选（泵 CGM / Nightscout） | ✅ 已实现 | 网址+密码（`api-secret: sha1`）；只读 `entries/sgv.json`；NS 来源默认 mmol/L，单位可在设置里手动固定 |
+| 首页血糖曲线 + NS 注射/碳水时间线 | ✅ 已实现 | 3 小时曲线，事件贴在曲线上；NS treatments 与本机台账合成一条时间线 |
+| 后台静音保活 | ✅ 已实现 | `UIBackgroundModes: audio` + 静音 WAV 循环；锁屏后闭环仍按 5 分钟一拍 |
+| 接管模式（泵基础率扣减） | ✅ 已实现 | 净补 = 计划 − 泵自己跑的；建议泵留 0.2–0.4 U/h 安全下限 |
 | **闭环（微剂量模拟基础率）** | ✅ 已实现，需真机验证 | 每 5 分钟一针小额大剂量代替基础率；十道拦阻见 `ClosedLoop.swift`；演练模式默认不发针 |
 | Control-IQ 状态监视 | ✅ 已实现 | 0x68/0x69（运动模式再读 0xB2/0xB3）+ 0x6A/0x6B 睡眠表 → 闭环开/关、模式、体重、每日总量；**只读** |
 | 改 Control-IQ 参数（目标/体重/睡眠表） | ⛔ 不做 | 同属 X2 固件拒绝的写入路径；页面只显示泵当前在用什么 |
@@ -42,7 +45,7 @@ Tandem t:slim X2 / Mobi 胰岛素泵的 iOS 客户端，协议层由 [pumpX2](ht
 
 ## 已验证的部分
 
-在 Linux 上跑通 245 个单元测试（`swift test`）：
+在 Linux 上跑通 252 个单元测试（`swift test`）：
 
 - SHA-256 / SHA-1 / HMAC-SHA1 / HMAC-SHA256：RFC 2202、RFC 4231、NIST 向量
 - CRC16 与组包：与 pumpX2 `BTResponseParserTest` 的真实抓包十六进制逐字节一致

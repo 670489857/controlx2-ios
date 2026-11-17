@@ -22,7 +22,12 @@ struct ControlX2App: App {
         .onChange(of: scenePhase) { phase in
             // 从后台回来也一样。iOS 会让 App 在挂起期间丢掉链路，
             // 回来时如果不主动补一次，界面就停在「未连接」等用户点。
-            if phase == .active { model.autoConnectIfPossible() }
+            if phase == .active {
+                model.autoConnectIfPossible()
+                // 后台期间 NS 拉不到数（除非保活开着），回前台必须立刻补一次，
+                // 不能让界面继续挂着十分钟前的血糖
+                Task { await model.onAppForeground() }
+            }
         }
     }
 }
@@ -153,6 +158,16 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var nsLatestMgdl: Int?
     @Published var nsLatestDate: Date?
     @Published var nsLoading = false
+    /// NS 里的注射/碳水记录，首页「最近记录」和曲线标记都用它
+    @Published var nsTreatments: [NightscoutTreatment] = []
+
+    // MARK: 后台保活
+    @Published var backgroundAudioEnabled: Bool =
+        UserDefaults.standard.bool(forKey: "backgroundAudioEnabled")
+    @Published var backgroundAudioMessage: String?
+
+    /// 已确认「泵的基础率已经降下来」，闭环才允许真发
+    @Published var loopZeroBasalConfirmed = false
     /// 血糖卡片下面那行小字，明确写出这个数是从哪来的
     @Published var glucoseSourceHint: String = "mg/dL · 以泵屏幕为准"
     @Published var glucoseUnit: GlucoseDisplayUnit =
@@ -1477,6 +1492,8 @@ struct DashboardView: View {
                 .padding(.vertical, 22)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
 
+                GlucoseTrendSection()
+
                 PredictionCard()
                 AdviceCard()
 
@@ -1537,6 +1554,16 @@ struct DashboardView: View {
                 } label: {
                     Label(model.loopArmed ? (model.loopLiveDosing ? "闭环运行中（真发）" : "闭环演练中（不发针）") : "闭环 · 微剂量模拟基础率",
                           systemImage: "gearshape.2.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                NavigationLink {
+                    BackgroundKeepAliveView()
+                } label: {
+                    Label(model.backgroundAudioEnabled ? "后台保活 · 已开启" : "后台保活 · 未开启",
+                          systemImage: "waveform")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
@@ -2651,6 +2678,15 @@ struct ClosedLoopView: View {
             numberRow("每小时上限 U", value: $model.loopSettings.maxHourlyMicroBolus, step: 0.05)
             numberRow("IOB 上限 U", value: $model.loopSettings.maxIobUnits, step: 0.1)
             numberRow("停止线 mg/dL", value: $model.loopSettings.lowSuspendThreshold)
+            numberRow("泵自己在跑的基础率 U/h", value: $model.loopSettings.pumpBasalUnitsPerHour, step: 0.05)
+            if model.loopSettings.pumpBasalUnitsPerHour >= 0.05 {
+                Text("泵留在 \(String(format: "%.2f", model.loopSettings.pumpBasalUnitsPerHour)) U/h 上自己跑，App 只补差额。蓝牙断了也不会一点基础胰岛素都没有——这是推荐的安全下限做法。")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                Text("0 表示泵的基础率已被设成 0：全部基础胰岛素都由 App 用微剂量补。断链时会完全没有基础胰岛素，风险最高。")
+                    .font(.caption).foregroundStyle(.orange)
+            }
+            Toggle("已确认泵的基础率已按上面的值设置", isOn: $model.loopZeroBasalConfirmed)
             if let invalid = model.loopSettings.invalidReason {
                 Text(invalid).font(.footnote).foregroundStyle(.red)
             }

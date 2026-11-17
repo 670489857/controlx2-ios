@@ -61,6 +61,16 @@ public enum ClosedLoop {
         /// 防止参数填错时一针冲太多
         public var maxCorrectionMultipleOfBasal: Double = 4.0
 
+        /// 泵自己在跑的基础率（U/h）。
+        ///
+        /// Control-IQ 关掉之后，泵会按自己计划里的基础率继续输注。手机接管时，
+        /// 这一段必须从「该补的量」里扣掉——否则泵打一份、App 再打一份，
+        /// 两份基础率叠在一起，几小时后必然低血糖。
+        ///
+        /// 0 表示泵当前基础率已被设成 0（真接管）；设成 0.3 表示泵留着 0.3 U/h 的安全下限，
+        /// App 只补差额——这样蓝牙断了也不会一点基础胰岛素都没有。
+        public var pumpBasalUnitsPerHour: Double = 0
+
         public init() {}
 
         /// 参数合法性。返回 nil 表示可用；返回字符串就是不能启用的理由。
@@ -74,6 +84,7 @@ public enum ClosedLoop {
             if maxSingleMicroBolus < minStepUnits { return "单次微剂量上限不能小于最小步进 0.05 U" }
             if maxHourlyMicroBolus < maxSingleMicroBolus { return "每小时上限不能小于单次上限" }
             if tickSeconds != 300 { return "决策节拍固定 5 分钟：改成别的值会让基础率换算和泵的节奏错位" }
+            if pumpBasalUnitsPerHour < 0 { return "泵自己跑的基础率不能是负数" }
             return nil
         }
     }
@@ -183,8 +194,13 @@ public enum ClosedLoop {
     public static func decide(_ settings: Settings, _ inputs: Inputs) -> Decision {
         // 先把「该补多少」算出来，即便后面被拦，日志里也要能看到它算到了多少——
         // 只有拦住结果、不记过程，事后没法判断是算法偏了还是闸门挡住了。
-        let basalEquiv = max(0, (inputs.basalProfileUnitsPerHour ?? 0) * settings.tickSeconds / 3600.0)
-        let correction = computeCorrection(settings, inputs, basalEquiv: basalEquiv)
+        let requiredBasal = max(0, (inputs.basalProfileUnitsPerHour ?? 0) * settings.tickSeconds / 3600.0)
+        let pumpBasalEquiv = max(0, settings.pumpBasalUnitsPerHour * settings.tickSeconds / 3600.0)
+        // 净补量：计划要多少，减去泵自己已经在跑的那一份
+        let basalEquiv = max(0, requiredBasal - pumpBasalEquiv)
+        // 追加上限按「计划」算而不是按「净补」算：把泵的份额扣掉后净补可能趋近 0，
+        // 按净值当倍数基准会让高血糖时的可打剂量莫名其妙地被压到没有
+        let correction = computeCorrection(settings, inputs, basalEquiv: requiredBasal)
 
         func hold(_ reason: Hold, _ extra: String = "") -> Decision {
             Decision(units: 0,
@@ -241,6 +257,7 @@ public enum ClosedLoop {
         }
         let leftover = max(0, carried - units)
         var parts: [String] = []
+        if pumpBasalEquiv > 0 { parts.append(String(format: "泵已跑 %.2f", pumpBasalEquiv)) }
         if basalEquiv > 0 { parts.append(String(format: "基础率段 %.2f", basalEquiv)) }
         if correction > 0 { parts.append(String(format: "追加 %.2f", correction)) }
         if leftover > 0 { parts.append(String(format: "留下 %.2f", leftover)) }

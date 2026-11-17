@@ -27,7 +27,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app
         # 版本号的单一来源是仓库根目录的 VERSION 文件，CI 会校验两处一致后用
         # 它覆盖这里。本地直接开 Xcode 时这两个值就是兜底值。
-        MARKETING_VERSION: "0.4.3"
+        MARKETING_VERSION: "0.5.0"
         CURRENT_PROJECT_VERSION: "1"
         BUILD_GIT_SHA: "local"
         SWIFT_VERSION: "5.9"
@@ -47,6 +47,9 @@ targets:
         UILaunchScreen: {}
         UIBackgroundModes:
           - bluetooth-central
+          # 静音音频保活：iOS 只给「正在播放音频」的 App 后台运行权，
+          # 这是让闭环在锁屏后继续跑的唯一可靠手段（需要用户在设置里手动打开）
+          - audio
         NSBluetoothAlwaysUsageDescription: 需要蓝牙权限以连接并读取胰岛素泵状态。
         NSBluetoothPeripheralUsageDescription: 需要蓝牙权限以连接并读取胰岛素泵状态。
         ITSAppUsesNonExemptEncryption: false

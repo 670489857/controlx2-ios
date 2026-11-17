@@ -114,6 +114,50 @@ public struct NightscoutEntry: Equatable, Sendable, Codable {
     public var trendCode: Int? { NightscoutClient.trendCode(for: direction) }
 }
 
+/// 一条 NS treatment（注射 / 碳水 / 临时基础率……）。
+///
+/// NS 的 treatments 是个混杂集合：bolus、carbs、temp basal、profile switch 都在这里。
+/// 只把「胰岛素」和「碳水」当事件展示，其余类型保留但界面不画——
+/// 比如 Temp Basal 在 t:slim X2 上根本写不进去，显示它只会让人误以为泵在改基础率。
+public struct NightscoutTreatment: Codable, Equatable, Sendable, Identifiable {
+    public let id: String
+    public let eventType: String
+    public let insulin: Double?
+    public let carbs: Double?
+    public let glucose: Double?
+    public let dateMs: Int
+    public let notes: String?
+    public let enteredBy: String?
+
+    public init(id: String,
+                eventType: String,
+                insulin: Double? = nil,
+                carbs: Double? = nil,
+                glucose: Double? = nil,
+                dateMs: Int,
+                notes: String? = nil,
+                enteredBy: String? = nil) {
+        self.id = id
+        self.eventType = eventType
+        self.insulin = insulin
+        self.carbs = carbs
+        self.glucose = glucose
+        self.dateMs = dateMs
+        self.notes = notes
+        self.enteredBy = enteredBy
+    }
+
+    public var date: Date { Date(timeIntervalSince1970: Double(dateMs) / 1000) }
+    public var insulinUnits: Double { insulin ?? 0 }
+    public var carbGrams: Double { carbs ?? 0 }
+    public var isInsulin: Bool { insulinUnits > 0 }
+    public var isCarbs: Bool { carbGrams > 0 }
+    /// 泵里写不进去的类型，界面不当作"输注记录"
+    public var isIgnoredType: Bool {
+        ["Temp Basal", "Temp Target", "Profile Switch", "Announcement", "Note", "DAD Strike"].contains(eventType)
+    }
+}
+
 public enum NightscoutError: Error, Equatable, LocalizedError {
     case badBaseURL
     case emptyPayload
@@ -166,6 +210,82 @@ public struct NightscoutClient: Sendable {
             throw NightscoutError.badPayload
         }
         return try Self.parseEntries(data)
+    }
+
+    /// 拉最近的治疗记录
+    public func treatments(count: Int = 48) async throws -> [NightscoutTreatment] {
+        guard let url = Self.treatmentsURL(base: config.normalizedBase,
+                                           token: config.authMode == .token ? config.trimmedToken : nil,
+                                           count: count) else {
+            throw NightscoutError.badBaseURL
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 12
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        if config.authMode == .secret {
+            let secret = config.trimmedSecret
+            if !secret.isEmpty {
+                request.setValue(SHA1.hex(secret), forHTTPHeaderField: "api-secret")
+            }
+        }
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw (http.statusCode == 401 || http.statusCode == 403)
+                ? NightscoutError.unauthorized
+                : NightscoutError.badPayload
+        }
+        return try Self.parseTreatments(data)
+    }
+
+    /// 治疗记录的 URL（`/api/v1/treatments.json`）
+    public static func treatmentsURL(base: String, token: String?, count: Int) -> URL? {
+        var trimmed = base.trimmingCharacters(in: .whitespacesAndNewlines)
+        while trimmed.hasSuffix("/") { trimmed.removeLast() }
+        guard !trimmed.isEmpty,
+              let baseURL = URL(string: trimmed),
+              baseURL.host != nil,
+              var comps = URLComponents(url: baseURL.appendingPathComponent("api/v1/treatments.json"),
+                                        resolvingAgainstBaseURL: false)
+        else { return nil }
+        var items = [URLQueryItem(name: "count", value: String(max(1, count)))]
+        if let token, !token.trimmingCharacters(in: .whitespaces).isEmpty {
+            items.append(URLQueryItem(name: "token", value: token.trimmingCharacters(in: .whitespaces)))
+        }
+        comps.queryItems = items
+        return comps.url
+    }
+
+    /// 解析治疗记录。空数组是**合法结果**（用户可能从没手动记过碳水），
+    /// 所以这里和血糖不同：不抛 emptyPayload，返回空列表。
+    public static func parseTreatments(_ data: Data) throws -> [NightscoutTreatment] {
+        guard let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            throw NightscoutError.badPayload
+        }
+        let list: [NightscoutTreatment] = raw.compactMap { obj in
+            let ms: Int
+            if let d = (obj["date"] as? NSNumber)?.intValue {
+                ms = d
+            } else if let cs = obj["created_at"] as? String, let parsed = parseISO8601(cs) {
+                ms = Int(parsed.timeIntervalSince1970 * 1000)
+            } else {
+                return nil
+            }
+            let id = (obj["_id"] as? String) ?? "\(ms)-\(obj["eventType"] as? String ?? "?")"
+            let eventType = (obj["eventType"] as? String) ?? "Bolus"
+            let insulin = (obj["insulin"] as? NSNumber)?.doubleValue
+            let carbs = (obj["carbs"] as? NSNumber)?.doubleValue
+            let glucose = (obj["glucose"] as? NSNumber)?.doubleValue
+            guard (insulin ?? 0) > 0 || (carbs ?? 0) > 0 || glucose != nil else { return nil }
+            return NightscoutTreatment(id: id,
+                                       eventType: eventType,
+                                       insulin: insulin,
+                                       carbs: carbs,
+                                       glucose: glucose,
+                                       dateMs: ms,
+                                       notes: obj["notes"] as? String,
+                                       enteredBy: obj["enteredBy"] as? String)
+        }
+        return list.sorted { $0.dateMs < $1.dateMs }
     }
 
     /// 拼 URL。抽成静态函数是为了能在不联网的情况下测：地址拼错是这里最常见的故障。
