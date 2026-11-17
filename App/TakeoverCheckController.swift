@@ -19,7 +19,7 @@ extension AppModel {
         facts.bolusRiskAccepted = bolusRiskAccepted
         facts.loopSettingsInvalidReason = loopSettings.invalidReason
         if cgmSource == .nightscout {
-            facts.cgmAgeMinutes = nsAgeMinutes.map(Double.init)
+            facts.cgmAgeMinutes = nsAgeMinutes.map { Double($0) }
         } else if let seconds = snap.glucoseAgeSeconds {
             facts.cgmAgeMinutes = Double(seconds) / 60
         }
@@ -29,7 +29,7 @@ extension AppModel {
         facts.pumpClockLooksValid = Self.pumpClockLooksValid(snap.pumpTimeSinceReset)
         facts.loopMaxSingleMicroBolus = loopSettings.maxSingleMicroBolus
         facts.lowSuspendThreshold = loopSettings.lowSuspendThreshold
-        facts.currentBg = glucoseValue.map(Double.init)
+        facts.currentBg = glucoseValue.map { Double($0) }
         facts.iobUnits = snap.iobUnits
         return TakeoverCheck.evaluate(facts)
     }
