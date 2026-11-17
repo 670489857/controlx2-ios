@@ -70,6 +70,11 @@ public actor PumpSession {
         public var glucoseTrend: Int?
         /// EGV 状态：0 无效 / 1 有效 / 2 低 / 3 高 / 4 不可用
         public var glucoseStatus: Int?
+        /// 泵给这条 CGM 读数打的时间戳（泵计时秒）
+        public var glucoseTimestamp: UInt32?
+        /// 这条 CGM 读数距读取时刻多少秒。闭环用它判断「读数是新的还是几十分钟前的」，
+        /// 不能只看「刷新成功了」——刷新成功但泵报的仍是同一旧读数，是最常见的假新鲜。
+        public var glucoseAgeSeconds: Int?
         /// 活性胰岛素（U）
         public var iobUnits: Double?
         /// 泵当前用的 IOB 曲线（Mudaliar / Swan 6hr）。两种曲线给出的数不同，必须记下来
@@ -416,6 +421,7 @@ public actor PumpSession {
                 snapshot.glucoseMgdl = e.mgdl > 0 ? e.mgdl : nil
                 snapshot.glucoseTrend = e.trend
                 snapshot.glucoseStatus = e.status
+                snapshot.glucoseTimestamp = e.timestamp
             }
         }
 
@@ -477,6 +483,11 @@ public actor PumpSession {
             let sinceReset = u32(frame.cargo, 4)
             pumpTimeSinceReset = sinceReset
             snapshot.pumpTimeSinceReset = UInt64(sinceReset)
+            // CGM 读数的年龄 = 泵计时 − 读数时间戳。两者同源（都是泵的秒计数），
+            // 所以这条差值才是「这条血糖是几分钟前测的」，而不是「我们多久没刷新」
+            if let ts = snapshot.glucoseTimestamp, sinceReset >= ts {
+                snapshot.glucoseAgeSeconds = Int(sinceReset - ts)
+            }
         }
         snapshot.lastUpdated = Date()
     }

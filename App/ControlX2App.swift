@@ -128,6 +128,21 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var controlIQError: String?
     @Published var controlIQLoading = false
 
+    // MARK: 闭环（微剂量模拟基础率）
+    @Published var loopSettings: ClosedLoop.Settings = ClosedLoop.Settings()
+    /// 武装 = 每 5 分钟跑一拍、算一次。演练模式下只记账不发针
+    @Published var loopArmed = false
+    /// 真发针。必须单独打开，且在武装之后
+    @Published var loopLiveDosing = false
+    @Published var loopCarried: Double = 0
+    @Published var loopLastDecision: ClosedLoop.Decision?
+    @Published var loopRecords: [LoopRecord] = []
+    @Published var loopError: String?
+    @Published var loopTickCount = 0
+    @Published var loopHourUnits: Double = 0
+    @Published var loopTodayUnits: Double = 0
+    @Published var loopNextTickAt: Date?
+
     /// 基础率卡片的副标题：当前值与配置值不一致时把配置值写出来
     @Published var basalHint: String = "basal"
     /// 读数核对表
@@ -175,9 +190,19 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     private let lastPumpStore: LastPumpStore = UserDefaultsLastPumpStore()
     private let glucoseStore: GlucoseHistoryStore
     private let shadowLog: ShadowLog
+    /// 闭环每一拍的去向。额度从这里算，不从内存计数器算
+    let loopLedger: LoopLedger
     private var currentPumpID: UUID?
     private var pollTask: Task<Void, Never>?
     private var lastShadowAt: Date?
+    /// 闭环定时任务。武装时启动，卸下武装立刻取消
+    var loopTask: Task<Void, Never>?
+    /// 上一针是否还在推。推注没结束就叠下一针，是最容易出错的地方
+    var loopPumpBusy = false
+    /// 连续几拍血糖过低。两拍（10 分钟）就自动卸武装
+    var loopLowTicks = 0
+    /// 连续几拍出错
+    var loopErrorTicks = 0
     /// 重连后补认证的状态。连续失败两次就停下，不留在一个「一直重连、一直失败」的循环里。
     private var isResuming = false
     private var resumeAttempts = 0
@@ -188,6 +213,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         glucoseStore = GlucoseHistoryStore(fileURL: docs.appendingPathComponent("glucose.json"))
         shadowLog = ShadowLog(fileURL: docs.appendingPathComponent("shadow.jsonl"))
+        loopLedger = LoopLedger(fileURL: docs.appendingPathComponent("loop.jsonl"))
         advisorSettings = Self.loadSettings()
         samples = glucoseStore.recent(minutes: 180)
         shadowCount = shadowLog.summarize().total
@@ -439,7 +465,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// 第一条状态请求被泵回 Nack 并断开——日志里「链路已就绪 → TX 0x24 →
     /// 749ms 后 CBErrorDomain 7 → 重连 1/2」反复出现，表现就是「划掉 App
     /// 再进来就再也连不上」。
-    private func resumeAfterReconnectIfNeeded() async {
+    func resumeAfterReconnectIfNeeded() async {
         guard phase == .dashboard, !isResuming else { return }
         if await session.isAuthenticated {
             resumeAttempts = 0
@@ -758,7 +784,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     ///
     /// 这里做的事情全部是"算"，没有一条指令会发给泵。影子记录也在这里落盘，
     /// 目的是两周后能拿真实数据回答"如果自动，会不会做蠢事"。
-    private func updateAdvisor(with snap: PumpSession.Snapshot) {
+    func updateAdvisor(with snap: PumpSession.Snapshot) {
         let now = Date()
 
         // 采样时间用快照的抓取时刻。EGV 报文里虽然带时间戳，但那是泵自己的
@@ -1412,6 +1438,16 @@ struct DashboardView: View {
                     NavigationLink("诊断日志") { DiagnosticView() }
                 }
                 .font(.footnote)
+
+                NavigationLink {
+                    ClosedLoopView()
+                } label: {
+                    Label(model.loopArmed ? (model.loopLiveDosing ? "闭环运行中（真发）" : "闭环演练中（不发针）") : "闭环 · 微剂量模拟基础率",
+                          systemImage: "gearshape.2.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
 
                 Button(role: .destructive) {
                     showForget = true
@@ -2401,6 +2437,197 @@ struct BasalProfileView: View {
             if model.basalProfile == nil, model.linkPhase.isReady {
                 Task { await model.loadBasalProfile() }
             }
+        }
+    }
+}
+
+// MARK: - 闭环（微剂量模拟基础率）
+
+/// 闭环页。这一页是全 App 唯一会「自己往身体里送胰岛素」的地方，
+/// 所以它的形状是：先把边界写在最上面，再给两个分开的开关，最后才是参数和账。
+struct ClosedLoopView: View {
+    @EnvironmentObject var model: AppModel
+    @State private var showLiveConfirm = false
+    @State private var showClearConfirm = false
+
+    private var tickText: String {
+        guard let next = model.loopNextTickAt else { return "—" }
+        let left = max(0, Int(next.timeIntervalSinceNow))
+        return String(format: "%d:%02d", left / 60, left % 60)
+    }
+
+    var body: some View {
+        Form {
+            boundarySection
+            statusSection
+            paramsSection
+            decisionSection
+            ledgerSection
+        }
+        .navigationTitle("闭环")
+        .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
+        .onAppear { model.refreshLoopTotals() }
+        .confirmationDialog("真的让它自己发针？", isPresented: $showLiveConfirm,
+                            titleVisibility: .visible) {
+            Button("开始真发", role: .destructive) { model.armLoop(live: true) }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("每 5 分钟最多一针，单针上限 \(String(format: "%.2f", model.loopSettings.maxSingleMicroBolus)) U，每小时上限 \(String(format: "%.2f", model.loopSettings.maxHourlyMicroBolus)) U。打出去的收不回来，血糖低了软件只能停手，不能把胰岛素抽回去。")
+        }
+    }
+
+    // MARK: 边界
+
+    private var boundarySection: some View {
+        Section {
+            Text("这里做的是**微剂量模拟基础率**：每 5 分钟，把这 5 分钟本该缓慢滴入的量，用一针小额大剂量补进去。")
+            Text("三条代价，写在这里而不是藏在文档里：")
+            Text("1. 只能加不能减。血糖要往下掉时，软件只能停止后续针，已经进去的收不回来。所以它比 AAPS 那种能设临时基础率的闭环更依赖你盯着。")
+            Text("2. 每针都会进泵的大剂量历史，泵按大剂量算 IOB。这是这套方案的固有形状。")
+            Text("3. 泵自带 Control-IQ 必须关掉。两边同时调胰岛素就是叠加给药，读不到它的状态时这一拍也不出针。")
+            Text("X2 固件不接受基础率写入（SetTempRate/Suspend/Resume 全是 MOBI_ONLY），上面这三条不是选择，是这台泵剩下的唯一路径。")
+        } header: {
+            Text("先读这段")
+        }
+        .font(.footnote)
+    }
+
+    // MARK: 状态
+
+    private var statusSection: some View {
+        Section {
+            LabeledContent("状态") {
+                if model.loopArmed {
+                    Text(model.loopLiveDosing ? "运行中 · 真发针" : "演练中 · 只记账")
+                        .foregroundStyle(model.loopLiveDosing ? Color.orange : Color.green)
+                } else {
+                    Text("未启动").foregroundStyle(.secondary)
+                }
+            }
+            if model.loopArmed {
+                LabeledContent("下一拍", value: tickText)
+                LabeledContent("已跑", value: "\(model.loopTickCount) 拍")
+            }
+            LabeledContent("Control-IQ（泵）") {
+                if let info = model.controlIQ {
+                    Text(info.closedLoopEnabled ? "开着 · 闭环不能同时跑" : "关着 · 允许")
+                        .foregroundStyle(info.closedLoopEnabled ? Color.red : Color.green)
+                } else {
+                    Text("未读到 · 不出针").foregroundStyle(.orange)
+                }
+            }
+            if let error = model.loopError {
+                Text(error).font(.footnote).foregroundStyle(.red)
+            }
+
+            if model.loopArmed {
+                Button("停止闭环", role: .destructive) {
+                    model.disarmLoop(note: "你手动停止了闭环")
+                }
+            } else {
+                Button("开始演练（不发针）") { model.armLoop(live: false) }
+                Button("开始真发针") { showLiveConfirm = true }
+                    .foregroundStyle(.red)
+            }
+        } header: {
+            Text("开关")
+        } footer: {
+            Text("演练和真发是两个按钮。演练跑够一轮、看记录里算出来的量合不合理，再考虑真发。")
+        }
+    }
+
+    // MARK: 参数
+
+    private var paramsSection: some View {
+        Section {
+            numberRow("目标下限 mg/dL", value: $model.loopSettings.targetLow)
+            numberRow("目标上限 mg/dL", value: $model.loopSettings.targetHigh)
+            numberRow("敏感系数 ISF", value: $model.loopSettings.isf)
+            numberRow("胰岛素作用时长（分钟）", value: $model.loopSettings.insulinDurationMinutes)
+            numberRow("单针上限 U", value: $model.loopSettings.maxSingleMicroBolus, step: 0.05)
+            numberRow("每小时上限 U", value: $model.loopSettings.maxHourlyMicroBolus, step: 0.05)
+            numberRow("IOB 上限 U", value: $model.loopSettings.maxIobUnits, step: 0.1)
+            numberRow("停止线 mg/dL", value: $model.loopSettings.lowSuspendThreshold)
+            if let invalid = model.loopSettings.invalidReason {
+                Text(invalid).font(.footnote).foregroundStyle(.red)
+            }
+        } header: {
+            Text("参数")
+        } footer: {
+            Text("目标、ISF 应与你泵里个人计划一致。默认值只是保守起点，不是处方。")
+        }
+    }
+
+    private func numberRow(_ title: String, value: Binding<Double>, step: Double = 1) -> some View {
+        LabeledContent(title) {
+            TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.decimalPad)
+                .monospacedDigit()
+        }
+    }
+
+    // MARK: 最近一拍
+
+    private var decisionSection: some View {
+        Section {
+            if let d = model.loopLastDecision {
+                Text(d.summary).font(.callout)
+                LabeledContent("基础率折算") { Text(String(format: "%.3f U", d.basalEquiv)) }
+                if d.correction > 0 {
+                    LabeledContent("高血糖追加") { Text(String(format: "%.2f U", d.correction)) }
+                }
+                if d.carriedOut > 0 {
+                    LabeledContent("攒到下一拍") { Text(String(format: "%.3f U", d.carriedOut)) }
+                }
+            } else {
+                Text("还没跑过一拍").foregroundStyle(.secondary)
+            }
+            LabeledContent("近一小时已发", value: String(format: "%.2f U", model.loopHourUnits))
+            LabeledContent("今日已发", value: String(format: "%.2f U", model.loopTodayUnits))
+        } header: {
+            Text("最近一拍")
+        }
+    }
+
+    // MARK: 台账
+
+    private var ledgerSection: some View {
+        Section {
+            ForEach(Array(model.loopRecords.reversed().prefix(20)), id: \.timestamp) { r in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text(r.timestamp.formatted(date: .omitted, time: .shortened))
+                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
+                        Spacer()
+                        if r.accepted == true {
+                            Text(String(format: "%.2f U", r.units))
+                                .font(.caption.weight(.semibold)).foregroundStyle(.green)
+                        } else if let hold = r.holdReason {
+                            Text(hold).font(.caption2).foregroundStyle(.secondary)
+                        } else {
+                            Text("未发 / 未知").font(.caption2).foregroundStyle(.orange)
+                        }
+                    }
+                    Text(r.summary).font(.caption2).foregroundStyle(.secondary)
+                    if let e = r.errorText {
+                        Text(e).font(.caption2).foregroundStyle(.orange)
+                    }
+                }
+            }
+            if model.loopRecords.isEmpty { Text("还没有记录").foregroundStyle(.secondary) }
+
+            Button("清空台账", role: .destructive) { showClearConfirm = true }
+                .confirmationDialog("清空闭环台账？", isPresented: $showClearConfirm, titleVisibility: .visible) {
+                    Button("清空", role: .destructive) { model.clearLoopLedger() }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("清空后「近一小时已发」会从 0 重算，等于放弃这道额度。一般不要清。")
+                }
+        } header: {
+            Text("台账 · 最近 20 条")
+        } footer: {
+            Text("额度从台账算，不从内存计数。App 被杀掉重开，额度不会归零。")
         }
     }
 }

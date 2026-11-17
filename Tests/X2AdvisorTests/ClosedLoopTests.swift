@@ -1,0 +1,207 @@
+import XCTest
+@testable import X2Advisor
+
+/// 闭环决策核的测试。
+///
+/// 重点不是"算得准不准"，而是**每一条拦截都真的会拦**。算法把剂量算对只是及格线；
+/// 血糖已经 60 了还因为别的原因放行，才是要命的那种错。所以每条 hold 都单独一个用例，
+/// 且都构造在"其他条件全部正常"的前提下，确保拦下它的是那个闸门本身。
+final class ClosedLoopTests: XCTestCase {
+
+    private var settings = ClosedLoop.Settings()
+
+    /// 一切正常的基线输入：血糖 120、5 分钟前读数、IOB 0.5、计划基础率 1 U/h
+    private func healthyInputs() -> ClosedLoop.Inputs {
+        ClosedLoop.Inputs(cgmMgdl: 120,
+                          cgmAgeMinutes: 5,
+                          iobUnits: 0.5,
+                          basalProfileUnitsPerHour: 1.0,
+                          deliveredLastHourUnits: 0.3,
+                          eventualBg: 120,
+                          minutesToLow: nil,
+                          trendPerMinute: 0,
+                          controlIQEnabled: false,
+                          carriedUnits: 0,
+                          pumpBusy: false)
+    }
+
+    // MARK: 闸门
+
+    func testControlIQOnAlwaysHolds() {
+        var inputs = healthyInputs()
+        inputs.controlIQEnabled = true
+        inputs.eventualBg = 300          // 即便血糖很高也不许出针：双控制器会叠加
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.hold, .controlIQOn)
+        XCTAssertEqual(d.units, 0)
+    }
+
+    func testControlIQUnknownHolds() {
+        // 没读到 Control-IQ 状态时按"可能开着"处理：宁可停一拍，
+        // 也不要在泵自己调基础率时叠一针上去
+        var inputs = healthyInputs()
+        inputs.controlIQEnabled = nil
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.hold, .controlIQUnknown)
+        XCTAssertEqual(d.units, 0)
+    }
+
+    func testMissingCGMHolds() {
+        var inputs = healthyInputs()
+        inputs.cgmMgdl = nil
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .cgmMissing)
+    }
+
+    func testStaleCGMHolds() {
+        var inputs = healthyInputs()
+        inputs.cgmAgeMinutes = 20
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .cgmStale)
+    }
+
+    func testLowGlucoseHolds() {
+        var inputs = healthyInputs()
+        inputs.cgmMgdl = 65
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .glucoseLow)
+    }
+
+    func testPredictedLowHolds() {
+        var inputs = healthyInputs()
+        inputs.minutesToLow = 20
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .predictedLow)
+    }
+
+    func testPredictedLowOutsideWindowDoesNotHold() {
+        var inputs = healthyInputs()
+        inputs.minutesToLow = 45
+        XCTAssertNil(ClosedLoop.decide(settings, inputs).hold)
+    }
+
+    func testFallingFastHolds() {
+        var inputs = healthyInputs()
+        inputs.trendPerMinute = -2.5
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .fallingFast)
+    }
+
+    func testIobAtCapHolds() {
+        var inputs = healthyInputs()
+        inputs.iobUnits = 4.2
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .iobAtCap)
+    }
+
+    func testHourlyCapHolds() {
+        var inputs = healthyInputs()
+        inputs.deliveredLastHourUnits = 1.6
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .hourlyCap)
+    }
+
+    func testNoBasalProfileHolds() {
+        var inputs = healthyInputs()
+        inputs.basalProfileUnitsPerHour = nil
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .noBasalProfile)
+    }
+
+    func testPumpBusyHolds() {
+        var inputs = healthyInputs()
+        inputs.pumpBusy = true
+        XCTAssertEqual(ClosedLoop.decide(settings, inputs).hold, .pumpBusy)
+    }
+
+    // MARK: 剂量换算
+
+    func testBasalEquivPerFiveMinutes() {
+        // 1 U/h → 每 5 分钟 0.0833 U → 向下取整到 0.05，剩 0.0333 留到下一拍
+        let d = ClosedLoop.decide(settings, healthyInputs())
+        XCTAssertEqual(d.basalEquiv, 1.0 * 300 / 3600, accuracy: 0.0001)
+        XCTAssertEqual(d.units, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(d.carriedOut, 0.0333, accuracy: 0.002)
+        XCTAssertNil(d.hold)
+    }
+
+    func testCarriedUnitsAccumulate() {
+        var inputs = healthyInputs()
+        inputs.carriedUnits = 0.02
+        let d = ClosedLoop.decide(settings, inputs)
+        // 0.02 + 0.0833 = 0.1033 → 0.10，剩 0.0033
+        XCTAssertEqual(d.units, 0.10, accuracy: 0.0001)
+        XCTAssertEqual(d.carriedOut, 0.0033, accuracy: 0.002)
+    }
+
+    func testFloorNeverRoundsUp() {
+        var inputs = healthyInputs()
+        inputs.carriedUnits = 0.049      // 差一点点才够一步
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.basalEquiv, 0.0833, accuracy: 0.001)
+        // 0.049 + 0.0833 = 0.1323 → 0.10；不能因为"差不多"就给 0.15
+        XCTAssertEqual(d.units, 0.10, accuracy: 0.0001)
+    }
+
+    func testSmallAmountBelowStepIsCarried() {
+        var inputs = healthyInputs()
+        inputs.basalProfileUnitsPerHour = 0.3   // 每 5 分钟 0.025 U
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.hold, .doseBelowStep)
+        XCTAssertEqual(d.units, 0)
+    }
+
+    func testHighGlucoseAddsCorrection() {
+        var inputs = healthyInputs()
+        inputs.cgmMgdl = 200
+        inputs.eventualBg = 200          // (200-130)/50 = 1.4 U，被单次上限 0.30 截断
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.correction, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(d.units, 0.30, accuracy: 0.0001, "单次上限生效，不会把 1.4 U 分一次打出去")
+    }
+
+    func testCorrectionCappedByBasalMultiple() {
+        var inputs = healthyInputs()
+        inputs.basalProfileUnitsPerHour = 0.2   // 每段 0.0167 U，×4 = 0.0667
+        inputs.cgmMgdl = 250
+        inputs.eventualBg = 250
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.correction, 0.0667, accuracy: 0.002, "基础率很小时追加也要跟着小")
+    }
+
+    func testEventualBelowTargetSuppressesBasal() {
+        var inputs = healthyInputs()
+        inputs.cgmMgdl = 100
+        inputs.eventualBg = 85           // 预测会往目标以下走
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(d.basalEquiv, 0.0833, accuracy: 0.001, "算出来的基础段要照实记录")
+        XCTAssertEqual(d.units, 0, "但这一拍不打——只能减到 0，不能减成负的")
+        XCTAssertEqual(d.hold, .doseBelowStep)
+    }
+
+    func testIobHeadroomLimitsDose() {
+        var inputs = healthyInputs()
+        inputs.iobUnits = 3.9            // 上限 4.0，只剩 0.1 的空间
+        inputs.cgmMgdl = 220
+        inputs.eventualBg = 220
+        let d = ClosedLoop.decide(settings, inputs)
+        XCTAssertLessThanOrEqual(d.units, 0.1 + 0.001)
+    }
+
+    // MARK: 参数校验
+
+    func testSettingsRejectBadISF() {
+        var s = ClosedLoop.Settings()
+        s.isf = 0
+        XCTAssertNotNil(s.invalidReason)
+    }
+
+    func testSettingsRejectInvertedTargets() {
+        var s = ClosedLoop.Settings()
+        s.targetHigh = s.targetLow - 10
+        XCTAssertNotNil(s.invalidReason)
+    }
+
+    func testSettingsRejectHourlyBelowSingle() {
+        var s = ClosedLoop.Settings()
+        s.maxHourlyMicroBolus = 0.2
+        s.maxSingleMicroBolus = 0.3
+        XCTAssertNotNil(s.invalidReason)
+    }
+
+    func testDefaultSettingsAreValid() {
+        XCTAssertNil(ClosedLoop.Settings().invalidReason)
+    }
+}
