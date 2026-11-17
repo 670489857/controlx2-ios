@@ -111,7 +111,7 @@ final class ControlIQMessageTests: XCTestCase {
     /// 跨零点：23:00–07:00 在 02:00 也算「正在睡」
     func testSleepWindowSpansMidnight() throws {
         let cargo: [UInt8] = [
-            1, 0x7F, 0x64, 0x05, 0x1C, 0x02,
+            1, 0x7F, 0x64, 0x05, 0xA4, 0x01,   // 启用、每天、1380(23:00)、420(07:00)
             0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0
