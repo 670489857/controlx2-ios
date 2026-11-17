@@ -74,7 +74,13 @@ final class LoopLedgerTests: XCTestCase {
 
     func testCorruptLineIsSkippedNotFatal() throws {
         let ledger = LoopLedger(fileURL: fileURL)
+        // 诊断分两步：先确认「一次 append 只产生一行」。这一步失败说明是写入本身重复；
+        // 这一步通过而下一步失败，说明是文件被多个测试共用。
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path),
+                       "测试开始前文件不该存在：\(fileURL.path)")
         ledger.append(record(5, units: 0.10, accepted: true))
+        XCTAssertEqual(ledger.readAll().count, 1,
+                       "一次 append 应该只有一行，实际 \(ledger.readAll().count) 行，文件 \(fileURL.path)")
         let text = try String(contentsOf: fileURL, encoding: .utf8)
         try (text + "{broken\n").write(to: fileURL, atomically: true, encoding: .utf8)
         XCTAssertEqual(ledger.readAll().count, 1, "坏行跳过，前面的记录仍然可读")
