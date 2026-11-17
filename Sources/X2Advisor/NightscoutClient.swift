@@ -123,7 +123,7 @@ public struct NightscoutClient: Sendable {
         guard var comps = URLComponents(url: baseURL.appendingPathComponent("api/v1/entries/sgv.json"),
                                         resolvingAgainstBaseURL: false)
         else { return nil }
-        var items = [URLQueryItem(name: "count", value: String(max(1, count))]
+        var items = [URLQueryItem(name: "count", value: String(max(1, count)))]
         if let token, !token.trimmingCharacters(in: .whitespaces).isEmpty {
             items.append(URLQueryItem(name: "token", value: token.trimmingCharacters(in: .whitespaces)))
         }
