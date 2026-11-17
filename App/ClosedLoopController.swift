@@ -60,6 +60,9 @@ extension AppModel {
             if loopSettings.pumpBasalUnitsPerHour < 0.05 && !loopZeroBasalConfirmed {
                 return "泵的基础率还在跑：先到泵上把基础率设成 0（或把 App 里「泵自己在跑的」填成实际值），再勾选确认。否则 App 补的会和泵叠加"
             }
+            // 真发必须先把「接管自检」跑通并签发凭证：
+            // 泵在跑什么、Control-IQ 关没关、药筒还剩多少，都是会在几十分钟内变化的状态
+            if let reason = takeoverClearanceBlockReason { return reason }
         }
         return nil
     }

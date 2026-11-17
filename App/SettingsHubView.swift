@@ -289,3 +289,100 @@ struct LoopPresetEditorView: View {
         }
     }
 }
+
+/// 接管自检页。
+///
+/// 顺序是刻意的：先刷新泵、再判定、最后才允许签发凭证。
+/// 界面只负责把「哪一条没过」摆到最上面，不替用户做判断。
+struct TakeoverCheckView: View {
+    @EnvironmentObject var model: AppModel
+
+    private var report: TakeoverCheck.Report? { model.takeoverReport }
+
+    private var clearanceText: String {
+        guard let verified = model.takeoverVerifiedAt else { return "未签发" }
+        let minutes = Int(Date().timeIntervalSince(verified) / 60)
+        return minutes <= 30 ? "有效（\(minutes) 分钟前签发）" : "已过期（\(minutes) 分钟前）"
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Button {
+                    Task { await model.runTakeoverCheck() }
+                } label: {
+                    Label(model.takeoverChecking ? "正在自检…" : "重新自检", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.takeoverChecking)
+
+                LabeledContent("凭证", value: clearanceText)
+
+                if let checked = model.takeoverCheckedAt {
+                    Text("上次自检 " + checked.formatted(date: .omitted, time: .standard))
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("自检")
+            } footer: {
+                Text("凭证有效期 30 分钟。泵的电量、药筒、Control-IQ 状态都会变，过期就重新核对一次。")
+            }
+
+            if let report {
+                if let reason = report.firstBlockReason {
+                    Section {
+                        Text(reason).font(.footnote).foregroundStyle(.red)
+                    } header: {
+                        Text("先修这一条")
+                    }
+                }
+
+                Section {
+                    ForEach(report.items) { item in
+                        checkRow(item)
+                    }
+                } header: {
+                    Text("逐条核对")
+                }
+
+                if !report.warnings.isEmpty {
+                    Section {
+                        Toggle("我确认以上警告，仍要真发", isOn: $model.takeoverWarningsAcknowledged)
+                    } footer: {
+                        Text("警告项不是「必须修」，但每一条都对应一个真实的失效场景——例如断链后没有基础胰岛素、或泵自身报警不会响。")
+                    }
+                }
+
+                Section {
+                    Button {
+                        model.grantTakeoverClearance()
+                    } label: {
+                        Label("自检通过，允许真发 30 分钟", systemImage: "checkmark.shield")
+                    }
+                    .disabled(!report.canProceed(warningsAcknowledged: model.takeoverWarningsAcknowledged))
+                }
+            } else {
+                Section {
+                    Text("还没跑过自检。点上面的「重新自检」——它会先刷新泵状态，再逐条判定。")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+        }
+        .navigationTitle("接管自检")
+        .task {
+            if model.takeoverReport == nil { await model.runTakeoverCheck() }
+        }
+    }
+
+    private func checkRow(_ item: TakeoverCheck.Item) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: item.passed ? "checkmark.circle.fill"
+                                          : (item.severity == .blocker ? "xmark.octagon.fill" : "exclamationmark.triangle.fill"))
+                .foregroundStyle(item.passed ? Color.green
+                                             : (item.severity == .blocker ? Color.red : Color.orange))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.title).font(.subheadline.weight(.medium))
+                Text(item.detail).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+}

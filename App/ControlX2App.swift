@@ -169,6 +169,14 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// 已确认「泵的基础率已经降下来」，闭环才允许真发
     @Published var loopZeroBasalConfirmed = false
 
+    // MARK: 接管自检
+    @Published var takeoverReport: TakeoverCheck.Report?
+    @Published var takeoverChecking = false
+    @Published var takeoverCheckedAt: Date?
+    /// 通过自检后的凭证时间。30 分钟内有效
+    @Published var takeoverVerifiedAt: Date?
+    @Published var takeoverWarningsAcknowledged = false
+
     // MARK: 控糖设定档
     @Published var loopPresets: [LoopPreset] =
         LoopPresetLibrary.decode(UserDefaults.standard.data(forKey: "loopPresets"))
@@ -2617,6 +2625,12 @@ struct ClosedLoopView: View {
             decisionSection
             ledgerSection
             Section {
+                NavigationLink {
+                    TakeoverCheckView()
+                } label: {
+                    Label(model.takeoverVerifiedAt == nil ? "接管自检（真发前必做）" : "接管自检 · 已通过",
+                          systemImage: model.takeoverVerifiedAt == nil ? "checklist" : "checkmark.shield.fill")
+                }
                 NavigationLink("高级参数（ISF / 上限 / 泵基础率）") {
                     LoopAdvancedView()
                 }
