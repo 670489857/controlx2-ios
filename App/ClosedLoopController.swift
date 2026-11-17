@@ -159,11 +159,16 @@ extension AppModel {
     }
 
     private func loopInputs(_ snap: PumpSession.Snapshot) -> ClosedLoop.Inputs {
-        // CGM 年龄用泵给的读数时间戳算，不是「我们上次刷新距今」
-        let cgmAgeMinutes = snap.glucoseAgeSeconds.map { Double($0) / 60 }
+        // 血糖从「用户选定的来源」取。闭环如果一边用 NS 的值做判断、
+        // 一边拿泵的 EGV 做显示，就会在两边差 10 mg/dL 时没人说得清为什么停针。
+        let useNS = cgmSource == .nightscout && nsLatestMgdl != nil
+        let cgmAgeMinutes = useNS ? nsAgeMinutes : snap.glucoseAgeSeconds.map { Double($0) / 60 }
         let status = snap.glucoseStatus
-        // 状态不是 1（有效）就当没有读数据：0 无 CGM、2 低、3 高、4 不可用
-        let bg: Double? = (status == nil || status == 1) ? snap.glucoseMgdl.map(Double.init) : nil
+        // 状态不是 1（有效）就当没有读数据：0 无 CGM、2 低、3 高、4 不可用。
+        // NS 没有这个概念，用年龄闸门兜底（超过 maxCgmAgeMinutes 直接停拍）。
+        let bg: Double? = useNS
+            ? nsLatestMgdl.map(Double.init)
+            : ((status == nil || status == 1) ? snap.glucoseMgdl.map(Double.init) : nil)
 
         return ClosedLoop.Inputs(
             cgmMgdl: bg,

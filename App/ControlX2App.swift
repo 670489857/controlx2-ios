@@ -60,6 +60,21 @@ struct ReadingRow: Identifiable {
     let note: String
 }
 
+/// 血糖来源。只影响"读哪里的数"，不影响任何输注逻辑——
+/// 泵的 IOB、基础率、Control-IQ 状态永远来自泵，不会因为换了 CGM 来源就变。
+enum CGMSource: String, CaseIterable, Codable, Identifiable {
+    case pump
+    case nightscout
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .pump: return "泵自带 CGM（Dexcom 直连）"
+        case .nightscout: return "Nightscout"
+        }
+    }
+}
+
 /// 输注界面状态机。只描述「界面走到了哪一步」，不代表泵那边的真实状态——
 /// 泵的真实状态永远以 0x2D 与泵屏幕为准。
 enum BolusPhase: Equatable {
@@ -111,6 +126,22 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var batteryText: String = "—"
     @Published var basalText: String = "—"
     @Published var hasLiveData = false
+
+    // MARK: 血糖来源
+    @Published var cgmSource: CGMSource =
+        CGMSource(rawValue: UserDefaults.standard.string(forKey: "cgmSource") ?? "pump") ?? .pump
+    @Published var nsConfig: NightscoutConfig = AppModel.loadNightscoutConfig()
+    @Published var nsStatus: String?
+    @Published var nsError: String?
+    @Published var nsLatestMgdl: Int?
+    @Published var nsLatestDate: Date?
+    @Published var nsLoading = false
+    /// 血糖卡片下面那行小字，明确写出这个数是从哪来的
+    @Published var glucoseSourceHint: String = "mg/dL · 以泵屏幕为准"
+    /// 上一次成功拉 NS 的时间。轮询靠它做 2 分钟节流
+    var nsLastFetchAt: Date?
+    /// 最近一批 NS 记录，界面和趋势码都从这里取
+    var nsLastEntries: [NightscoutEntry] = []
 
     // 预测与建议
     @Published var samples: [GlucoseSample] = []
@@ -188,7 +219,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     private let store: CredentialStore = KeychainCredentialStore()
     /// 上次连上的泵，用来在启动时直接连回去
     private let lastPumpStore: LastPumpStore = UserDefaultsLastPumpStore()
-    private let glucoseStore: GlucoseHistoryStore
+    let glucoseStore: GlucoseHistoryStore
     private let shadowLog: ShadowLog
     /// 闭环每一拍的去向。额度从这里算，不从内存计数器算
     let loopLedger: LoopLedger
@@ -629,6 +660,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
                 await resumeAfterReconnectIfNeeded()
                 try? await session.refresh()
                 await refreshFromSession()
+                await maybeRefreshNightscout()
             }
         }
     }
@@ -645,6 +677,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             await resumeAfterReconnectIfNeeded()
             try? await session.refresh()
             await refreshFromSession()
+            await maybeRefreshNightscout()
         }
     }
 
@@ -664,6 +697,19 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             hasLiveData = true
         }
         trendSymbol = Self.trendSymbol(for: snap.glucoseTrend)
+
+        // Nightscout 作为来源时，界面上的血糖必须换成 NS 的：泵的 EGV 可能根本没数据，
+        // 也可能比 NS 旧。以「用户选定的来源」为唯一准星，避免两个数字打架。
+        if cgmSource == .nightscout, let ns = nsLatestMgdl {
+            glucoseText = "\(ns)"
+            glucoseSub = String(format: "%.1f mmol/L", Double(ns) / 18.0182)
+            glucoseValue = ns
+            hasLiveData = true
+            trendSymbol = Self.trendSymbol(for: nsTrendCode)
+            glucoseSourceHint = "mg/dL · Nightscout " + nsAgeText
+        } else {
+            glucoseSourceHint = "mg/dL · 以泵屏幕为准"
+        }
         if let iob = snap.iobUnits {
             iobText = String(format: "%.2f U", iob)
             iobValue = iob
@@ -789,7 +835,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 
         // 采样时间用快照的抓取时刻。EGV 报文里虽然带时间戳，但那是泵自己的
         // 时钟起点，未与 Unix 纪元对齐，直接用会把所有点挪到 1970 年。
-        if let g = snap.glucoseMgdl {
+        if cgmSource == .pump, let g = snap.glucoseMgdl {
             glucoseStore.append(GlucoseSample(
                 timestamp: snap.lastUpdated ?? now,
                 mgdl: g,
@@ -1377,7 +1423,7 @@ struct DashboardView: View {
                     }
                     Text(model.glucoseSub.isEmpty ? "等待 CGM 数据" : model.glucoseSub)
                         .font(.callout).foregroundStyle(.secondary)
-                    Text("mg/dL · 以泵屏幕为准")
+                    Text(model.glucoseSourceHint)
                         .font(.caption2).foregroundStyle(.tertiary)
                 }
                 .frame(maxWidth: .infinity)
@@ -1444,6 +1490,16 @@ struct DashboardView: View {
                 } label: {
                     Label(model.loopArmed ? (model.loopLiveDosing ? "闭环运行中（真发）" : "闭环演练中（不发针）") : "闭环 · 微剂量模拟基础率",
                           systemImage: "gearshape.2.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                NavigationLink {
+                    CGMSourceView()
+                } label: {
+                    Label(model.cgmSource == .nightscout ? "血糖来源 · Nightscout" : "血糖来源 · 泵 CGM",
+                          systemImage: "antenna.radiowaves.left.and.right")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
@@ -2628,6 +2684,101 @@ struct ClosedLoopView: View {
             Text("台账 · 最近 20 条")
         } footer: {
             Text("额度从台账算，不从内存计数。App 被杀掉重开，额度不会归零。")
+        }
+    }
+}
+
+// MARK: - 血糖来源
+
+/// 血糖来源页。只切「读哪里的血糖」，泵侧的 IOB / 基础率 / Control-IQ 一律不变。
+struct CGMSourceView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("血糖来源", selection: Binding(get: { model.cgmSource },
+                                                     set: { model.setCGMSource($0) })) {
+                    ForEach(CGMSource.allCases) { source in
+                        Text(source.title).tag(source)
+                    }
+                }
+                .pickerStyle(.inline)
+            } footer: {
+                Text("换来源只影响血糖、趋势、预测和闭环的输入。胰岛素相关数据永远来自泵。")
+            }
+
+            if model.cgmSource == .nightscout {
+                nightscoutSection
+                currentSection
+            }
+
+            Section {
+                Text("1. 只读血糖。不写 treatment、不读 NS 的 IOB——NS 的 IOB 是别的 App 按它自己的参数算的，拿来做本机闸门等于用别人的假设决定打不打针。")
+                Text("2. NS 的延迟是真实存在的：手机上传、桥接、服务器，任何一段卡住都会让「最新血糖」变成十分钟前那条。闭环按读数时间戳算年龄，超过 12 分钟直接停拍。")
+                Text("3. 闭环真发之前，先确认 NS 的数值和指尖血 / 泵屏幕对得上。对不上就退回泵 CGM，不要带着一个偏高的读数跑自动。")
+            } header: {
+                Text("边界")
+            }
+            .font(.footnote)
+        }
+        .navigationTitle("血糖来源")
+        .onChange(of: model.nsConfig) { _ in model.saveNightscoutConfig() }
+    }
+
+    private var nightscoutSection: some View {
+        Section {
+            Toggle("启用 Nightscout", isOn: $model.nsConfig.enabled)
+
+            LabeledContent("站点地址") {
+                TextField("https://ns.example.com", text: $model.nsConfig.baseURL)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .keyboardType(.URL)
+                    .multilineTextAlignment(.trailing)
+            }
+            LabeledContent("只读 token") {
+                TextField("可留空", text: $model.nsConfig.token)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .multilineTextAlignment(.trailing)
+            }
+
+            Button {
+                model.saveNightscoutConfig()
+                Task { await model.refreshNightscout() }
+            } label: {
+                Label(model.nsLoading ? "正在拉取…" : "保存并拉取一次", systemImage: "arrow.down.circle")
+            }
+            .disabled(model.nsLoading)
+
+            if let status = model.nsStatus {
+                Text(status).font(.footnote).foregroundStyle(.secondary)
+            }
+            if let error = model.nsError {
+                Text(error).font(.footnote).foregroundStyle(.orange)
+            }
+        } header: {
+            Text("Nightscout")
+        } footer: {
+            Text("地址填站点根即可（例如 https://ns.example.com 或 https://ns.example.com/ns），把整条 API 地址粘进来也能识别。token 存在本机 UserDefaults，不是 Keychain——它只有读权限。")
+        }
+    }
+
+    private var currentSection: some View {
+        Section {
+            if let mgdl = model.nsLatestMgdl {
+                LabeledContent("最新血糖", value: "\(mgdl) mg/dL")
+                LabeledContent("数据时间", value: model.nsAgeText)
+                if let age = model.nsAgeMinutes, age > 12 {
+                    Text("这条读数已经 \(Int(age)) 分钟了，闭环会停拍。检查桥接是否在跑。")
+                        .font(.footnote).foregroundStyle(.orange)
+                }
+            } else {
+                Text("还没拉到数据").foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("当前数据")
         }
     }
 }
