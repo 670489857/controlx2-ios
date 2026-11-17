@@ -120,6 +120,5 @@ extension AppModel {
         applyGlucoseDisplay(mgdl: ns)
         hasLiveData = true
         trendSymbol = Self.trendSymbol(for: nsTrendCode)
-        glucoseSourceHint = "mmol/L · Nightscout " + nsAgeText
     }
 }

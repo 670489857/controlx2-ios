@@ -60,6 +60,23 @@ struct ReadingRow: Identifiable {
     let note: String
 }
 
+/// 血糖显示单位。只影响界面上的数字，所有计算永远是 mg/dL。
+enum GlucoseDisplayUnit: String, CaseIterable, Identifiable {
+    case auto
+    case mgdl
+    case mmol
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .auto: return "跟随来源"
+        case .mgdl: return "mg/dL"
+        case .mmol: return "mmol/L"
+        }
+    }
+}
+
 /// 血糖来源。只影响"读哪里的数"，不影响任何输注逻辑——
 /// 泵的 IOB、基础率、Control-IQ 状态永远来自泵，不会因为换了 CGM 来源就变。
 enum CGMSource: String, CaseIterable, Codable, Identifiable {
@@ -138,6 +155,8 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var nsLoading = false
     /// 血糖卡片下面那行小字，明确写出这个数是从哪来的
     @Published var glucoseSourceHint: String = "mg/dL · 以泵屏幕为准"
+    @Published var glucoseUnit: GlucoseDisplayUnit =
+        GlucoseDisplayUnit(rawValue: UserDefaults.standard.string(forKey: "glucoseUnit") ?? "auto") ?? .auto
     /// 上一次成功拉 NS 的时间。轮询靠它做 2 分钟节流
     var nsLastFetchAt: Date?
     /// 最近一批 NS 记录，界面和趋势码都从这里取
@@ -688,13 +707,32 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// 显示单位只在最后一层换，绝不参与计算。
     func applyGlucoseDisplay(mgdl: Int) {
         glucoseValue = mgdl
-        if cgmSource == .nightscout {
+        let unit = effectiveGlucoseUnit
+        switch unit {
+        case .mmol:
             glucoseText = String(format: "%.1f", Double(mgdl) / 18.0182)
             glucoseSub = "\(mgdl) mg/dL"
-        } else {
+        default:
             glucoseText = "\(mgdl)"
             glucoseSub = String(format: "%.1f mmol/L", Double(mgdl) / 18.0182)
         }
+        glucoseSourceHint = (unit == .mmol ? "mmol/L" : "mg/dL") + " · " + glucoseSourceName
+    }
+
+    /// 实际生效的单位：手动指定优先；`跟随来源` 时 NS → mmol、泵 → mg/dL
+    var effectiveGlucoseUnit: GlucoseDisplayUnit {
+        glucoseUnit == .auto ? (cgmSource == .nightscout ? .mmol : .mgdl) : glucoseUnit
+    }
+
+    var glucoseSourceName: String {
+        cgmSource == .nightscout ? "Nightscout " + nsAgeText : "以泵屏幕为准"
+    }
+
+    func setGlucoseUnit(_ unit: GlucoseDisplayUnit) {
+        glucoseUnit = unit
+        UserDefaults.standard.set(unit.rawValue, forKey: "glucoseUnit")
+        // 立刻用现有读数重画，不必等下一次泵报文
+        if let mgdl = glucoseValue { applyGlucoseDisplay(mgdl: mgdl) }
     }
 
     func refreshFromSession() async {
@@ -718,9 +756,6 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             applyGlucoseDisplay(mgdl: ns)
             hasLiveData = true
             trendSymbol = Self.trendSymbol(for: nsTrendCode)
-            glucoseSourceHint = "mmol/L · Nightscout " + nsAgeText
-        } else {
-            glucoseSourceHint = "mg/dL · 以泵屏幕为准"
         }
         if let iob = snap.iobUnits {
             iobText = String(format: "%.2f U", iob)
@@ -2718,6 +2753,20 @@ struct CGMSourceView: View {
                 .pickerStyle(.inline)
             } footer: {
                 Text("换来源只影响血糖、趋势、预测和闭环的输入。胰岛素相关数据永远来自泵。")
+            }
+
+            Section {
+                Picker("显示单位", selection: Binding(get: { model.glucoseUnit },
+                                                    set: { model.setGlucoseUnit($0) })) {
+                    ForEach(GlucoseDisplayUnit.allCases) { unit in
+                        Text(unit.title).tag(unit)
+                    }
+                }
+                .pickerStyle(.segmented)
+            } header: {
+                Text("血糖单位")
+            } footer: {
+                Text("「跟随来源」= Nightscout 用 mmol/L、泵用 mg/dL。手动选一项就固定不动，换来源也保持。单位只改显示，闸门和闭环一直按 mg/dL 算。")
             }
 
             if model.cgmSource == .nightscout {
