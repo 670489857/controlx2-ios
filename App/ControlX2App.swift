@@ -1643,17 +1643,34 @@ struct AdvisorSettingsView: View {
                     TextField("5", value: $model.bolusPolicy.maxSingleUnits, format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
+                        .disabled(model.bolusPolicy.maxSingleUnits <= 0)
                 }
+                Toggle("单次上限不限", isOn: Binding(
+                    get: { model.bolusPolicy.maxSingleUnits <= 0 },
+                    set: { on in model.bolusPolicy.maxSingleUnits = on ? 0 : 5 }
+                ))
+
                 LabeledContent("24 小时上限（U）") {
                     TextField("12", value: $model.bolusPolicy.max24hUnits, format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
+                        .disabled(model.bolusPolicy.max24hUnits <= 0)
                 }
+                Toggle("24 小时累计不限", isOn: Binding(
+                    get: { model.bolusPolicy.max24hUnits <= 0 },
+                    set: { on in model.bolusPolicy.max24hUnits = on ? 0 : 12 }
+                ))
+
                 LabeledContent("最小间隔（分）") {
                     TextField("60", value: $model.bolusPolicy.minIntervalMinutes, format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
+                        .disabled(model.bolusPolicy.minIntervalMinutes <= 0)
                 }
+                Toggle("不要求给药间隔", isOn: Binding(
+                    get: { model.bolusPolicy.minIntervalMinutes <= 0 },
+                    set: { on in model.bolusPolicy.minIntervalMinutes = on ? 0 : 60 }
+                ))
                 LabeledContent("低血糖阈值") {
                     TextField("80", value: $model.bolusPolicy.lowGlucoseThreshold, format: .number)
                         .multilineTextAlignment(.trailing)
@@ -1662,7 +1679,7 @@ struct AdvisorSettingsView: View {
             } header: {
                 Text("大剂量边界")
             } footer: {
-                Text("这几条是 App 侧闸门，命中任一条就不发输注报文。泵自己的单次上限另算。改完点右上角「保存」，否则下次进大剂量页还是旧值。")
+                Text("这几条是 App 侧闸门，命中任一条就不发输注报文。上限填 0 或打开「不限」等于关掉这条闸门——泵自己的单次上限仍然有效，那是泵那边的事。改完点右上角「保存」。")
             }
 
             Section {
@@ -1755,6 +1772,19 @@ struct BolusView: View {
 
     private var decision: BolusDecision {
         model.bolusDecision ?? BolusGuard.evaluate(model.bolusContext())
+    }
+
+    /// 闸门现状的一句话。上限为 0 时显示「不限」，而不是显示 0.00 U 让人以为被卡死。
+    private var boundaryText: String {
+        let p = model.bolusPolicy
+        let single = p.maxSingleUnits > 0
+            ? String(format: "单次上限 %.2f U", p.maxSingleUnits) : "单次不限"
+        let daily = p.max24hUnits > 0
+            ? String(format: "24 小时上限 %.2f U", p.max24hUnits) : "24 小时不限"
+        let interval = p.minIntervalMinutes > 0
+            ? String(format: "最小间隔 %.0f 分钟", p.minIntervalMinutes) : "不要求间隔"
+        let low = String(format: "低血糖阈值 %.0f mg/dL", p.lowGlucoseThreshold)
+        return "\(single) · \(daily) · \(interval) · \(low)。在「建议参数」里改。"
     }
 
     private var canDeliver: Bool {
@@ -1890,11 +1920,7 @@ struct BolusView: View {
         } header: {
             Text("输注前检查")
         } footer: {
-            Text(String(format: "单次上限 %.2f U · 24 小时上限 %.2f U · 最小间隔 %.0f 分钟 · 低血糖阈值 %.0f mg/dL。上限在「建议参数」里改。",
-                        model.bolusPolicy.maxSingleUnits,
-                        model.bolusPolicy.max24hUnits,
-                        model.bolusPolicy.minIntervalMinutes,
-                        model.bolusPolicy.lowGlucoseThreshold))
+            Text(boundaryText)
         }
     }
 

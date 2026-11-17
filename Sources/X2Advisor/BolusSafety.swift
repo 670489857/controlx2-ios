@@ -9,11 +9,13 @@ import Foundation
 /// 单次上限、24 小时累计、与上次的间隔、当前血糖、药筒余量。
 /// 缺失的数据不当作 0——药筒余量读不到就不放行，而不是假设「还有很多」。
 public struct BolusPolicy: Codable, Equatable, Sendable {
-    /// 单次硬上限（U）。默认 5 U，可由用户在设置里改，改完立即生效。
+    /// 单次上限（U）。默认 5 U，用户可改，改完立即生效。
+    /// **填 0 表示不限**——这条闸门整条不参与判断，而不是「上限 0 U」。
     public var maxSingleUnits: Double = 5.0
-    /// 24 小时累计上限（U）
+    /// 24 小时累计上限（U）。**填 0 表示不限**。
+    /// 关掉之后台账仍然记录，只是不再拦；界面会把累计量继续显示出来。
     public var max24hUnits: Double = 12.0
-    /// 两次大剂量之间的最小间隔（分钟）
+    /// 两次大剂量之间的最小间隔（分钟）。**填 0 表示不要求间隔**。
     public var minIntervalMinutes: Double = 60
     /// 低于此血糖不放大剂量（mg/dL）
     public var lowGlucoseThreshold: Double = 80
@@ -115,16 +117,18 @@ public enum BolusGuard {
             blocks.append(BolusBlock(reason: .doseTooSmall,
                                      detail: String(format: "取整后 %.2f U，泵最小 0.05 U", units)))
         }
-        if units > p.maxSingleUnits + 1e-9 {
+        // 上限为 0 = 这条闸门关掉。写成 `> 0` 而不是 `!= 0`：负数（手滑输进去的）
+        // 同样当「不限」，不能让一个负号变成「任何剂量都超限」这种更奇怪的行为。
+        if p.maxSingleUnits > 0, units > p.maxSingleUnits + 1e-9 {
             blocks.append(BolusBlock(reason: .aboveSingleLimit,
                                      detail: String(format: "%.2f U > 单次上限 %.2f U", units, p.maxSingleUnits)))
         }
-        if ctx.delivered24h + units > p.max24hUnits + 1e-9 {
+        if p.max24hUnits > 0, ctx.delivered24h + units > p.max24hUnits + 1e-9 {
             blocks.append(BolusBlock(reason: .aboveDailyLimit,
                                      detail: String(format: "24 小时已给 %.2f U，再加 %.2f U 会超过 %.2f U",
                                                     ctx.delivered24h, units, p.max24hUnits)))
         }
-        if let last = ctx.lastBolusAt {
+        if p.minIntervalMinutes > 0, let last = ctx.lastBolusAt {
             let minutes = ctx.now.timeIntervalSince(last) / 60
             if minutes < p.minIntervalMinutes - 1e-9 {
                 blocks.append(BolusBlock(reason: .tooSoon,
@@ -158,6 +162,7 @@ public enum BolusGuard {
             warnings.append("没有 IOB 读数：泵可能尚未返回，或在用别的曲线")
         }
         if ctx.delivered24h > 0 {
+            // 即使 24 小时上限关掉了，累计量也照样报——关的是拦截，不是记录
             warnings.append(String(format: "本机台账 24 小时累计 %.2f U（不含在泵上直接打的）", ctx.delivered24h))
         }
 

@@ -155,3 +155,52 @@ final class BolusSafetyTests: XCTestCase {
         XCTAssertTrue(BolusLedger.decode(nil).records.isEmpty)
     }
 }
+
+    // MARK: 闸门可关闭（0 = 不限）
+
+    /// 单次上限填 0 应当整条闸门关掉，而不是「上限 0 U，什么都超」。
+    func testZeroSingleLimitDisablesGate() {
+        var policy = BolusPolicy()
+        policy.maxSingleUnits = 0
+        let decision = BolusGuard.evaluate(context(units: 8.0, policy: policy))
+        XCTAssertTrue(decision.allowed)
+        XCTAssertTrue(decision.blocks.isEmpty)
+    }
+
+    /// 负数同理：手滑输进一个负号，不能让所有剂量都被判超限。
+    func testNegativeSingleLimitTreatedAsUnlimited() {
+        var policy = BolusPolicy()
+        policy.maxSingleUnits = -1
+        let decision = BolusGuard.evaluate(context(units: 2.0, policy: policy))
+        XCTAssertTrue(decision.allowed)
+    }
+
+    func testZeroDailyLimitDisablesGate() {
+        var policy = BolusPolicy()
+        policy.max24hUnits = 0
+        // 台账已记 20 U，再打 3 U，上限关掉后不该拦
+        let decision = BolusGuard.evaluate(context(units: 3.0, delivered24h: 20.0, policy: policy))
+        XCTAssertTrue(decision.allowed)
+        XCTAssertTrue(decision.blocks.isEmpty)
+        // 但累计本身仍然要报出来：关的是拦截，不是记录
+        XCTAssertTrue(decision.warnings.contains { $0.contains("24 小时累计") })
+    }
+
+    func testZeroIntervalDisablesGate() {
+        var policy = BolusPolicy()
+        policy.minIntervalMinutes = 0
+        let decision = BolusGuard.evaluate(context(units: 1.0, lastMinutesAgo: 1, policy: policy))
+        XCTAssertTrue(decision.allowed, "上次是 1 分钟前，间隔要求关掉后应当放行")
+    }
+
+    func testLowGlucoseGateStillActiveWhenOthersDisabled() {
+        // 只关这三条，低血糖与药筒不跟着关：这两条对应的是能看到的身体状态和余量
+        var policy = BolusPolicy()
+        policy.maxSingleUnits = 0
+        policy.max24hUnits = 0
+        policy.minIntervalMinutes = 0
+        let decision = BolusGuard.evaluate(context(units: 1.0, reservoir: 10, glucose: 55, policy: policy))
+        XCTAssertFalse(decision.allowed)
+        XCTAssertEqual(decision.blocks.map(\.reason), [.lowGlucose])
+    }
+}

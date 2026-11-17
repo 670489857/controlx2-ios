@@ -172,9 +172,9 @@ Tools/message_catalog.json   上述元数据的中间产物
 | 闸门 | 默认 | 位置 |
 |---|---|---|
 | 最小步进 / 取整方向 | 0.05 U，向下 | `InsulinUnit.roundDownToStep` |
-| 单次上限 | 5 U（可改） | `BolusPolicy.maxSingleUnits` |
-| 24 小时累计 | 12 U（可改） | `BolusLedger.delivered` |
-| 两次最小间隔 | 60 分钟 | `BolusPolicy.minIntervalMinutes` |
+| 单次上限 | 5 U（可改，填 0 = 不限） | `BolusPolicy.maxSingleUnits` |
+| 24 小时累计 | 12 U（可改，填 0 = 不限） | `BolusLedger.delivered` |
+| 两次最小间隔 | 60 分钟（可关） | `BolusPolicy.minIntervalMinutes` |
 | 低血糖拦截 | < 80 mg/dL | `BolusPolicy.lowGlucoseThreshold` |
 | 药筒余量 | 留 0.5 U；读不到即拦 | `BolusPolicy.reservoirMarginUnits` |
 
