@@ -190,6 +190,10 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 
     // 预测与建议
     @Published var samples: [GlucoseSample] = []
+    /// 曲线用的采样。窗口可切 3/6/12/24 小时，和预测用的 `samples`（固定 3 小时）分开
+    @Published var chartSamples: [GlucoseSample] = []
+    @Published var chartWindowHours: Int =
+        UserDefaults.standard.object(forKey: "chartWindowHours") as? Int ?? 3
     @Published var prediction: PredictionResult?
     @Published var advice: DoseAdvice?
     @Published var advisorSettings: AdvisorSettings
@@ -292,6 +296,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         loopLedger = LoopLedger(fileURL: docs.appendingPathComponent("loop.jsonl"))
         advisorSettings = Self.loadSettings()
         samples = glucoseStore.recent(minutes: 180)
+        chartSamples = glucoseStore.recent(minutes: (UserDefaults.standard.object(forKey: "chartWindowHours") as? Int ?? 3) * 60)
         shadowCount = shadowLog.summarize().total
 
         // 已接受过免责声明时：有「上次那台泵 + 凭据」就直接落到状态页，连接在后台补；
@@ -917,6 +922,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             ))
         }
         samples = glucoseStore.recent(minutes: 180, now: now)
+        refreshChartSamples()
 
         // IOB 读不到就不预测。用 0 顶替等于假设"体内没有活性胰岛素"，
         // 这正是最容易导致过量建议的错误假设。

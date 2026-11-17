@@ -67,6 +67,23 @@ extension AppModel {
         nsLatestDate.map { Date().timeIntervalSince($0) / 60 }
     }
 
+    /// 按当前窗口重建曲线采样。窗口切到 24 小时时要能从本地历史里取满 24 小时
+    func refreshChartSamples() {
+        chartSamples = glucoseStore.recent(minutes: chartWindowHours * 60)
+    }
+
+    /// 切曲线窗口：换了跨度要立刻重算采样；NS 来源还要把远端的历史一起拉进来，
+    /// 否则 24 小时窗口只能看到 App 自己开机以后的那点数据
+    func setChartWindow(_ hours: Int) {
+        guard hours != chartWindowHours else { return }
+        chartWindowHours = hours
+        UserDefaults.standard.set(hours, forKey: "chartWindowHours")
+        refreshChartSamples()
+        if cgmSource == .nightscout, nsConfig.enabled {
+            Task { await refreshNightscout() }
+        }
+    }
+
     /// 轮询里调用：NS 每 5 分钟才更新一次，没必要每 60 秒打一次请求。
     /// `force` 用在后台上限被挂起之后、或者用户手动点「拉取」时——那时节流没有意义。
     func maybeRefreshNightscout(force: Bool = false) async {
@@ -95,10 +112,14 @@ extension AppModel {
         defer { nsLoading = false }
         do {
             let client = NightscoutClient(config: nsConfig)
-            let entries = try await client.entries(count: 24)
+            // NS 一条 5 分钟：24 小时窗口要 288 条才画得满
+            let entryCount = min(400, max(24, chartWindowHours * 12 + 6))
+            let entries = try await client.entries(count: entryCount)
             nsLastFetchAt = Date()
-            // 治疗记录单独拉：它失败不该让血糖也显示不出来
-            if let t = try? await client.treatments(count: 48) {
+            // 治疗记录单独拉：它失败不该让血糖也显示不出来。
+            // 窗口越长要的记录越多，否则 24 小时曲线上只剩最近几条注射标记
+            let treatmentCount = chartWindowHours >= 12 ? 200 : 48
+            if let t = try? await client.treatments(count: treatmentCount) {
                 nsTreatments = t
             }
             nsLastEntries = entries

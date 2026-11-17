@@ -184,10 +184,12 @@ struct GlucoseChartView: View {
                 context.fill(Path(ellipseIn: rect), with: .color(Color.green.opacity(0.75)))
             }
 
-            // 事件标记：三角 + 数值，画在对应时间的曲线上
+            // 事件标记：三角 + 数值，画在对应时间的曲线上。
+            // 同一条曲线上一串追加针常挤在一分钟里，标签会叠成一团文字——这里按像素间距丢标签，只留三角
+            var lastLabelX: CGFloat = -.greatestFiniteMagnitude
             for m in markers where m.date >= start && m.kind != .loopHold {
                 let px = x(m.date)
-                let bgValue = nearestValue(to: m.date, in: visible) ?? 180
+                let bgValue = nearestValue(to: m.date, in: visible, windowMinutes: windowMinutes) ?? 180
                 let py = y(bgValue)
                 let color: Color = m.kind == .carbs ? .orange : (m.kind == .bolus ? .blue : .green)
 
@@ -197,14 +199,28 @@ struct GlucoseChartView: View {
                 tri.addLine(to: CGPoint(x: px + 4.5, y: py - 14))
                 tri.closeSubpath()
                 context.fill(tri, with: .color(color))
+
+                guard px - lastLabelX >= 26 else { continue }
+                lastLabelX = px
                 context.draw(Text(m.shortLabel).font(.system(size: 9, weight: .semibold)).foregroundColor(color),
                              at: CGPoint(x: px, y: py - 22), anchor: .bottom)
+            }
+
+            // 时间轴：起始、中点、现在
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            for fraction in [0.0, 0.5, 1.0] {
+                let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
+                let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
+                context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
+                             at: CGPoint(x: x(date), y: plot.maxY + 10))
             }
         }
         .frame(height: 168)
     }
 
-    private func nearestValue(to date: Date, in samples: [GlucoseSample]) -> Double? {
+    private func nearestValue(to date: Date, in samples: [GlucoseSample],
+                              windowMinutes: Double) -> Double? {
         guard !samples.isEmpty else { return nil }
         var best: GlucoseSample?
         var bestGap = Double.greatestFiniteMagnitude
@@ -212,7 +228,9 @@ struct GlucoseChartView: View {
             let gap = abs(s.timestamp.timeIntervalSince(date))
             if gap < bestGap { bestGap = gap; best = s }
         }
-        // 离得太远（超过 20 分钟）就不硬贴着曲线画，交给调用方回退默认高度
+        // 24 小时窗口里一个点是 5 分钟，20 分钟阈值不变；但窗口很短时点更密，
+        // 这里只判断"有没有点"，距离交给三角本身的位置表达
+        _ = windowMinutes
         return best.map { Double($0.mgdl) }
     }
 }
