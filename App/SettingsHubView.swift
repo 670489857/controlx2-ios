@@ -9,102 +9,19 @@ struct SettingsHubView: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Form {
-            Section {
-                Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
-                                                    set: { model.setGlucoseUnit($0) })) {
-                    Text("mg/dL").tag(GlucoseDisplayUnit.mgdl)
-                    Text("mmol/L").tag(GlucoseDisplayUnit.mmol)
-                }
-                .pickerStyle(.segmented)
-            } header: {
-                Text("血糖单位")
-            } footer: {
-                Text("这里手动选的会覆盖「跟随来源」。单位只影响显示，闸门和闭环一直按 mg/dL 算。")
+        ScrollView {
+            VStack(spacing: 18) {
+                deviceCard
+                therapyCard
+                backgroundCard
+                safetyCard
+                aboutCard
             }
-
-            Section {
-                NavigationLink {
-                    PairingView()
-                } label: {
-                    settingRow(icon: "drop.fill", color: .blue, title: "胰岛素泵",
-                               status: model.linkPhase.isReady ? "已连接" : "未连接",
-                               statusColor: model.linkPhase.isReady ? .green : .secondary)
-                }
-                NavigationLink {
-                    CGMSourceView()
-                } label: {
-                    settingRow(icon: "antenna.radiowaves.left.and.right", color: .green, title: "血糖来源",
-                               status: model.cgmSource == .nightscout ? "Nightscout" : "泵 CGM",
-                               statusColor: model.cgmSource == .nightscout ? .blue : .green)
-                }
-                NavigationLink {
-                    ClosedLoopView()
-                } label: {
-                    settingRow(icon: "arrow.triangle.2.circlepath", color: .purple, title: "闭环控糖",
-                               status: model.loopArmed
-                                    ? (model.loopLiveDosing ? "开 · 真发针" : "开 · 演练")
-                                    : "关",
-                               statusColor: model.loopArmed ? .green : .secondary)
-                }
-                NavigationLink {
-                    BolusView()
-                } label: {
-                    settingRow(icon: "syringe.fill", color: .red, title: "大剂量",
-                               status: model.bolusEnabled ? "已启用" : "未启用",
-                               statusColor: model.bolusEnabled ? .green : .secondary)
-                }
-            } header: {
-                Text("核心设备与控糖")
-            }
-
-            Section {
-                NavigationLink {
-                    BackgroundKeepAliveView()
-                } label: {
-                    settingRow(icon: "waveform", color: .orange, title: "后台保活",
-                               status: model.backgroundAudioEnabled ? "已开启" : "未开启",
-                               statusColor: model.backgroundAudioEnabled ? .green : .secondary)
-                }
-                NavigationLink {
-                    LiveActivityView()
-                } label: {
-                    settingRow(icon: "lock.rectangle.stack.fill", color: .purple, title: "锁屏显示",
-                               status: model.liveActivityEnabled ? "已开启" : "未开启",
-                               statusColor: model.liveActivityEnabled ? .green : .secondary)
-                }
-                NavigationLink {
-                    BasalProfileView()
-                } label: {
-                    settingRow(icon: "chart.bar.fill", color: .teal, title: "基础率计划",
-                               status: model.basalProfile == nil ? "未读取" : "已读取",
-                               statusColor: model.basalProfile == nil ? .secondary : .green)
-                }
-                NavigationLink {
-                    AdvisorSettingsView()
-                } label: {
-                    settingRow(icon: "slider.horizontal.3", color: .indigo, title: "剂量闸门",
-                               status: "查看", statusColor: .secondary)
-                }
-                NavigationLink {
-                    ControlIQView()
-                } label: {
-                    settingRow(icon: "waveform.path.ecg", color: .pink, title: "泵 Control-IQ",
-                               status: model.controlIQ?.closedLoopEnabled == true ? "泵内已开启" : "未开启",
-                               statusColor: model.controlIQ?.closedLoopEnabled == true ? .orange : .secondary)
-                }
-            } header: {
-                Text("保活与显示")
-            }
-
-            Section {
-                LabeledContent("版本", value: BuildInfo.version)
-                LabeledContent("构建", value: BuildInfo.build)
-                NavigationLink("诊断信息") { DiagnosticView() }
-            } header: {
-                Text("关于")
-            }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 6)
+            .padding(.bottom, 34)
         }
+        .background(PageBackground())
         .navigationTitle("设置")
         .onAppear {
             if model.backgroundAudioEnabled, !AudioKeepAlive.shared.isRunning {
@@ -113,17 +30,162 @@ struct SettingsHubView: View {
         }
     }
 
-    private func settingRow(icon: String, color: Color, title: String,
-                            status: String, statusColor: Color) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 28, height: 28)
-                .background(color, in: RoundedRectangle(cornerRadius: 7))
-            Text(title)
-            Spacer()
-            Text(status).font(.footnote).foregroundStyle(statusColor)
+    // MARK: 设备
+
+    /// 设备类设置：连了哪台泵、血糖从哪来、基础率计划是什么、读数和泵屏幕对没对上。
+    private var deviceCard: some View {
+        VStack(spacing: 0) {
+            SectionTitle(text: "设备与数据", icon: "dot.radiowaves.left.and.right")
+            Card(padding: 18) {
+                VStack(spacing: 0) {
+                    NavigationLink { PairingView() } label: {
+                        SettingRow(icon: "drop.fill",
+                                   title: "胰岛素泵",
+                                   subtitle: model.linkPhase.text,
+                                   status: model.linkPhase.isReady ? (model.connectedName ?? "已连接") : "未连接",
+                                   statusTint: model.linkPhase.isReady ? DS.ok : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    RowRule()
+                    NavigationLink { CGMSourceView() } label: {
+                        SettingRow(icon: "antenna.radiowaves.left.and.right",
+                                   tint: .teal,
+                                   title: "血糖来源与单位",
+                                   subtitle: "Nightscout 或泵 CGM",
+                                   status: sourceSummary)
+                    }
+                    .buttonStyle(.plain)
+                    RowRule()
+                    NavigationLink { BasalProfileView() } label: {
+                        SettingRow(icon: "chart.bar.fill",
+                                   tint: .indigo,
+                                   title: "基础率计划",
+                                   subtitle: "只读，改不了泵",
+                                   status: model.basalProfile == nil ? "未读取" : "已读取")
+                    }
+                    .buttonStyle(.plain)
+                    RowRule()
+                    NavigationLink { ReadingsCheckView() } label: {
+                        SettingRow(icon: "checkmark.seal",
+                                   tint: .gray,
+                                   title: "读数核对",
+                                   subtitle: "与泵屏幕逐项对一遍",
+                                   status: nil)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    private var sourceSummary: String {
+        let unit = model.effectiveGlucoseUnit == .mmol ? "mmol/L" : "mg/dL"
+        let source = model.cgmSource == .nightscout ? "Nightscout" : "泵 CGM"
+        return source + " · " + unit
+    }
+
+    // MARK: 控糖
+
+    /// 控糖参数只有这一个入口。闭环的开关在首页的「闭环」里——
+    /// 那是会往身体里送胰岛素的动作，不该和参数设置混在同一页。
+    private var therapyCard: some View {
+        VStack(spacing: 0) {
+            SectionTitle(text: "控糖与安全", icon: "slider.horizontal.3")
+            Card(padding: 18) {
+                VStack(spacing: 0) {
+                    NavigationLink { AdvisorSettingsView() } label: {
+                        SettingRow(icon: "shield.lefthalf.filled",
+                                   tint: .orange,
+                                   title: "剂量闸门与建议参数",
+                                   subtitle: "单次 / 24h / 间隔 / 低血糖线")
+                    }
+                    .buttonStyle(.plain)
+                    RowRule()
+                    NavigationLink { SafetyView() } label: {
+                        SettingRow(icon: "shield.lefthalf.filled",
+                                   tint: DS.danger,
+                                   title: "安全说明与边界",
+                                   subtitle: "能做什么、为什么不能做什么")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // MARK: 后台与显示
+
+    private var backgroundCard: some View {
+        VStack(spacing: 0) {
+            SectionTitle(text: "后台与显示", icon: "moon.stars")
+            Card(padding: 18) {
+                VStack(spacing: 0) {
+                    NavigationLink { BackgroundKeepAliveView() } label: {
+                        SettingRow(icon: "waveform",
+                                   tint: .orange,
+                                   title: "后台保活",
+                                   subtitle: "锁屏后闭环还能继续跑的前提",
+                                   status: model.backgroundAudioEnabled ? "已开启" : "未开启",
+                                   statusTint: model.backgroundAudioEnabled ? DS.ok : .secondary)
+                    }
+                    .buttonStyle(.plain)
+                    RowRule()
+                    NavigationLink { LiveActivityView() } label: {
+                        SettingRow(icon: "lock.rectangle.stack",
+                                   tint: .teal,
+                                   title: "锁屏显示",
+                                   subtitle: "血糖、趋势、最近一针",
+                                   status: model.liveActivityEnabled ? "已开启" : "未开启")
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    // MARK: 安全与诊断
+
+    private var safetyCard: some View {
+        VStack(spacing: 0) {
+            SectionTitle(text: "诊断", icon: "cross.case")
+            Card(padding: 18) {
+                NavigationLink { DiagnosticView() } label: {
+                    SettingRow(icon: "stethoscope",
+                               tint: .gray,
+                               title: "诊断日志",
+                               subtitle: "报文收发与链路状态")
+                }
+                .buttonStyle(.plain)
+            }
+            Text("闭环开关、设定档、「接管自检」都在首页的「闭环」里——那里是唯一会往身体里送胰岛素的地方，不和参数混在一层。")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 8)
+                .padding(.top, 6)
+        }
+    }
+
+    // MARK: 关于
+
+    private var aboutCard: some View {
+        VStack(spacing: 0) {
+            SectionTitle(text: "关于", icon: "info.circle")
+            Card(padding: 18) {
+                VStack(spacing: 12) {
+                    HStack {
+                        Text("版本").font(.system(size: 14))
+                        Spacer()
+                        Text(BuildInfo.version + " · b" + BuildInfo.build)
+                            .font(.system(size: 14, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    }
+                    RowRule(leading: 0)
+                    Text("实验性工具，未经监管批准。任何治疗决定以泵屏幕与医嘱为准。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
     }
 }
@@ -162,6 +224,8 @@ struct LoopAdvancedView: View {
                 Text("填 0 = 泵基础率已设成 0，全部基础胰岛素由 App 补（断链就没有基础量，风险最高）。填 0.2–0.4 = 泵留安全下限，App 只补差额。")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("高级参数")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
     }
@@ -204,6 +268,8 @@ struct LiveActivityView: View {
             }
             .font(.footnote)
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("锁屏显示")
     }
 }
@@ -268,6 +334,8 @@ struct LoopPresetEditorView: View {
                 Button("删除此设定档", role: .destructive) { confirmDelete = true }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("编辑设定档")
         .confirmationDialog("删除这套设定档？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) {
@@ -293,7 +361,7 @@ struct LoopPresetEditorView: View {
 /// 接管自检页。
 ///
 /// 顺序是刻意的：先刷新泵、再判定、最后才允许签发凭证。
-/// 界面只负责把「哪一条没过」摆到最上面，不替用户做判断。
+/// 界面只把"哪一条没过"摆到最上面，不替用户做判断。
 struct TakeoverCheckView: View {
     @EnvironmentObject var model: AppModel
 
@@ -302,86 +370,144 @@ struct TakeoverCheckView: View {
     private var clearanceText: String {
         guard let verified = model.takeoverVerifiedAt else { return "未签发" }
         let minutes = Int(Date().timeIntervalSince(verified) / 60)
-        return minutes <= 30 ? "有效（\(minutes) 分钟前签发）" : "已过期（\(minutes) 分钟前）"
+        return minutes <= 30 ? "有效 · \(minutes) 分钟前签发" : "已过期 · \(minutes) 分钟前"
     }
 
     var body: some View {
-        Form {
-            Section {
-                Button {
-                    Task { await model.runTakeoverCheck() }
-                } label: {
-                    Label(model.takeoverChecking ? "正在自检…" : "重新自检", systemImage: "arrow.clockwise")
-                }
-                .disabled(model.takeoverChecking)
-
-                LabeledContent("凭证", value: clearanceText)
-
-                if let checked = model.takeoverCheckedAt {
-                    Text("上次自检 " + checked.formatted(date: .omitted, time: .standard))
-                        .font(.caption2).foregroundStyle(.secondary)
-                }
-            } header: {
-                Text("自检")
-            } footer: {
-                Text("凭证有效期 30 分钟。泵的电量、药筒、Control-IQ 状态都会变，过期就重新核对一次。")
-            }
-
-            if let report {
-                if let reason = report.firstBlockReason {
-                    Section {
-                        Text(reason).font(.footnote).foregroundStyle(.red)
-                    } header: {
-                        Text("先修这一条")
+        ScrollView {
+            VStack(spacing: DS.gap) {
+                headerCard
+                if let report {
+                    if let reason = report.firstBlockReason {
+                        blockCard(reason)
                     }
-                }
-
-                Section {
-                    ForEach(report.items) { item in
-                        checkRow(item)
+                    checksCard(report)
+                    if !report.warnings.isEmpty {
+                        warningAckCard(report)
                     }
-                } header: {
-                    Text("逐条核对")
-                }
-
-                if !report.warnings.isEmpty {
-                    Section {
-                        Toggle("我确认以上警告，仍要真发", isOn: $model.takeoverWarningsAcknowledged)
-                    } footer: {
-                        Text("警告项不是「必须修」，但每一条都对应一个真实的失效场景——例如断链后没有基础胰岛素、或泵自身报警不会响。")
+                    ctaCard(report)
+                } else {
+                    Card {
+                        Text("还没跑过自检。点上面的「重新自检」——它会先刷新泵状态，再逐条判定。")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.secondary)
                     }
-                }
-
-                Section {
-                    Button {
-                        model.grantTakeoverClearance()
-                    } label: {
-                        Label("自检通过，允许真发 30 分钟", systemImage: "checkmark.shield")
-                    }
-                    .disabled(!report.canProceed(warningsAcknowledged: model.takeoverWarningsAcknowledged))
-                }
-            } else {
-                Section {
-                    Text("还没跑过自检。点上面的「重新自检」——它会先刷新泵状态，再逐条判定。")
-                        .font(.footnote).foregroundStyle(.secondary)
                 }
             }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 6)
+            .padding(.bottom, 34)
         }
+        .background(PageBackground())
         .navigationTitle("接管自检")
         .task {
             if model.takeoverReport == nil { await model.runTakeoverCheck() }
         }
     }
 
-    private func checkRow(_ item: TakeoverCheck.Item) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: item.passed ? "checkmark.circle.fill"
-                                          : (item.severity == .blocker ? "xmark.octagon.fill" : "exclamationmark.triangle.fill"))
-                .foregroundStyle(item.passed ? Color.green
-                                             : (item.severity == .blocker ? Color.red : Color.orange))
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title).font(.subheadline.weight(.medium))
-                Text(item.detail).font(.caption).foregroundStyle(.secondary)
+    private var headerCard: some View {
+        Card(padding: 18) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("凭证").font(.system(size: 12)).foregroundStyle(.secondary)
+                        Text(clearanceText)
+                            .font(.system(size: 16, weight: .semibold))
+                            .foregroundStyle(model.takeoverVerifiedAt == nil ? Color.secondary : DS.ok)
+                    }
+                    Spacer()
+                    if model.takeoverChecking { ProgressView().controlSize(.small) }
+                }
+
+                if let checked = model.takeoverCheckedAt {
+                    Text("上次自检 " + checked.formatted(date: .omitted, time: .standard))
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+
+                GhostButton(title: model.takeoverChecking ? "正在自检…" : "重新自检",
+                            systemImage: "arrow.clockwise") {
+                    Task { await model.runTakeoverCheck() }
+                }
+                .disabled(model.takeoverChecking)
+
+                Text("凭证 30 分钟有效。泵的电量、药筒、Control-IQ 状态都会变，过期就重新核对。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private func blockCard(_ reason: String) -> some View {
+        Card(tint: DS.danger, padding: 16) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.octagon.fill")
+                    .foregroundStyle(DS.danger)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("先修这一条").font(.system(size: 12, weight: .semibold)).foregroundStyle(DS.danger)
+                    Text(reason)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.primary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+
+    private func checksCard(_ report: TakeoverCheck.Report) -> some View {
+        Card(title: "逐条核对", subtitle: "硬性项必须先修，警告项可以确认后放行", padding: 18) {
+            VStack(spacing: 0) {
+                ForEach(report.items) { item in
+                    HStack(alignment: .top, spacing: 11) {
+                        Image(systemName: item.passed ? "checkmark.circle.fill"
+                                                      : (item.severity == .blocker ? "xmark.octagon.fill" : "exclamationmark.triangle.fill"))
+                            .font(.system(size: 14))
+                            .foregroundStyle(item.passed ? DS.ok : (item.severity == .blocker ? DS.danger : DS.warn))
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(item.title)
+                                .font(.system(size: 13, weight: .medium))
+                            Text(item.detail)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .padding(.vertical, 9)
+                    if item.id != report.items.last?.id { RowRule(leading: 29) }
+                }
+            }
+        }
+    }
+
+    private func warningAckCard(_ report: TakeoverCheck.Report) -> some View {
+        Card(padding: 18) {
+            VStack(alignment: .leading, spacing: 8) {
+                Toggle(isOn: $model.takeoverWarningsAcknowledged) {
+                    Text("我确认以上 \(report.warnings.count) 条警告，仍要真发")
+                        .font(.system(size: 14, weight: .medium))
+                }
+                .tint(DS.warn)
+                Text("警告项不是「必须修」，但每一条都对应一个真实的失效场景——断链后没有基础胰岛素、泵自身报警不会响、或者 App 进后台就停摆。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func ctaCard(_ report: TakeoverCheck.Report) -> some View {
+        VStack(spacing: 10) {
+            PrimaryButton(title: "自检通过，允许真发 30 分钟",
+                          systemImage: "checkmark.shield",
+                          disabled: !report.canProceed(warningsAcknowledged: model.takeoverWarningsAcknowledged)) {
+                model.grantTakeoverClearance()
+            }
+            if !report.blockers.isEmpty {
+                Text("还有 \(report.blockers.count) 条硬性项没过")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
             }
         }
     }

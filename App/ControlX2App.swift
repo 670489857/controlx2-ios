@@ -1405,6 +1405,7 @@ struct DiscoveryView: View {
 
 struct PairingView: View {
     @EnvironmentObject var model: AppModel
+    @State private var showForget = false
 
     private var linkColor: Color {
         switch model.linkPhase {
@@ -1481,166 +1482,230 @@ struct PairingView: View {
                 .font(.caption).foregroundStyle(.secondary)
             Text("6 位码的配对全程约 3–5 秒，期间会连发 6 条报文，请让 App 保持在前台。失败后泵上会换一个新码，重新读一次。")
                 .font(.caption).foregroundStyle(.secondary)
+
             Spacer()
+
+            // 「忘记此泵」放在这一页：它属于设备管理，放在首页底部只会让人误点
+            Divider()
+            Button(role: .destructive) {
+                showForget = true
+            } label: {
+                Label("忘记此泵", systemImage: "trash")
+                    .font(.footnote)
+            }
+            .confirmationDialog("删除本机保存的配对凭据？", isPresented: $showForget,
+                                titleVisibility: .visible) {
+                Button("删除", role: .destructive) { model.forgetPump() }
+                Button("取消", role: .cancel) {}
+            } message: {
+                Text("泵那边的配对记录还在。要彻底断开，还得在泵上「解除配对」。")
+            }
         }
         .padding()
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("配对")
     }
 }
 
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
-    @State private var showForget = false
+
+    /// 主卡里的迷你趋势线用最近 4 小时的点，不用当前窗口：
+    /// 它只是"刚才在往哪走"的一个感觉，不承担读数职责
+    private var sparkValues: [Double] {
+        model.samples.suffix(48).map { Double($0.mgdl) }
+    }
+
+    private var tint: Color { DS.glucoseTint(model.glucoseValue.map { Double($0) }) }
+
+    private var batteryTint: Color {
+        guard let text = model.batteryText.first, let value = Int(String(text)), value < 25 else {
+            return .primary
+        }
+        return DS.warn
+    }
 
     var body: some View {
         ScrollView {
-            VStack(spacing: 14) {
+            VStack(spacing: DS.gap) {
                 ConnectionBanner()
-
-                // 血糖主卡
-                VStack(spacing: 6) {
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        Text(model.glucoseText)
-                            .font(.system(size: 76, weight: .semibold, design: .rounded))
-                            .monospacedDigit()
-                            .foregroundStyle(model.hasLiveData ? .primary : .secondary)
-                        if !model.trendSymbol.isEmpty {
-                            Image(systemName: model.trendSymbol)
-                                .font(.system(size: 34, weight: .semibold))
-                        }
-                    }
-                    Text(model.glucoseSub.isEmpty ? "等待 CGM 数据" : model.glucoseSub)
-                        .font(.callout).foregroundStyle(.secondary)
-                    Text(model.glucoseSourceHint)
-                        .font(.caption2).foregroundStyle(.tertiary)
-                }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 22)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
-
+                hero
+                quickActions
+                metrics
                 GlucoseTrendSection()
-
                 PredictionCard()
                 AdviceCard()
-
-                NavigationLink {
-                    ControlIQView()
-                } label: {
-                    ControlIQSummaryCard()
-                }
-                .buttonStyle(.plain)
-
-                NavigationLink {
-                    BolusView()
-                } label: {
-                    Label(model.bolusEnabled && model.bolusRiskAccepted ? "大剂量 · 输注已启用" : "大剂量",
-                          systemImage: "drop.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                HStack(spacing: 12) {
-                    MetricCard(title: "活性胰岛素", value: model.iobText, caption: "IOB")
-                    MetricCard(title: "药筒余量", value: model.insulinUnits, caption: "reservoir")
-                }
-                HStack(spacing: 12) {
-                    MetricCard(title: "基础率", value: model.basalText, caption: model.basalHint)
-                    MetricCard(title: "电量", value: model.batteryText, caption: "battery")
-                }
-
-                HStack {
-                    Label(model.connectedName ?? "未连接", systemImage: "dot.radiowaves.left.and.right")
-                        .font(.footnote)
-                    Spacer()
-                    Text("API \(model.apiVersion ?? "—") · \(model.lastUpdated)")
-                        .font(.footnote).foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 4)
-
-                Button {
-                    model.refresh()
-                } label: {
-                    Label("立即刷新", systemImage: "arrow.clockwise")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-
-                HStack(spacing: 16) {
-                    NavigationLink("基础率计划") { BasalProfileView() }
-                    NavigationLink("读数核对") { ReadingsCheckView() }
-                    NavigationLink("安全说明") { SafetyView() }
-                    NavigationLink("诊断日志") { DiagnosticView() }
-                }
-                .font(.footnote)
-
-                NavigationLink {
-                    ClosedLoopView()
-                } label: {
-                    Label(model.loopArmed ? (model.loopLiveDosing ? "闭环运行中（真发）" : "闭环演练中（不发针）") : "闭环 · 微剂量模拟基础率",
-                          systemImage: "gearshape.2.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                NavigationLink {
-                    BackgroundKeepAliveView()
-                } label: {
-                    Label(model.backgroundAudioEnabled ? "后台保活 · 已开启" : "后台保活 · 未开启",
-                          systemImage: "waveform")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                NavigationLink {
-                    CGMSourceView()
-                } label: {
-                    Label(model.cgmSource == .nightscout ? "血糖来源 · Nightscout" : "血糖来源 · 泵 CGM",
-                          systemImage: "antenna.radiowaves.left.and.right")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.large)
-
-                Button(role: .destructive) {
-                    showForget = true
-                } label: {
-                    Label("忘记此泵", systemImage: "trash")
-                        .font(.footnote)
-                }
-                .confirmationDialog("删除本机保存的配对凭据？", isPresented: $showForget,
-                                    titleVisibility: .visible) {
-                    Button("删除，下次重新输入配对码", role: .destructive) { model.forgetPump() }
-                    Button("取消", role: .cancel) {}
-                } message: {
-                    Text("凭据只存在本机 Keychain，删除后不影响泵上的其他配对设备。")
-                }
-
-                Text("本版本包含大剂量输注；基础率与暂停仍由泵固件拒绝写入。闭环状态只读——跑 Control-IQ 的是泵，不是本 App。")
-                    .font(.caption2).foregroundStyle(.secondary)
-                    .padding(.top, 4)
-
-                Text("版本 \(BuildInfo.full)")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                    .textSelection(.enabled)
+                controlIQCard
+                footer
             }
-            .padding()
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 6)
+            .padding(.bottom, 34)
         }
+        .background(PageBackground())
         .navigationTitle("状态")
         .refreshable { model.refresh() }
         .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
+            ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink { SettingsHubView() } label: {
-                    Image(systemName: "gearshape")
-                }
-                NavigationLink { AdvisorSettingsView() } label: {
                     Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 15, weight: .semibold))
                 }
+                .accessibilityLabel("设置")
             }
         }
+    }
+
+    // MARK: 血糖主卡
+
+    /// 主卡只放一件事：现在的血糖。
+    /// IOB、药筒、基础率、电量全部下沉到下面的指标格——它们重要，但不是"此刻最该看的那个数"。
+    private var hero: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 8) {
+                Text(glucoseWord)
+                    .font(.system(size: 12, weight: .semibold))
+                    .tracking(1.2)
+                    .foregroundStyle(tint)
+                    .textCase(.uppercase)
+                Pill(text: model.cgmSource == .nightscout ? "Nightscout" : "泵 CGM",
+                     tint: .secondary)
+                Spacer()
+                Text(model.glucoseSourceHint)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            HStack(alignment: .center, spacing: 10) {
+                Text(model.glucoseText)
+                    .font(.system(size: 88, weight: .semibold, design: .rounded))
+                    .monospacedDigit()
+                    .foregroundStyle(model.hasLiveData ? tint : Color.secondary)
+                    .contentTransition(.numericText())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.6)
+
+                if !model.trendSymbol.isEmpty {
+                    Image(systemName: model.trendSymbol)
+                        .font(.system(size: 32, weight: .semibold))
+                        .foregroundStyle(tint.opacity(0.85))
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 2)
+
+            Text(model.glucoseSub.isEmpty ? "等待 CGM 数据" : model.glucoseSub)
+                .font(.system(size: 15, weight: .medium, design: .rounded))
+                .foregroundStyle(.secondary)
+                .padding(.top, -4)
+
+            if sparkValues.count > 1 {
+                MiniSpark(values: sparkValues)
+                    .stroke(tint.opacity(0.55), lineWidth: 1.8)
+                    .frame(height: 44)
+                    .padding(.top, 16)
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background {
+            RoundedRectangle(cornerRadius: DS.radiusCard, style: .continuous)
+                .fill(Color(.secondarySystemGroupedBackground))
+                .overlay {
+                    // 只在左上角铺一层极淡的区间色，读起来像纸上的水印，不像报警横幅
+                    RoundedRectangle(cornerRadius: DS.radiusCard, style: .continuous)
+                        .fill(LinearGradient(colors: [tint.opacity(0.16), tint.opacity(0.01)],
+                                             startPoint: .topLeading, endPoint: .bottomTrailing))
+                }
+        }
+        .overlay {
+            RoundedRectangle(cornerRadius: DS.radiusCard, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.045), lineWidth: 0.8)
+        }
+        .shadow(color: .black.opacity(0.05), radius: 18, y: 8)
+    }
+
+    private var glucoseWord: String {
+        Theme.glucoseLabel(model.glucoseValue.map { Double($0) })
+    }
+
+    // MARK: 三个直达
+
+    private var quickActions: some View {
+        HStack(spacing: 10) {
+            NavigationLink { BolusView() } label: {
+                QuickAction(title: "大剂量",
+                            systemImage: "drop.fill",
+                            caption: model.bolusEnabled && model.bolusRiskAccepted ? "已启用" : "未启用",
+                            emphasized: true)
+            }
+            NavigationLink { ClosedLoopView() } label: {
+                QuickAction(title: "闭环",
+                            systemImage: "arrow.triangle.2.circlepath",
+                            caption: model.loopArmed ? (model.loopLiveDosing ? "真发中" : "演练中") : "未武装",
+                            tint: model.loopArmed ? DS.ok : .secondary)
+            }
+            NavigationLink { HistoryView() } label: {
+                QuickAction(title: "记录",
+                            systemImage: "clock.arrow.circlepath",
+                            caption: "注射与血糖",
+                            tint: .secondary)
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: 四项指标
+
+    private var metrics: some View {
+        Card(padding: 18) {
+            HStack(spacing: 0) {
+                MetricTile(title: "活性胰岛素", value: model.iobText, note: "IOB · U")
+                verticalRule
+                MetricTile(title: "药筒余量", value: model.insulinUnits, note: "reservoir")
+                verticalRule
+                MetricTile(title: "基础率", value: model.basalText, note: model.basalHint)
+                verticalRule
+                MetricTile(title: "泵电量", value: model.batteryText, note: "battery", tint: batteryTint)
+            }
+        }
+    }
+
+    private var verticalRule: some View {
+        Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34)
+            .padding(.horizontal, 10)
+    }
+
+    private var controlIQCard: some View {
+        NavigationLink { ControlIQView() } label: {
+            ControlIQSummaryCard()
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: 页脚
+
+    private var footer: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.linkPhase.isReady ? DS.ok : Color.secondary.opacity(0.4))
+                    .frame(width: 7, height: 7)
+                Text(model.connectedName ?? "未连接泵")
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+                Text("API \(model.apiVersion ?? "—") · \(model.lastUpdated)")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+            }
+
+            GhostButton(title: "立即刷新", systemImage: "arrow.clockwise") { model.refresh() }
+        }
+        .padding(.horizontal, 4)
+        .padding(.top, 4)
     }
 }
 
@@ -1664,7 +1729,8 @@ struct ConnectionBanner: View {
                 Spacer()
             }
             .padding(12)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(Color(.secondarySystemGroupedBackground),
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         } else if let note = model.connectionNote {
             VStack(alignment: .leading, spacing: 10) {
                 Label(note, systemImage: "exclamationmark.triangle.fill")
@@ -1686,7 +1752,8 @@ struct ConnectionBanner: View {
                     .font(.caption2).foregroundStyle(.secondary)
             }
             .padding(12)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+            .background(Color(.secondarySystemGroupedBackground),
+                        in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         }
     }
 }
@@ -1752,8 +1819,7 @@ struct PredictionCard: View {
                     .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
             }
         }
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .appCard(padding: 16)
     }
 
     private func yDomain(_ p: PredictionResult) -> ClosedRange<Double> {
@@ -1805,9 +1871,7 @@ struct AdviceCard: View {
             Text("本版本不发送任何指令，只记录判断结果。")
                 .font(.caption2).foregroundStyle(.tertiary)
         }
-        .padding(14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .appCard(padding: 16)
     }
 }
 
@@ -1920,6 +1984,8 @@ struct AdvisorSettingsView: View {
                 Text("每个周期记录一次「如果自动会给多少」，但不发送。攒够两周再回看，判断这套判断逻辑值不值得打开执行。")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("建议参数")
         .toolbar {
             Button("保存") { model.saveSettings() }
@@ -1974,9 +2040,7 @@ struct ControlIQSummaryCard: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .appCard(padding: 16)
     }
 }
 
@@ -2033,7 +2097,7 @@ struct ControlIQView: View {
                 row("运动剩余", "\((info.exerciseRemainingSeconds ?? 0) / 60) 分钟", .primary)
             }
         }
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .appCard(padding: 0)
 
         Text("读到的是 V\(info.version) 报文。控制状态码是泵自己报的数字，公开资料里没有确证含义，所以这里原样显示、不翻译成「正在减量」之类的结论。")
             .font(.caption2).foregroundStyle(.secondary)
@@ -2090,23 +2154,6 @@ struct ControlIQView: View {
     }
 }
 
-struct MetricCard: View {
-    let title: String
-    let value: String
-    let caption: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(value).font(.title2.weight(.semibold)).monospacedDigit()
-            Text(caption).font(.caption2).foregroundStyle(.tertiary)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 14))
-    }
-}
-
 struct SafetyView: View {
     var body: some View {
         ScrollView {
@@ -2139,6 +2186,8 @@ struct SafetyView: View {
             .font(.callout)
             .padding()
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("安全说明")
     }
 }
@@ -2169,7 +2218,7 @@ struct BolusView: View {
         let interval = p.minIntervalMinutes > 0
             ? String(format: "最小间隔 %.0f 分钟", p.minIntervalMinutes) : "不要求间隔"
         let low = String(format: "低血糖阈值 %.0f mg/dL", p.lowGlucoseThreshold)
-        return "\(single) · \(daily) · \(interval) · \(low)。在「建议参数」里改。"
+        return "\(single) · \(daily) · \(interval) · \(low)"
     }
 
     private var canDeliver: Bool {
@@ -2178,17 +2227,23 @@ struct BolusView: View {
     }
 
     var body: some View {
-        Form {
-            if !model.bolusRiskAccepted {
-                riskSection
-            } else {
-                enableSection
-                doseSection
-                gateSection
-                actionSection
-                ledgerSection
+        ScrollView {
+            VStack(spacing: DS.gap) {
+                if !model.bolusRiskAccepted {
+                    riskCard
+                } else {
+                    doseCard
+                    statusCard
+                    gateCard
+                    actionCard
+                    ledgerCard
+                }
             }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 6)
+            .padding(.bottom, 34)
         }
+        .background(PageBackground())
         .navigationTitle("大剂量")
         .onAppear { model.reviewBolus() }
         .confirmationDialog(
@@ -2205,12 +2260,18 @@ struct BolusView: View {
         }
     }
 
-    private var riskSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 10) {
-                Label("这一段会真的把胰岛素打进身体里", systemImage: "exclamationmark.triangle.fill")
-                    .font(.headline)
-                    .foregroundStyle(.red)
+    // MARK: 风险确认
+
+    private var riskCard: some View {
+        Card(tint: DS.danger) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(DS.danger)
+                    Text("这一段会真的把胰岛素打进身体里")
+                        .font(.system(size: 16, weight: .semibold))
+                }
+
                 Text("""
                 大剂量报文已按 pumpX2 的抓包向量逐字节核对（含签名与泵计时），但「泵在真机上是否受理、推注速度是否符合预期」只能由你自己确认。
 
@@ -2221,133 +2282,201 @@ struct BolusView: View {
 
                 这不是医疗器械，未经任何监管批准。
                 """)
-                .font(.callout)
-                Button("我已理解，启用输注") { model.acceptBolusRisk() }
-                    .buttonStyle(.borderedProminent)
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .lineSpacing(3)
+
+                PrimaryButton(title: "我已理解，启用输注",
+                              systemImage: "checkmark.shield",
+                              tint: DS.danger) {
+                    model.acceptBolusRisk()
+                }
             }
-            .padding(.vertical, 4)
         }
     }
 
-    private var enableSection: some View {
-        Section {
-            Toggle("允许输注", isOn: Binding(get: { model.bolusEnabled },
-                                          set: { model.setBolusEnabled($0) }))
-            LabeledContent("链路", value: model.linkPhase.text)
-            LabeledContent("泵回报的当前大剂量", value: model.activeBolus?.statusName ?? "无")
-        } footer: {
-            Text("关掉后界面不会再发 0x9E / 0xA0 这类会改变输注的报文。")
-        }
-    }
+    // MARK: 剂量
 
-    private var doseSection: some View {
-        Section {
-            HStack {
-                Button { model.adjustBolusUnits(by: -0.05) } label: {
-                    Image(systemName: "minus.circle.fill").font(.title2)
+    private var doseCard: some View {
+        Card(padding: 22) {
+            VStack(spacing: 18) {
+                HStack {
+                    Text("本次剂量").sectionLabel()
+                    Spacer()
+                    Pill(text: model.bolusEnabled ? "输注已启用" : "输注已关闭",
+                         tint: model.bolusEnabled ? DS.ok : .secondary)
                 }
-                .buttonStyle(.plain)
-                .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
 
-                Spacer()
-                Text(String(format: "%.2f U", model.bolusUnits))
-                    .font(.system(size: 42, weight: .semibold, design: .rounded))
-                    .monospacedDigit()
-                Spacer()
-
-                Button { model.adjustBolusUnits(by: 0.05) } label: {
-                    Image(systemName: "plus.circle.fill").font(.title2)
-                }
-                .buttonStyle(.plain)
-                .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
-            }
-            .padding(.vertical, 6)
-
-            HStack(spacing: 10) {
-                ForEach([0.5, 1.0, 2.0, 3.0], id: \.self) { preset in
-                    Button(String(format: "%.1f", preset)) {
-                        model.bolusUnits = preset
-                        model.reviewBolus()
+                HStack(alignment: .center, spacing: 18) {
+                    stepButton(systemName: "minus", enabled: model.bolusEnabled && !model.bolusPhase.isBusy) {
+                        model.adjustBolusUnits(by: -0.05)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
+
+                    HStack(alignment: .firstTextBaseline, spacing: 5) {
+                        Text(String(format: "%.2f", model.bolusUnits))
+                            .font(.system(size: 62, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                            .contentTransition(.numericText())
+                        Text("U")
+                            .font(.system(size: 18, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+
+                    stepButton(systemName: "plus", enabled: model.bolusEnabled && !model.bolusPhase.isBusy) {
+                        model.adjustBolusUnits(by: 0.05)
+                    }
                 }
+
+                HStack(spacing: 8) {
+                    ForEach([0.5, 1.0, 2.0, 3.0], id: \.self) { preset in
+                        Button {
+                            model.bolusUnits = preset
+                            model.reviewBolus()
+                        } label: {
+                            Text(String(format: "%.1f", preset))
+                                .font(.system(size: 14, weight: .medium, design: .rounded))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 38)
+                                .background(Color.primary.opacity(0.05),
+                                            in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(!model.bolusEnabled || model.bolusPhase.isBusy)
+                    }
+                }
+
+                Text("步进 0.05 U。实际下发前会再向下取整一次，只会少不会多。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
             }
-        } header: {
-            Text("剂量")
-        } footer: {
-            Text("步进 0.05 U。实际下发前会再向下取整一次，只会少不会多。")
         }
     }
 
-    private var gateSection: some View {
-        Section {
-            if decision.allowed {
-                Label("全部闸门通过，将下发 \(String(format: "%.2f", decision.units)) U",
-                      systemImage: "checkmark.circle.fill")
-                    .foregroundStyle(.green)
-            }
-            ForEach(decision.blocks, id: \.detail) { block in
-                VStack(alignment: .leading, spacing: 2) {
-                    Label(block.reason.explanation, systemImage: "xmark.octagon.fill")
-                        .foregroundStyle(.red)
-                    Text(block.detail).font(.caption).foregroundStyle(.secondary)
+    private func stepButton(systemName: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName)
+                .font(.system(size: 17, weight: .bold))
+                .foregroundStyle(enabled ? DS.accent : Color.secondary.opacity(0.4))
+                .frame(width: 46, height: 46)
+                .background(DS.accent.opacity(enabled ? 0.12 : 0.04),
+                            in: Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
+    // MARK: 状态
+
+    private var statusCard: some View {
+        Card(padding: 18) {
+            VStack(spacing: 0) {
+                Toggle(isOn: Binding(get: { model.bolusEnabled },
+                                     set: { model.setBolusEnabled($0) })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("允许输注").font(.system(size: 15, weight: .medium))
+                        Text("关掉后不会再发任何改变输注的报文").font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .tint(DS.accent)
+                RowRule(leading: 0).padding(.vertical, 10)
+                HStack {
+                    Text("链路").font(.system(size: 13)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(model.linkPhase.text).font(.system(size: 13))
+                }
+                .padding(.bottom, 8)
+                HStack {
+                    Text("泵回报的当前大剂量").font(.system(size: 13)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(model.activeBolus?.statusName ?? "无").font(.system(size: 13))
                 }
             }
-            ForEach(decision.warnings, id: \.self) { warning in
-                Label(warning, systemImage: "exclamationmark.circle")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-            Button("重新检查") { model.refresh(); model.reviewBolus() }
-                .font(.footnote)
-        } header: {
-            Text("输注前检查")
-        } footer: {
-            Text(boundaryText)
         }
     }
 
-    private var actionSection: some View {
-        Section {
+    // MARK: 闸门
+
+    private var gateCard: some View {
+        Card(title: "输注前检查", subtitle: boundaryText, padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                if decision.allowed {
+                    Label("全部通过，将下发 \(String(format: "%.2f", decision.units)) U",
+                          systemImage: "checkmark.circle.fill")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(DS.ok)
+                }
+                ForEach(decision.blocks, id: \.detail) { block in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Label(block.reason.explanation, systemImage: "xmark.octagon.fill")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(DS.danger)
+                        Text(block.detail)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(decision.warnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.circle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(DS.warn)
+                }
+                if !decision.allowed || !decision.warnings.isEmpty {
+                    GhostButton(title: "重新检查", systemImage: "arrow.clockwise") {
+                        model.refresh(); model.reviewBolus()
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: 动作
+
+    private var actionCard: some View {
+        VStack(spacing: 12) {
             if let message = model.bolusMessage {
                 Text(message)
-                    .font(.callout)
-                    .foregroundStyle(model.bolusPhase == .failed ? Color.red : Color.secondary)
+                    .font(.system(size: 13))
+                    .foregroundStyle(model.bolusPhase == .failed ? DS.danger : Color.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if model.bolusPhase == .delivering || model.bolusPhase == .cancelling {
                 if let active = model.activeBolus {
-                    LabeledContent("正在输注", value: String(format: "%.2f U", active.requestedUnits))
+                    HStack {
+                        Text("正在输注").font(.system(size: 14))
+                        Spacer()
+                        Text(String(format: "%.2f U", active.requestedUnits))
+                            .font(.system(size: 15, weight: .semibold, design: .rounded))
+                            .monospacedDigit()
+                    }
+                    .padding(.horizontal, 4)
                 }
-                Button(role: .destructive) {
+                PrimaryButton(title: "取消输注", systemImage: "stop.circle", tint: DS.danger, disabled: model.bolusPhase == .cancelling) {
                     showCancelConfirm = true
-                } label: {
-                    Label("取消输注", systemImage: "stop.circle.fill")
-                        .frame(maxWidth: .infinity)
                 }
-                .disabled(model.bolusPhase == .cancelling)
             } else if model.bolusPhase == .requesting {
                 HStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text("正在与泵交互…").font(.footnote)
+                    Text("正在与泵交互…").font(.system(size: 13))
                 }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
             } else {
-                Button {
+                PrimaryButton(title: "请求授权并输注", systemImage: "drop.fill", disabled: !canDeliver) {
                     showConfirm = true
-                } label: {
-                    Label("请求授权并输注", systemImage: "drop.fill")
-                        .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(!canDeliver)
+                if !canDeliver {
+                    Text(decision.allowed ? "链路或开关未就绪" : "上面还有未通过的检查")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
             }
 
             if model.bolusPhase == .done || model.bolusPhase == .failed {
-                Button("回到初始状态") { model.resetBolusState() }
-                    .font(.footnote)
+                GhostButton(title: "回到初始状态", systemImage: "arrow.counterclockwise") {
+                    model.resetBolusState()
+                }
             }
         }
         .confirmationDialog("取消这次输注？", isPresented: $showCancelConfirm,
@@ -2359,28 +2488,37 @@ struct BolusView: View {
         }
     }
 
-    private var ledgerSection: some View {
-        Section {
-            LabeledContent("本机 24 小时累计",
-                           value: String(format: "%.2f U", model.ledger.delivered(now: Date())))
-            if model.ledger.records.isEmpty {
-                Text("还没有记录").font(.footnote).foregroundStyle(.secondary)
-            } else {
-                ForEach(model.ledger.records.suffix(5).reversed(), id: \.at) { record in
-                    HStack {
-                        Text(record.at.formatted(date: .omitted, time: .shortened))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text(String(format: "%.2f U", record.units))
-                            .font(.system(.caption, design: .monospaced))
+    // MARK: 台账
+
+    private var ledgerCard: some View {
+        Card(title: "台账", subtitle: "只记这个 App 发出去的针，泵上手动按的不在这里", padding: 18) {
+            VStack(spacing: 12) {
+                HStack {
+                    Text("本机 24 小时累计").font(.system(size: 13)).foregroundStyle(.secondary)
+                    Spacer()
+                    Text(String(format: "%.2f U", model.ledger.delivered(now: Date())))
+                        .font(.system(size: 15, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                }
+                if model.ledger.records.isEmpty {
+                    Text("还没有记录").font(.system(size: 12)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    RowRule(leading: 0)
+                    ForEach(model.ledger.records.suffix(5).reversed(), id: \.at) { record in
+                        HStack {
+                            Text(record.at.formatted(date: .omitted, time: .shortened))
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .monospacedDigit()
+                            Spacer()
+                            Text(String(format: "%.2f U", record.units))
+                                .font(.system(size: 12, design: .rounded))
+                                .monospacedDigit()
+                        }
                     }
                 }
             }
-        } header: {
-            Text("台账")
-        } footer: {
-            Text("只记这个 App 发出去的针。在泵上直接按的大剂量不在这里，所以 24 小时累计只是下限，不是总量。")
         }
     }
 }
@@ -2450,6 +2588,8 @@ struct ReadingsCheckView: View {
                 Text("刷新会依次发 0x20 / 0x24 / 0x22 / 0x6C / 0x34 / 0x28 / 0x36，全部是只读请求。")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("读数核对")
     }
 }
@@ -2591,6 +2731,8 @@ struct BasalProfileView: View {
                 Text("只能读。基础率写入、临时基础率、暂停与恢复在 X2 固件属于 MOBI 专属指令，泵会直接拒绝，所以没有实现。")
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("基础率计划")
         .onAppear {
             if model.basalProfile == nil, model.linkPhase.isReady {
@@ -2608,6 +2750,7 @@ struct ClosedLoopView: View {
     @EnvironmentObject var model: AppModel
     @State private var showLiveConfirm = false
     @State private var showClearConfirm = false
+    @State private var showBoundary = false
 
     private var tickText: String {
         guard let next = model.loopNextTickAt else { return "—" }
@@ -2615,27 +2758,40 @@ struct ClosedLoopView: View {
         return String(format: "%d:%02d", left / 60, left % 60)
     }
 
+    private var stateTitle: String {
+        guard model.loopArmed else { return "未启动" }
+        return model.loopLiveDosing ? "真发针运行中" : "演练中"
+    }
+
+    private var stateSubtitle: String {
+        guard model.loopArmed else { return "只显示血糖，不自动给药" }
+        return model.loopLiveDosing
+            ? "每 5 分钟最多一针，打出去收不回来"
+            : "按同样的参数计算，但不发针，只记账"
+    }
+
+    private var stateTint: Color {
+        guard model.loopArmed else { return .secondary }
+        return model.loopLiveDosing ? DS.warn : DS.ok
+    }
+
     var body: some View {
-        Form {
-            boundarySection
-            masterSection
-            presetSection
-            readoutsSection
-            statusSection
-            decisionSection
-            ledgerSection
-            Section {
-                NavigationLink {
-                    TakeoverCheckView()
-                } label: {
-                    Label(model.takeoverVerifiedAt == nil ? "接管自检（真发前必做）" : "接管自检 · 已通过",
-                          systemImage: model.takeoverVerifiedAt == nil ? "checklist" : "checkmark.shield.fill")
-                }
-                NavigationLink("高级参数（ISF / 上限 / 泵基础率）") {
-                    LoopAdvancedView()
-                }
+        ScrollView {
+            VStack(spacing: DS.gap) {
+                stateCard
+                setupCard
+                paramsCard
+                readoutsCard
+                decisionCard
+                presetCard
+                ledgerCard
+                boundaryCard
             }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 6)
+            .padding(.bottom, 34)
         }
+        .background(PageBackground())
         .navigationTitle("闭环")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
         .onAppear { model.refreshLoopTotals() }
@@ -2649,235 +2805,343 @@ struct ClosedLoopView: View {
         }
     }
 
-    // MARK: 边界
+    // MARK: 状态与开关
 
-    private var boundarySection: some View {
-        Section {
-            Text("这里做的是**微剂量模拟基础率**：每 5 分钟，把这 5 分钟本该缓慢滴入的量，用一针小额大剂量补进去。")
-            Text("三条代价，写在这里而不是藏在文档里：")
-            Text("1. 只能加不能减。血糖要往下掉时，软件只能停止后续针，已经进去的收不回来。所以它比 AAPS 那种能设临时基础率的闭环更依赖你盯着。")
-            Text("2. 每针都会进泵的大剂量历史，泵按大剂量算 IOB。这是这套方案的固有形状。")
-            Text("3. 泵自带 Control-IQ 必须关掉。两边同时调胰岛素就是叠加给药，读不到它的状态时这一拍也不出针。")
-            Text("X2 固件不接受基础率写入（SetTempRate/Suspend/Resume 全是 MOBI_ONLY），上面这三条不是选择，是这台泵剩下的唯一路径。")
-        } header: {
-            Text("先读这段")
-        }
-        .font(.footnote)
-    }
-
-    // MARK: 状态
-
-    private var statusSection: some View {
-        Section {
-            LabeledContent("状态") {
-                if model.loopArmed {
-                    Text(model.loopLiveDosing ? "运行中 · 真发针" : "演练中 · 只记账")
-                        .foregroundStyle(model.loopLiveDosing ? Color.orange : Color.green)
-                } else {
-                    Text("未启动").foregroundStyle(.secondary)
-                }
-            }
-            if model.loopArmed {
-                LabeledContent("下一拍", value: tickText)
-                LabeledContent("已跑", value: "\(model.loopTickCount) 拍")
-            }
-            LabeledContent("Control-IQ（泵）") {
-                if let info = model.controlIQ {
-                    Text(info.closedLoopEnabled ? "开着 · 闭环不能同时跑" : "关着 · 允许")
-                        .foregroundStyle(info.closedLoopEnabled ? Color.red : Color.green)
-                } else {
-                    Text("未读到 · 不出针").foregroundStyle(.orange)
-                }
-            }
-            if let error = model.loopError {
-                Text(error).font(.footnote).foregroundStyle(.red)
-            }
-
-            if model.loopArmed {
-                Button("停止闭环", role: .destructive) {
-                    model.disarmLoop(note: "你手动停止了闭环")
-                }
-            } else {
-                Button("开始演练（不发针）") { model.armLoop(live: false) }
-                Button("开始真发针") { showLiveConfirm = true }
-                    .foregroundStyle(.red)
-            }
-        } header: {
-            Text("开关")
-        } footer: {
-            Text("演练和真发是两个按钮。演练跑够一轮、看记录里算出来的量合不合理，再考虑真发。")
-        }
-    }
-
-    // MARK: 设定档
-
-    private var presetSection: some View {
-        Section {
-            ForEach(model.loopPresets) { preset in
-                HStack(spacing: 10) {
-                    Button {
-                        model.applyPreset(preset.id)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(preset.name).font(.subheadline.weight(.medium))
-                                .foregroundStyle(.primary)
-                            Text(preset.summary).font(.caption2).foregroundStyle(.secondary)
+    private var stateCard: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(alignment: .center) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 8) {
+                            Circle().fill(stateTint).frame(width: 9, height: 9)
+                            Text(stateTitle)
+                                .font(.system(size: 19, weight: .semibold))
+                        }
+                        Text(stateSubtitle)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    if model.loopArmed {
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text("下一拍").font(.system(size: 10)).foregroundStyle(.tertiary)
+                            Text(tickText)
+                                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                                .monospacedDigit()
                         }
                     }
-                    .buttonStyle(.plain)
-                    Spacer()
-                    if model.activePresetID == preset.id {
-                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                }
+
+                HStack(spacing: 8) {
+                    if let info = model.controlIQ {
+                        Pill(text: info.closedLoopEnabled ? "泵 Control-IQ 开着" : "泵 Control-IQ 已关",
+                             tint: info.closedLoopEnabled ? DS.danger : DS.ok)
+                    } else {
+                        Pill(text: "读不到 Control-IQ", tint: DS.warn)
                     }
-                    NavigationLink("编辑") { LoopPresetEditorView(preset: preset) }
-                        .font(.caption)
+                    if model.loopArmed {
+                        Pill(text: "已跑 \(model.loopTickCount) 拍", tint: .secondary)
+                    }
+                }
+
+                if let error = model.loopError {
+                    Text(error)
+                        .font(.system(size: 12))
+                        .foregroundStyle(DS.danger)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DS.danger.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+
+                if model.loopArmed {
+                    PrimaryButton(title: "停止闭环", systemImage: "stop.fill", tint: DS.danger) {
+                        model.disarmLoop(note: "你手动停止了闭环")
+                    }
+                } else {
+                    HStack(spacing: 10) {
+                        Button {
+                            model.armLoop(live: false)
+                        } label: {
+                            Text("开始演练")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(DS.accent)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 50)
+                                .background(DS.accent.opacity(0.10),
+                                            in: RoundedRectangle(cornerRadius: DS.radiusInner, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+
+                        Button {
+                            showLiveConfirm = true
+                        } label: {
+                            Text("真发")
+                                .font(.system(size: 15, weight: .semibold))
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 50)
+                                .background(DS.danger,
+                                            in: RoundedRectangle(cornerRadius: DS.radiusInner, style: .continuous))
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
-            if model.loopPresets.isEmpty {
-                Text("还没有设定档。把现在这套参数存下来，改坏了能切回去。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            Button {
-                model.createPresetFromCurrent()
-            } label: {
-                Label("把当前参数另存为设定档", systemImage: "plus.circle")
-            }
-        } header: {
-            Text("控糖设定档")
-        } footer: {
-            Text("点名字切到那一档，会整组替换参数（不是单项）。编辑当前生效的档会立刻影响运行中的闭环。")
         }
     }
 
-    // MARK: 闭环主开关
+    // MARK: 前置
 
-    private var masterSection: some View {
-        Section {
-            Toggle(isOn: Binding(get: { model.loopArmed },
-                                 set: { on in
-                                     if on {
-                                         showLiveConfirm = true
-                                     } else {
-                                         model.disarmLoop(note: "你手动停止了闭环")
-                                     }
-                                 })) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("闭环").font(.headline)
-                    Text(model.loopArmed
-                         ? (model.loopLiveDosing ? "真发针运行中" : "演练中，只记账不发针")
-                         : "关闭：只显示血糖，不自动给药")
-                        .font(.caption).foregroundStyle(.secondary)
+    private var setupCard: some View {
+        Card(padding: 18) {
+            VStack(spacing: 0) {
+                NavigationLink { TakeoverCheckView() } label: {
+                    SettingRow(icon: model.takeoverVerifiedAt == nil ? "checklist" : "checkmark.shield.fill",
+                               tint: model.takeoverVerifiedAt == nil ? DS.warn : DS.ok,
+                               title: "接管自检",
+                               subtitle: "真发前的硬门，逐条核对泵的状态",
+                               status: model.takeoverVerifiedAt == nil ? "未通过" : "已通过",
+                               statusTint: model.takeoverVerifiedAt == nil ? DS.warn : DS.ok)
                 }
+                .buttonStyle(.plain)
+                RowRule()
+                NavigationLink { LoopAdvancedView() } label: {
+                    SettingRow(icon: "slider.horizontal.3",
+                               tint: .secondary,
+                               title: "高级参数",
+                               subtitle: "ISF、单针上限、泵基础率")
+                }
+                .buttonStyle(.plain)
             }
-            .tint(.green)
+        }
+    }
 
-            numberRow("体重", value: $model.loopSettings.weightKg, step: 1)
-            numberRow("每日胰岛素 U", value: $model.loopSettings.totalDailyInsulinUnits, step: 0.5)
-            numberRow("24h 累计上限 U", value: $model.loopSettings.maxDailyUnits, step: 1)
+    // MARK: 参数
 
-            Button {
-                model.adoptPumpProfileNumbers()
-            } label: {
-                Label("从泵重读体重和每日胰岛素", systemImage: "arrow.down.circle")
+    private var paramsCard: some View {
+        Card(title: "闭环", subtitle: "体重和每日总量泵里本来就有，直接读过来更不容易抄错", padding: 18) {
+            VStack(spacing: 0) {
+                Toggle(isOn: Binding(get: { model.loopArmed },
+                                     set: { on in
+                                         if on { showLiveConfirm = true }
+                                         else { model.disarmLoop(note: "你手动停止了闭环") }
+                                     })) {
+                    Text("闭环总开关").font(.system(size: 15, weight: .medium))
+                }
+                .tint(DS.accent)
+                .padding(.bottom, 6)
+
+                RowRule(leading: 0)
+                numberRow("体重", value: $model.loopSettings.weightKg, step: 1)
+                RowRule(leading: 0)
+                numberRow("每日胰岛素 U", value: $model.loopSettings.totalDailyInsulinUnits, step: 0.5)
+                RowRule(leading: 0)
+                numberRow("24h 累计上限 U", value: $model.loopSettings.maxDailyUnits, step: 1)
+
+                GhostButton(title: "从泵重读体重和每日胰岛素", systemImage: "arrow.down.circle") {
+                    model.adoptPumpProfileNumbers()
+                }
+                .padding(.top, 12)
             }
-        } header: {
-            Text("闭环")
-        } footer: {
-            Text("体重和每日总量泵里本来就有，抄一遍容易错，直接用上面的按钮从泵读。24h 上限填 0 表示不限。")
         }
     }
 
     private func numberRow(_ title: String, value: Binding<Double>, step: Double = 1) -> some View {
-        LabeledContent(title) {
+        HStack {
+            Text(title).font(.system(size: 14))
+            Spacer()
             TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
                 .multilineTextAlignment(.trailing)
                 .keyboardType(.decimalPad)
                 .monospacedDigit()
+                .font(.system(size: 15, design: .rounded))
+                .frame(width: 110)
         }
+        .padding(.vertical, 11)
     }
 
-    private var readoutsSection: some View {
-        Section {
-            LabeledContent("目前生效") {
-                Text(String(format: "目标 %.0f–%.0f", model.loopSettings.targetLow, model.loopSettings.targetHigh))
+    // MARK: 当前生效
+
+    private var readoutsCard: some View {
+        Card(title: "当前生效", padding: 18) {
+            HStack(spacing: 0) {
+                MetricTile(title: "目标", value: String(format: "%.0f–%.0f", model.loopSettings.targetLow, model.loopSettings.targetHigh), note: "mg/dL")
+                Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34).padding(.horizontal, 8)
+                MetricTile(title: "单针最大", value: String(format: "%.2f", model.loopSettings.maxSingleMicroBolus), note: "U")
+                Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34).padding(.horizontal, 8)
+                MetricTile(title: "每小时", value: String(format: "%.2f", model.loopSettings.maxHourlyMicroBolus), note: "U")
+                Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34).padding(.horizontal, 8)
+                MetricTile(title: "近 24h 已用",
+                           value: model.loopSettings.maxDailyUnits > 0
+                                ? String(format: "%.1f", model.loopTodayUnits) : String(format: "%.1f", model.loopTodayUnits),
+                           note: model.loopSettings.maxDailyUnits > 0
+                                ? String(format: "上限 %.0f U", model.loopSettings.maxDailyUnits) : "不限")
             }
-            LabeledContent("单次最大") {
-                Text(String(format: "%.2f U", model.loopSettings.maxSingleMicroBolus))
-            }
-            LabeledContent("每小时上限") {
-                Text(String(format: "%.2f U", model.loopSettings.maxHourlyMicroBolus))
-            }
-            LabeledContent("近 24h 已用") {
-                Text(model.loopSettings.maxDailyUnits > 0
-                     ? String(format: "%.1f/%.0f U", model.loopTodayUnits, model.loopSettings.maxDailyUnits)
-                     : String(format: "%.1f U", model.loopTodayUnits))
-            }
-        } header: {
-            Text("当前")
         }
     }
 
     // MARK: 最近一拍
 
-    private var decisionSection: some View {
-        Section {
-            if let d = model.loopLastDecision {
-                Text(d.summary).font(.callout)
-                LabeledContent("基础率折算") { Text(String(format: "%.3f U", d.basalEquiv)) }
-                if d.correction > 0 {
-                    LabeledContent("高血糖追加") { Text(String(format: "%.2f U", d.correction)) }
+    private var decisionCard: some View {
+        Card(title: "最近一拍", padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                if let d = model.loopLastDecision {
+                    Text(d.summary)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    HStack(spacing: 0) {
+                        MetricTile(title: "基础率折算", value: String(format: "%.3f", d.basalEquiv), note: "U")
+                        if d.correction > 0 {
+                            MetricTile(title: "高血糖追加", value: String(format: "%.2f", d.correction), note: "U", tint: DS.warn)
+                        }
+                        if d.carriedOut > 0 {
+                            MetricTile(title: "攒到下一拍", value: String(format: "%.3f", d.carriedOut), note: "U")
+                        }
+                        MetricTile(title: "近一小时已发", value: String(format: "%.2f", model.loopHourUnits), note: "U")
+                    }
+                } else {
+                    Text("还没跑过一拍").font(.system(size: 13)).foregroundStyle(.secondary)
                 }
-                if d.carriedOut > 0 {
-                    LabeledContent("攒到下一拍") { Text(String(format: "%.3f U", d.carriedOut)) }
-                }
-            } else {
-                Text("还没跑过一拍").foregroundStyle(.secondary)
             }
-            LabeledContent("近一小时已发", value: String(format: "%.2f U", model.loopHourUnits))
-            LabeledContent("今日已发", value: String(format: "%.2f U", model.loopTodayUnits))
-        } header: {
-            Text("最近一拍")
+        }
+    }
+
+    // MARK: 设定档
+
+    private var presetCard: some View {
+        Card(title: "控糖设定档", subtitle: "切换会整组替换参数，不是单项", padding: 18) {
+            VStack(spacing: 0) {
+                ForEach(model.loopPresets) { preset in
+                    HStack(spacing: 10) {
+                        Button {
+                            model.applyPreset(preset.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(preset.name)
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(.primary)
+                                Text(preset.summary)
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if model.activePresetID == preset.id {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 15))
+                                .foregroundStyle(DS.ok)
+                        }
+                        NavigationLink { LoopPresetEditorView(preset: preset) } label: {
+                            Text("编辑")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundStyle(DS.accent)
+                        }
+                    }
+                    .padding(.vertical, 10)
+                    if preset.id != model.loopPresets.last?.id { RowRule(leading: 0) }
+                }
+
+                if model.loopPresets.isEmpty {
+                    Text("还没有设定档。把现在这套存下来，改坏了能切回去。")
+                        .font(.system(size: 12)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 8)
+                }
+
+                GhostButton(title: "把当前参数另存为设定档", systemImage: "plus.circle") {
+                    model.createPresetFromCurrent()
+                }
+                .padding(.top, 8)
+            }
         }
     }
 
     // MARK: 台账
 
-    private var ledgerSection: some View {
-        Section {
-            ForEach(Array(model.loopRecords.reversed().prefix(20)), id: \.timestamp) { r in
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text(r.timestamp.formatted(date: .omitted, time: .shortened))
-                            .font(.caption2).foregroundStyle(.secondary).monospacedDigit()
-                        Spacer()
-                        if r.accepted == true {
-                            Text(String(format: "%.2f U", r.units))
-                                .font(.caption.weight(.semibold)).foregroundStyle(.green)
-                        } else if let hold = r.holdReason {
-                            Text(hold).font(.caption2).foregroundStyle(.secondary)
-                        } else {
-                            Text("未发 / 未知").font(.caption2).foregroundStyle(.orange)
+    private var ledgerCard: some View {
+        Card(title: "台账 · 最近 20 条", subtitle: "额度从台账算，App 被杀掉重开也不会归零", padding: 18) {
+            VStack(spacing: 12) {
+                if model.loopRecords.isEmpty {
+                    Text("还没有记录").font(.system(size: 12)).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(Array(model.loopRecords.reversed().prefix(20)), id: \.timestamp) { r in
+                        VStack(alignment: .leading, spacing: 3) {
+                            HStack {
+                                Text(r.timestamp.formatted(date: .omitted, time: .shortened))
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(.tertiary)
+                                    .monospacedDigit()
+                                Spacer()
+                                if r.accepted == true {
+                                    Text(String(format: "%.2f U", r.units))
+                                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                        .foregroundStyle(DS.ok)
+                                } else if let hold = r.holdReason {
+                                    Text(hold).font(.system(size: 11)).foregroundStyle(.secondary)
+                                } else {
+                                    Text("未发 / 未知").font(.system(size: 11)).foregroundStyle(DS.warn)
+                                }
+                            }
+                            Text(r.summary)
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                            if let e = r.errorText {
+                                Text(e).font(.system(size: 11)).foregroundStyle(DS.warn)
+                            }
                         }
                     }
-                    Text(r.summary).font(.caption2).foregroundStyle(.secondary)
-                    if let e = r.errorText {
-                        Text(e).font(.caption2).foregroundStyle(.orange)
+                }
+
+                if !model.loopRecords.isEmpty {
+                    GhostButton(title: "清空台账", systemImage: "trash", tint: .secondary) {
+                        showClearConfirm = true
+                    }
+                    .confirmationDialog("清空闭环台账？", isPresented: $showClearConfirm, titleVisibility: .visible) {
+                        Button("清空", role: .destructive) { model.clearLoopLedger() }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("清空后「近一小时已发」会从 0 重算，等于放弃这道额度。一般不要清。")
                     }
                 }
             }
-            if model.loopRecords.isEmpty { Text("还没有记录").foregroundStyle(.secondary) }
+        }
+    }
 
-            Button("清空台账", role: .destructive) { showClearConfirm = true }
-                .confirmationDialog("清空闭环台账？", isPresented: $showClearConfirm, titleVisibility: .visible) {
-                    Button("清空", role: .destructive) { model.clearLoopLedger() }
-                    Button("取消", role: .cancel) {}
-                } message: {
-                    Text("清空后「近一小时已发」会从 0 重算，等于放弃这道额度。一般不要清。")
+    // MARK: 边界
+
+    /// 这一段必须留在页面上，但不能压在第一屏。
+    /// 用折叠而不是删除：出事的时候，这几句话是唯一能被翻出来的解释。
+    private var boundaryCard: some View {
+        Card(padding: 18) {
+            DisclosureGroup(isExpanded: $showBoundary) {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("这里做的是微剂量模拟基础率：每 5 分钟，把这 5 分钟本该缓慢滴入的量，用一针小额大剂量补进去。")
+                    Text("1. 只能加不能减。血糖往下掉时，软件只能停止后续针，已经进去的收不回来，泵的基础率也停不了。")
+                    Text("2. 每针都会进泵的大剂量历史，泵按大剂量算 IOB。这是这套方案的固有形状，不是 bug。")
+                    Text("3. 泵自带 Control-IQ 必须关掉。两边同时调胰岛素就是叠加给药；读不到它的状态时这一拍也不出针。")
+                    Text("X2 固件不接受基础率写入（SetTempRate / Suspend / Resume 全是 MOBI_ONLY），上面三条不是选择，是这台泵剩下的唯一路径。")
                 }
-        } header: {
-            Text("台账 · 最近 20 条")
-        } footer: {
-            Text("额度从台账算，不从内存计数。App 被杀掉重开，额度不会归零。")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .lineSpacing(3)
+                .padding(.top, 10)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "info.circle")
+                        .foregroundStyle(DS.accent)
+                    Text("这套方案的三条代价")
+                        .font(.system(size: 14, weight: .medium))
+                }
+            }
+            .tint(DS.accent)
         }
     }
 }
@@ -2930,7 +3194,9 @@ struct CGMSourceView: View {
             }
             .font(.footnote)
         }
-        .navigationTitle("血糖来源")
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
+        .navigationTitle("血糖来源与单位")
         .onChange(of: model.nsConfig) { _ in model.saveNightscoutConfig() }
     }
 

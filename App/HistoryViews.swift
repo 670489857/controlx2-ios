@@ -235,83 +235,65 @@ struct GlucoseChartView: View {
     }
 }
 
-/// 首页血糖下方的整块：曲线 + 最近记录 + 全部记录入口
+/// 首页血糖下方的整块：曲线 + 最近记录。
+///
+/// 曲线跨度的入口只留这里一个分段控件。之前标题右侧还挂过一个同名菜单，
+/// 两个控件指向同一个状态，本质是同一个东西画了两遍。
 struct GlucoseTrendSection: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("血糖曲线").font(.subheadline.weight(.semibold))
-                Spacer()
-                // 同时给一个"当前跨度"的菜单入口：分段控件在浅色卡片上不够显眼，
-                // 用户上一版就没找到调整的地方
-                Menu {
-                    ForEach([3, 6, 12, 24], id: \.self) { hours in
-                        Button {
-                            model.setChartWindow(hours)
-                        } label: {
-                            if model.chartWindowHours == hours {
-                                Label("\(hours) 小时", systemImage: "checkmark")
-                            } else {
-                                Text("\(hours) 小时")
-                            }
+        Card(title: "血糖曲线", subtitle: nil, padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                Picker("时间跨度", selection: Binding(get: { model.chartWindowHours },
+                                                    set: { model.setChartWindow($0) })) {
+                    Text("3 小时").tag(3)
+                    Text("6 小时").tag(6)
+                    Text("12 小时").tag(12)
+                    Text("24 小时").tag(24)
+                }
+                .pickerStyle(.segmented)
+                .tint(DS.accent)
+
+                GlucoseChartView(samples: model.chartSamples,
+                                 markers: model.historyEvents,
+                                 windowMinutes: Double(model.chartWindowHours * 60),
+                                 unit: model.effectiveGlucoseUnit)
+
+                if model.chartSamples.isEmpty {
+                    Text("还没有采样。Nightscout 需要先拉一次；泵来源需要 CGM 连上。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+
+                if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 15 {
+                    Label("Nightscout 已经 \(Int(age)) 分钟没更新", systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(DS.warn)
+                }
+
+                RowRule(leading: 0).padding(.top, 2)
+
+                HStack {
+                    Text("最近记录")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text("共 \(model.historyEvents.count) 条")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+
+                if model.historyEvents.isEmpty {
+                    Text("还没有记录。Nightscout 的注射与碳水、本机闭环的每一针都会汇总到这里。")
+                        .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 12) {
+                        ForEach(Array(model.historyEvents.prefix(4))) { event in
+                            HistoryRow(event: event)
                         }
                     }
-                } label: {
-                    HStack(spacing: 3) {
-                        Text("最近 \(model.chartWindowHours) 小时")
-                        Image(systemName: "chevron.down").font(.caption2)
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.blue)
-                }
-            }
-
-            Picker("时间跨度", selection: Binding(get: { model.chartWindowHours },
-                                                set: { model.setChartWindow($0) })) {
-                Text("3 小时").tag(3)
-                Text("6 小时").tag(6)
-                Text("12 小时").tag(12)
-                Text("24 小时").tag(24)
-            }
-            .pickerStyle(.segmented)
-
-            GlucoseChartView(samples: model.chartSamples,
-                             markers: model.historyEvents,
-                             windowMinutes: Double(model.chartWindowHours * 60),
-                             unit: model.effectiveGlucoseUnit)
-
-            if model.chartSamples.isEmpty {
-                Text("还没有血糖采样。NS 来源需要先拉取一次，泵来源需要 CGM 连上。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-
-            if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 15 {
-                Text("NS 血糖已经 \(Int(age)) 分钟没有更新。后台保活没开时这是正常现象——回到 App 会立刻补拉。")
-                    .font(.caption).foregroundStyle(.orange)
-            }
-
-            Divider()
-
-            HStack {
-                Text("最近记录").font(.subheadline.weight(.semibold))
-                Spacer()
-                NavigationLink("全部记录") { HistoryView() }
-                    .font(.caption)
-            }
-
-            if model.historyEvents.isEmpty {
-                Text("还没有记录。NS 里的注射/碳水，以及本机闭环的每一针，都会出现在这里。")
-                    .font(.caption).foregroundStyle(.secondary)
-            } else {
-                ForEach(Array(model.historyEvents.prefix(4))) { event in
-                    HistoryRow(event: event)
                 }
             }
         }
-        .padding(14)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 18))
     }
 }
 
@@ -319,40 +301,101 @@ struct HistoryRow: View {
     let event: HistoryEvent
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 11) {
             Image(systemName: event.symbol)
-                .font(.caption.weight(.semibold))
+                .font(.system(size: 11, weight: .semibold))
                 .foregroundStyle(event.tint)
-                .frame(width: 20)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(event.title).font(.footnote.weight(.medium))
-                Text(event.detail).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                .frame(width: 28, height: 28)
+                .background(event.tint.opacity(0.12), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(event.title)
+                    .font(.system(size: 14, weight: .medium))
+                    .monospacedDigit()
+                Text(event.detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Spacer()
-            Text(event.date, style: .time).font(.caption2).foregroundStyle(.secondary)
+            Spacer(minLength: 6)
+            Text(event.date, style: .time)
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+                .monospacedDigit()
         }
     }
 }
 
-/// 全部记录。按时间倒序，日期变化处插入分组标题。
+/// 全部记录。按日期分组，同一天的事件收在一张卡里——
+/// 时间线本来就是一串，翻页式的长列表会让人分不清"这是今天还是上周"。
 struct HistoryView: View {
     @EnvironmentObject var model: AppModel
 
-    var body: some View {
-        List {
-            if model.historyEvents.isEmpty {
-                Text("还没有记录").foregroundStyle(.secondary)
-            }
-            ForEach(model.historyEvents) { event in
-                HistoryRow(event: event)
+    private struct DayGroup: Identifiable {
+        let id: Date
+        var events: [HistoryEvent]
+    }
+
+    private var groups: [DayGroup] {
+        let calendar = Calendar.current
+        var result: [DayGroup] = []
+        for event in model.historyEvents {
+            let day = calendar.startOfDay(for: event.date)
+            if let index = result.lastIndex(where: { calendar.isDate($0.id, inSameDayAs: day) }) {
+                result[index].events.append(event)
+            } else {
+                result.append(DayGroup(id: day, events: [event]))
             }
         }
+        return result
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: DS.gap) {
+                if groups.isEmpty {
+                    Card {
+                        Text("还没有记录。Nightscout 的注射与碳水、本机闭环的每一针都会汇总到这里。")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(groups) { group in
+                    Card(padding: 18) {
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text(dayTitle(group.id))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(.secondary)
+                            VStack(spacing: 13) {
+                                ForEach(group.events) { event in
+                                    HistoryRow(event: event)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.vertical, 8)
+        }
+        .background(PageBackground())
         .navigationTitle("记录")
         .toolbar {
-            Button("刷新 NS") {
-                Task { await model.maybeRefreshNightscout(force: true) }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    Task { await model.maybeRefreshNightscout(force: true) }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityLabel("刷新 NS")
             }
         }
+    }
+
+    private func dayTitle(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "今天" }
+        if calendar.isDateInYesterday(day) { return "昨天" }
+        return day.formatted(.dateTime.month().day().weekday(.wide))
     }
 }
 
@@ -393,6 +436,8 @@ struct BackgroundKeepAliveView: View {
             }
             .font(.footnote)
         }
+        .scrollContentBackground(.hidden)
+        .background(PageBackground())
         .navigationTitle("后台保活")
     }
 }
