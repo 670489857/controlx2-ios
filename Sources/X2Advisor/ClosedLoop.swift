@@ -131,6 +131,7 @@ public enum ClosedLoop {
                     cgmAgeMinutes: Double? = nil,
                     iobUnits: Double = 0,
                     basalProfileUnitsPerHour: Double? = nil,
+                    deliveredTodayUnits: Double = 0,
                     deliveredLastHourUnits: Double = 0,
                     eventualBg: Double? = nil,
                     minutesToLow: Int? = nil,
@@ -142,6 +143,7 @@ public enum ClosedLoop {
             self.cgmAgeMinutes = cgmAgeMinutes
             self.iobUnits = iobUnits
             self.basalProfileUnitsPerHour = basalProfileUnitsPerHour
+            self.deliveredTodayUnits = deliveredTodayUnits
             self.deliveredLastHourUnits = deliveredLastHourUnits
             self.eventualBg = eventualBg
             self.minutesToLow = minutesToLow
