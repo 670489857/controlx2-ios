@@ -244,15 +244,45 @@ struct GlucoseTrendSection: View {
             HStack {
                 Text("血糖曲线").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("最近 3 小时").font(.caption).foregroundStyle(.secondary)
+                // 同时给一个"当前跨度"的菜单入口：分段控件在浅色卡片上不够显眼，
+                // 用户上一版就没找到调整的地方
+                Menu {
+                    ForEach([3, 6, 12, 24], id: \.self) { hours in
+                        Button {
+                            model.setChartWindow(hours)
+                        } label: {
+                            if model.chartWindowHours == hours {
+                                Label("\(hours) 小时", systemImage: "checkmark")
+                            } else {
+                                Text("\(hours) 小时")
+                            }
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 3) {
+                        Text("最近 \(model.chartWindowHours) 小时")
+                        Image(systemName: "chevron.down").font(.caption2)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                }
             }
 
-            GlucoseChartView(samples: model.samples,
+            Picker("时间跨度", selection: Binding(get: { model.chartWindowHours },
+                                                set: { model.setChartWindow($0) })) {
+                Text("3 小时").tag(3)
+                Text("6 小时").tag(6)
+                Text("12 小时").tag(12)
+                Text("24 小时").tag(24)
+            }
+            .pickerStyle(.segmented)
+
+            GlucoseChartView(samples: model.chartSamples,
                              markers: model.historyEvents,
-                             windowMinutes: 180,
+                             windowMinutes: Double(model.chartWindowHours * 60),
                              unit: model.effectiveGlucoseUnit)
 
-            if model.samples.isEmpty {
+            if model.chartSamples.isEmpty {
                 Text("还没有血糖采样。NS 来源需要先拉取一次，泵来源需要 CGM 连上。")
                     .font(.caption).foregroundStyle(.secondary)
             }
