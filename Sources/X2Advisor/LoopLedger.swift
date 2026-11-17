@@ -1,4 +1,9 @@
 import Foundation
+#if canImport(Glibc)
+import Glibc
+#else
+import Darwin
+#endif
 
 /// 闭环每一拍的记录。和影子模式（`ShadowLog`）的区别是：这里记的是**真的打没打**。
 ///
@@ -64,18 +69,35 @@ public final class LoopLedger: @unchecked Sendable {
         decoder.dateDecodingStrategy = .iso8601
     }
 
-    /// 追加一条。**整文件重写**而不是 `FileHandle.seekToEnd`。
+    /// 追加一条，用 `O_APPEND` 打开后单次写。
     ///
-    /// 闭环每小时 12 条，跑一周也就 2000 行（几百 KB），重写的代价可以忽略；
-    /// 换来的是「写完就是写完」：不会再出现句柄复用、偏移没落盘这类丢行的情形。
-    /// 台账是额度的唯一来源，丢一行就等于额度算少一针，这笔账不能省。
+    /// 为什么不用「读整个文件 + 重写」：那在并发或多进程场景下会把记录写成重复行
+    /// （读到的旧内容和别人的写入交错）。`O_APPEND` 由内核保证每次写入落在文件末尾，
+    /// 不需要先读，也不会出现两个写者互相覆盖。
+    ///
+    /// 台账是额度的唯一来源：多一行等于额度算多，少一行等于额度算少。两种错都不接受，
+    /// 所以这里宁可上 POSIX，也不用"看起来更 Swift"的 `FileHandle` 来回 seek。
     public func append(_ record: LoopRecord) {
-        guard let url = fileURL, let data = try? encoder.encode(record) else { return }
+        guard let url = fileURL, var data = try? encoder.encode(record) else { return }
+        data.append(0x0A)
         lock.lock(); defer { lock.unlock() }
-        var merged = (try? Data(contentsOf: url)) ?? Data()
-        merged.append(data)
-        merged.append(0x0A)
-        try? merged.write(to: url, options: .atomic)
+        appendBytes(data, to: url)
+    }
+
+    private func appendBytes(_ data: Data, to url: URL) {
+        let fd = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+        guard fd >= 0 else { return }
+        defer { close(fd) }
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let written = write(fd, base + offset, raw.count - offset)
+                if written <= 0 { break }
+                offset += written
+            }
+        }
+        fsync(fd)
     }
 
     public func readAll() -> [LoopRecord] {
