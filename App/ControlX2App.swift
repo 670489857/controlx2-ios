@@ -1855,7 +1855,7 @@ struct ControlIQView: View {
                         Text(w.daysText).foregroundStyle(.secondary)
                         Text(w.enabled ? "启用" : "未用")
                             .font(.caption2)
-                            .foregroundStyle(w.enabled ? .green : .tertiary)
+                            .foregroundStyle(w.enabled ? Color.green : Color.secondary)
                     }
                     .font(.callout)
                     if w != schedule.windows.last { Divider() }
