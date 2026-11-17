@@ -67,6 +67,13 @@ struct SettingsHubView: View {
                                statusColor: model.backgroundAudioEnabled ? .green : .secondary)
                 }
                 NavigationLink {
+                    LiveActivityView()
+                } label: {
+                    settingRow(icon: "lock.rectangle.stack.fill", color: .purple, title: "锁屏显示",
+                               status: model.liveActivityEnabled ? "已开启" : "未开启",
+                               statusColor: model.liveActivityEnabled ? .green : .secondary)
+                }
+                NavigationLink {
                     BasalProfileView()
                 } label: {
                     settingRow(icon: "chart.bar.fill", color: .teal, title: "基础率计划",
@@ -157,6 +164,120 @@ struct LoopAdvancedView: View {
         }
         .navigationTitle("高级参数")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
+    }
+
+    private func row(_ title: String, _ value: Binding<Double>, step: Double = 1) -> some View {
+        LabeledContent(title) {
+            TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.decimalPad)
+                .monospacedDigit()
+        }
+    }
+}
+
+/// 锁屏即时动态的开关页。
+struct LiveActivityView: View {
+    @EnvironmentObject var model: AppModel
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("锁屏显示（即时动态）", isOn: Binding(
+                    get: { model.liveActivityEnabled },
+                    set: { model.setLiveActivity($0) }))
+                if let message = model.liveActivityMessage {
+                    Text(message).font(.footnote).foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("锁屏")
+            } footer: {
+                Text("开启后锁屏和灵动岛上会显示血糖、趋势、IOB、闭环状态和最近一针。这里只显示，不能发针——发针仍然只能在 App 里经过闸门。")
+            }
+
+            Section {
+                Text("1. 动态在 App 每分钟刷新时更新一次；系统对刷新频率有限制，锁屏上的数字可能比 App 里慢一两分钟。")
+                Text("2. 如果系统里关掉了「实时活动」，这里打开会失败，并提示你去 设置 → ControlX2 → 实时活动。")
+                Text("3. 锁屏内容可能在他人可见的位置——不想让别人看到血糖，就别开。")
+            } header: {
+                Text("要知道的事")
+            }
+            .font(.footnote)
+        }
+        .navigationTitle("锁屏显示")
+    }
+}
+
+/// 编辑一套设定档。
+struct LoopPresetEditorView: View {
+    @EnvironmentObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var draft: LoopPreset
+    @State private var confirmDelete = false
+
+    init(preset: LoopPreset) {
+        _draft = State(initialValue: preset)
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                LabeledContent("名称") {
+                    TextField("设定档名称", text: $draft.name)
+                        .multilineTextAlignment(.trailing)
+                }
+            }
+
+            Section {
+                row("体重", $draft.settings.weightKg)
+                row("每日胰岛素 U", $draft.settings.totalDailyInsulinUnits, step: 0.5)
+                row("24h 累计上限 U", $draft.settings.maxDailyUnits)
+            } header: {
+                Text("基础")
+            }
+
+            Section {
+                row("目标下限 mg/dL", $draft.settings.targetLow)
+                row("目标上限 mg/dL", $draft.settings.targetHigh)
+                row("敏感系数 ISF", $draft.settings.isf)
+                row("胰岛素作用时长（分钟）", $draft.settings.insulinDurationMinutes)
+            } header: {
+                Text("目标与敏感度")
+            }
+
+            Section {
+                row("单针上限 U", $draft.settings.maxSingleMicroBolus, step: 0.05)
+                row("每小时上限 U", $draft.settings.maxHourlyMicroBolus, step: 0.05)
+                row("IOB 上限 U", $draft.settings.maxIobUnits, step: 0.1)
+                row("停止线 mg/dL", $draft.settings.lowSuspendThreshold)
+                row("泵自己在跑的基础率 U/h", $draft.settings.pumpBasalUnitsPerHour, step: 0.05)
+                if let invalid = draft.settings.invalidReason {
+                    Text(invalid).font(.footnote).foregroundStyle(.red)
+                }
+            } header: {
+                Text("闸门")
+            }
+
+            Section {
+                Button("保存这套参数") {
+                    draft.updatedAt = Date()
+                    model.updatePreset(draft)
+                    dismiss()
+                }
+                .disabled(draft.settings.invalidReason != nil || draft.name.isEmpty)
+                Button("删除此设定档", role: .destructive) { confirmDelete = true }
+            }
+        }
+        .navigationTitle("编辑设定档")
+        .confirmationDialog("删除这套设定档？", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("删除", role: .destructive) {
+                model.deletePreset(draft.id)
+                dismiss()
+            }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("删除只影响这套参数，当前运行中的闭环不会因此停止。")
+        }
     }
 
     private func row(_ title: String, _ value: Binding<Double>, step: Double = 1) -> some View {

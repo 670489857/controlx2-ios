@@ -15,6 +15,8 @@ targets:
     platform: iOS
     sources:
       - path: App
+      # 锁屏即时动态的数据契约要和 App 共用同一份定义，否则两边字段会漂
+      - path: LiveActivity/Shared
     dependencies:
       - package: PumpX2Kit
         product: PumpX2Kit
@@ -22,12 +24,14 @@ targets:
         product: PumpX2BLE
       - package: PumpX2Kit
         product: X2Advisor
+      # 小组件扩展随主 App 一起嵌入
+      - target: LoopLiveActivity
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app
         # 版本号的单一来源是仓库根目录的 VERSION 文件，CI 会校验两处一致后用
         # 它覆盖这里。本地直接开 Xcode 时这两个值就是兜底值。
-        MARKETING_VERSION: "0.6.0"
+        MARKETING_VERSION: "0.7.0"
         CURRENT_PROJECT_VERSION: "1"
         BUILD_GIT_SHA: "local"
         SWIFT_VERSION: "5.9"
@@ -45,6 +49,8 @@ targets:
         # 装完后能在 App 内核对「手里这个包对应哪个提交」，不用回 CI 翻日志
         BuildGitSHA: "$(BUILD_GIT_SHA)"
         UILaunchScreen: {}
+        # 锁屏即时动态（ActivityKit）。没有这个键，Activity.request 会直接失败
+        NSSupportsLiveActivities: true
         UIBackgroundModes:
           - bluetooth-central
           # 静音音频保活：iOS 只给「正在播放音频」的 App 后台运行权，
@@ -55,3 +61,26 @@ targets:
         ITSAppUsesNonExemptEncryption: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
+
+  # 锁屏即时动态的小组件。只负责显示，没有任何写操作入口。
+  LoopLiveActivity:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LiveActivity/Widget
+      - path: LiveActivity/Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app.LoopLiveActivity
+        MARKETING_VERSION: "0.7.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1,2"
+    info:
+      path: LiveActivity/Info.plist
+      properties:
+        CFBundleDisplayName: ControlX2 动态
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension

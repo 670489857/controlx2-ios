@@ -168,6 +168,17 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 
     /// 已确认「泵的基础率已经降下来」，闭环才允许真发
     @Published var loopZeroBasalConfirmed = false
+
+    // MARK: 控糖设定档
+    @Published var loopPresets: [LoopPreset] =
+        LoopPresetLibrary.decode(UserDefaults.standard.data(forKey: "loopPresets"))
+    @Published var activePresetID: UUID? =
+        UserDefaults.standard.string(forKey: "activePresetID").flatMap(UUID.init(uuidString:))
+
+    // MARK: 锁屏即时动态
+    @Published var liveActivityEnabled: Bool =
+        UserDefaults.standard.bool(forKey: "liveActivityEnabled")
+    @Published var liveActivityMessage: String?
     /// 血糖卡片下面那行小字，明确写出这个数是从哪来的
     @Published var glucoseSourceHint: String = "mg/dL · 以泵屏幕为准"
     @Published var glucoseUnit: GlucoseDisplayUnit =
@@ -772,6 +783,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             hasLiveData = true
             trendSymbol = Self.trendSymbol(for: nsTrendCode)
         }
+        syncLiveActivity()
         if let iob = snap.iobUnits {
             iobText = String(format: "%.2f U", iob)
             iobValue = iob
@@ -2593,6 +2605,7 @@ struct ClosedLoopView: View {
         Form {
             boundarySection
             masterSection
+            presetSection
             readoutsSection
             statusSection
             decisionSection
@@ -2673,6 +2686,46 @@ struct ClosedLoopView: View {
             Text("开关")
         } footer: {
             Text("演练和真发是两个按钮。演练跑够一轮、看记录里算出来的量合不合理，再考虑真发。")
+        }
+    }
+
+    // MARK: 设定档
+
+    private var presetSection: some View {
+        Section {
+            ForEach(model.loopPresets) { preset in
+                HStack(spacing: 10) {
+                    Button {
+                        model.applyPreset(preset.id)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(preset.name).font(.subheadline.weight(.medium))
+                                .foregroundStyle(.primary)
+                            Text(preset.summary).font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    if model.activePresetID == preset.id {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    }
+                    NavigationLink("编辑") { LoopPresetEditorView(preset: preset) }
+                        .font(.caption)
+                }
+            }
+            if model.loopPresets.isEmpty {
+                Text("还没有设定档。把现在这套参数存下来，改坏了能切回去。")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Button {
+                model.createPresetFromCurrent()
+            } label: {
+                Label("把当前参数另存为设定档", systemImage: "plus.circle")
+            }
+        } header: {
+            Text("控糖设定档")
+        } footer: {
+            Text("点名字切到那一档，会整组替换参数（不是单项）。编辑当前生效的档会立刻影响运行中的闭环。")
         }
     }
 

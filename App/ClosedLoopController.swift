@@ -164,6 +164,7 @@ extension AppModel {
                                 errorText: errorText)
         loopLedger.append(record)
         refreshLoopTotals()
+        syncLiveActivity()
         if loopLiveDosing, errorText == nil, !decision.willDose { loopErrorTicks = 0 }
     }
 
