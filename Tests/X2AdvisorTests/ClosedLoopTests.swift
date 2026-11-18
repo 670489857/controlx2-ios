@@ -259,4 +259,56 @@ final class ClosedLoopTests: XCTestCase {
         settings.maxDailyUnits = 0.5      // 小于每小时上限 1.5
         XCTAssertNotNil(settings.invalidReason)
     }
+
+    /// 把「单拍追加上限倍数」调大之后，一针确实能到 0.5 U。
+    /// 这条测试存在的意义：不动倍数上限时，单把单针上限改成 0.5 是没用的。
+    func testCorrectionMultipleUnlocksLargerSingleDose() {
+        var settings = ClosedLoop.Settings()
+        settings.maxSingleMicroBolus = 0.5
+        settings.maxHourlyMicroBolus = 5
+        settings.maxIobUnits = 8
+        settings.maxCorrectionMultipleOfBasal = 20
+
+        var inputs = ClosedLoop.Inputs()
+        inputs.controlIQEnabled = false
+        inputs.cgmMgdl = 250
+        inputs.cgmAgeMinutes = 3
+        inputs.iobUnits = 0
+        inputs.basalProfileUnitsPerHour = 0.3
+        inputs.trendPerMinute = 0
+        inputs.eventualBg = 250
+        inputs.deliveredLastHourUnits = 0
+
+        let decision = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(decision.units, 0.5)
+    }
+
+    /// 同样参数但倍数还是默认 4：一针被压到 0.1 U 左右
+    func testDefaultMultipleCapsDoseRegardlessOfSingleCap() {
+        var settings = ClosedLoop.Settings()
+        settings.maxSingleMicroBolus = 0.5
+        settings.maxHourlyMicroBolus = 5
+        settings.maxCorrectionMultipleOfBasal = 4
+
+        var inputs = ClosedLoop.Inputs()
+        inputs.controlIQEnabled = false
+        inputs.cgmMgdl = 250
+        inputs.cgmAgeMinutes = 3
+        inputs.basalProfileUnitsPerHour = 0.3
+        inputs.trendPerMinute = 0
+        inputs.eventualBg = 250
+
+        let decision = ClosedLoop.decide(settings, inputs)
+        XCTAssertLessThanOrEqual(decision.units, 0.15)
+    }
+
+    func testCorrectionMultipleOutOfRangeIsInvalid() {
+        var settings = ClosedLoop.Settings()
+        settings.maxCorrectionMultipleOfBasal = 60
+        XCTAssertNotNil(settings.invalidReason)
+        settings.maxCorrectionMultipleOfBasal = 0.5
+        XCTAssertNotNil(settings.invalidReason)
+        settings.maxCorrectionMultipleOfBasal = 20
+        XCTAssertNil(settings.invalidReason)
+    }
 }

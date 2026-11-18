@@ -209,6 +209,25 @@ struct LoopAdvancedView: View {
                 if let invalid = model.loopSettings.invalidReason {
                     Text(invalid).font(.footnote).foregroundStyle(.red)
                 }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("单拍追加上限（倍基础量）").font(.footnote)
+                        Spacer()
+                        TextField("4", value: $model.loopSettings.maxCorrectionMultipleOfBasal,
+                                  format: .number.precision(.fractionLength(0...1)))
+                            .multilineTextAlignment(.trailing)
+                            .keyboardType(.decimalPad)
+                            .monospacedDigit()
+                            .font(.footnote)
+                            .frame(width: 70)
+                    }
+                    Text("这一项才是「一拍最多能打多少」的真正天花板。追加量 ≤ 这段基础量的 N 倍，"
+                         + "4 倍够日常纠高；想让一拍多打就往上调，代价是参数填错时一针冲得更狠。"
+                         + perTickHint)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             } header: {
                 Text("参数")
             } footer: {
@@ -228,6 +247,17 @@ struct LoopAdvancedView: View {
         .background(PageBackground())
         .navigationTitle("高级参数")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
+    }
+
+    /// 把当前参数折算成一句话：「这一拍最多能打多少」。
+    /// 用户改数字时最想知道的就是这个结果，而不是去心算基础率 ÷ 12 × 倍数。
+    private var perTickHint: String {
+        let basal = model.basalProfile?.currentSegment?.basalRateUnitsPerHour ?? 0
+        guard basal > 0 else { return "" }
+        let tickBasal = basal * model.loopSettings.tickSeconds / 3600
+        let capByMultiple = tickBasal * model.loopSettings.maxCorrectionMultipleOfBasal
+        let cap = min(model.loopSettings.maxSingleMicroBolus, capByMultiple)
+        return String(format: " 按当前基础率 %.2f U/h 算，这一拍最多约 %.2f U（再受单针上限与 IOB 余量约束）。", basal, cap)
     }
 
     private func row(_ title: String, _ value: Binding<Double>, step: Double = 1) -> some View {

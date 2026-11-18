@@ -96,6 +96,10 @@ public enum ClosedLoop {
             if maxDailyUnits > 0 && maxDailyUnits < maxHourlyMicroBolus {
                 return "24h 上限不能小于每小时上限"
             }
+            // 这一条是「单拍能打多少」的真正天花板：追加量不得超过这段基础量的 N 倍。
+            // 4 倍是为了防参数填错时一针冲太多，不是物理上限，允许改，但给个 48 倍的硬边界。
+            if maxCorrectionMultipleOfBasal < 1 { return "单拍追加上限的倍数不能小于 1" }
+            if maxCorrectionMultipleOfBasal > 48 { return "单拍追加上限最多 48 倍基础量" }
             return nil
         }
     }
