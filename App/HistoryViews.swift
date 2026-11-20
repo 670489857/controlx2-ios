@@ -127,111 +127,207 @@ struct GlucoseChartView: View {
     /// 显示单位（只影响纵轴标签，不影响绘制坐标——坐标永远是 mg/dL）
     var unit: GlucoseDisplayUnit = .mgdl
 
+    /// 拖动时被按住的那个点。nil = 没在拖，曲线回到"只看形状"的状态
+    @State private var scrubIndex: Int?
+
     private let low: Double = 40
     private let high: Double = 350
 
+    private var unitLabel: String { unit == .mmol ? "mmol/L" : "mg/dL" }
+
+    private func valueText(_ mgdl: Int) -> String {
+        unit == .mmol
+            ? String(format: "%.1f", Double(mgdl) / 18.0182)
+            : "\(mgdl)"
+    }
+
+    private func visible(_ now: Date) -> [GlucoseSample] {
+        let start = now.addingTimeInterval(-windowMinutes * 60)
+        return samples.filter { $0.timestamp >= start }
+    }
+
     var body: some View {
-        Canvas { context, size in
-            let now = Date()
-            let start = now.addingTimeInterval(-windowMinutes * 60)
-            let plot = CGRect(x: 26,
-                              y: 12,
-                              width: max(1, size.width - 26 - 12),
-                              height: max(1, size.height - 12 - 22))
+        GeometryReader { geo in
+            ZStack(alignment: .topLeading) {
+                Canvas { context, size in
+                    let now = Date()
+                    let start = now.addingTimeInterval(-windowMinutes * 60)
+                    let plot = CGRect(x: 26,
+                                      y: 12,
+                                      width: max(1, size.width - 26 - 12),
+                                      height: max(1, size.height - 12 - 22))
 
-            func y(_ value: Double) -> CGFloat {
-                plot.maxY - CGFloat((value - low) / (high - low)) * plot.height
-            }
-            func x(_ date: Date) -> CGFloat {
-                plot.minX + CGFloat(date.timeIntervalSince(start) / (windowMinutes * 60)) * plot.width
-            }
+                    func y(_ value: Double) -> CGFloat {
+                        plot.maxY - CGFloat((value - low) / (high - low)) * plot.height
+                    }
+                    func x(_ date: Date) -> CGFloat {
+                        plot.minX + CGFloat(date.timeIntervalSince(start) / (windowMinutes * 60)) * plot.width
+                    }
 
-            // 目标带参考线：70 / 180 mg/dL
-            for value in [70.0, 180.0] {
-                var line = Path()
-                line.move(to: CGPoint(x: plot.minX, y: y(value)))
-                line.addLine(to: CGPoint(x: plot.maxX, y: y(value)))
-                context.stroke(line, with: .color(Color.secondary.opacity(0.35)),
-                               style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-            }
+                    // 目标带参考线：70 / 180 mg/dL
+                    for value in [70.0, 180.0] {
+                        var line = Path()
+                        line.move(to: CGPoint(x: plot.minX, y: y(value)))
+                        line.addLine(to: CGPoint(x: plot.maxX, y: y(value)))
+                        context.stroke(line, with: .color(Color.secondary.opacity(0.35)),
+                                       style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                    }
 
-            // 纵轴刻度
-            for value in [70.0, 180.0, 250.0] {
-                let label: String
-                if unit == .mmol {
-                    label = String(format: "%.1f", value / 18.0182)
-                } else {
-                    label = String(format: "%.0f", value)
+                    // 纵轴刻度
+                    for value in [70.0, 180.0, 250.0] {
+                        let label = unit == .mmol
+                            ? String(format: "%.1f", value / 18.0182)
+                            : String(format: "%.0f", value)
+                        context.draw(Text(label).font(.system(size: 9)).foregroundColor(Color.secondary),
+                                     at: CGPoint(x: plot.minX - 8, y: y(value)), anchor: .trailing)
+                    }
+
+                    let shown = visible(now)
+
+                    // 曲线
+                    if shown.count >= 2 {
+                        var path = Path()
+                        path.move(to: CGPoint(x: x(shown[0].timestamp), y: y(Double(shown[0].mgdl))))
+                        for s in shown.dropFirst() {
+                            path.addLine(to: CGPoint(x: x(s.timestamp), y: y(Double(s.mgdl))))
+                        }
+                        context.stroke(path, with: .color(Color.green.opacity(0.85)), lineWidth: 1.5)
+                    }
+                    for s in shown {
+                        let r: CGFloat = 2.4
+                        let rect = CGRect(x: x(s.timestamp) - r, y: y(Double(s.mgdl)) - r,
+                                          width: r * 2, height: r * 2)
+                        context.fill(Path(ellipseIn: rect), with: .color(Color.green.opacity(0.75)))
+                    }
+
+                    // 事件标记：三角 + 数值，画在对应时间的曲线上。
+                    // 同一条曲线上一串追加针常挤在一分钟里，标签会叠成一团文字——这里按像素间距丢标签，只留三角
+                    var lastLabelX: CGFloat = -.greatestFiniteMagnitude
+                    for m in markers where m.date >= start && m.kind != .loopHold {
+                        let px = x(m.date)
+                        let bgValue = nearestValue(to: m.date, in: shown) ?? 180
+                        let py = y(bgValue)
+                        let color: Color = m.kind == .carbs ? .orange : (m.kind == .bolus ? .blue : .green)
+
+                        var tri = Path()
+                        tri.move(to: CGPoint(x: px, y: py - 6))
+                        tri.addLine(to: CGPoint(x: px - 4.5, y: py - 14))
+                        tri.addLine(to: CGPoint(x: px + 4.5, y: py - 14))
+                        tri.closeSubpath()
+                        context.fill(tri, with: .color(color))
+
+                        guard px - lastLabelX >= 26 else { continue }
+                        lastLabelX = px
+                        context.draw(Text(m.shortLabel).font(.system(size: 9, weight: .semibold)).foregroundColor(color),
+                                     at: CGPoint(x: px, y: py - 22), anchor: .bottom)
+                    }
+
+                    // 时间轴：起始、中点、现在
+                    let formatter = DateFormatter()
+                    formatter.dateFormat = "HH:mm"
+                    for fraction in [0.0, 0.5, 1.0] {
+                        let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
+                        let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
+                        context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
+                                     at: CGPoint(x: x(date), y: plot.maxY + 10))
+                    }
+
+                    // 拖动指示：竖线 + 高亮那个点。
+                    // 竖线用虚线而不是实线——实线会被误读成"现在是这个值"。
+                    if let index = scrubIndex, shown.indices.contains(index) {
+                        let s = shown[index]
+                        let px = x(s.timestamp)
+                        let py = y(Double(s.mgdl))
+
+                        var rule = Path()
+                        rule.move(to: CGPoint(x: px, y: plot.minY))
+                        rule.addLine(to: CGPoint(x: px, y: plot.maxY))
+                        context.stroke(rule, with: .color(Color.primary.opacity(0.35)),
+                                       style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+
+                        context.fill(Path(ellipseIn: CGRect(x: px - 7, y: py - 7, width: 14, height: 14)),
+                                     with: .color(Theme.glucose(Double(s.mgdl))))
+                        context.stroke(Path(ellipseIn: CGRect(x: px - 3.5, y: py - 3.5, width: 7, height: 7)),
+                                       with: .color(.white), lineWidth: 1.5)
+                    }
                 }
-                context.draw(Text(label).font(.system(size: 9)).foregroundColor(Color.secondary),
-                             at: CGPoint(x: plot.minX - 8, y: y(value)), anchor: .trailing)
-            }
+                .contentShape(Rectangle())
+                .simultaneousGesture(
+                    // 只处理横向拖动：竖向留给外层的 ScrollView，否则整页会滚不动
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { drag in
+                            guard abs(drag.translation.width) >= abs(drag.translation.height) else { return }
+                            let plotMinX: CGFloat = 26
+                            let plotMaxX = max(27, geo.size.width - 12)
+                            let width = plotMaxX - plotMinX
+                            let px = min(max(drag.location.x, plotMinX), plotMaxX)
+                            let start = Date().addingTimeInterval(-windowMinutes * 60)
+                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * windowMinutes * 60)
+                            let shown = visible(Date())
+                            if let index = nearestIndex(to: target, in: shown) {
+                                scrubIndex = index
+                            }
+                        }
+                        .onEnded { _ in
+                            scrubIndex = nil
+                        }
+                )
 
-            // 曲线
-            let visible = samples.filter { $0.timestamp >= start }
-            if visible.count >= 2 {
-                var path = Path()
-                path.move(to: CGPoint(x: x(visible[0].timestamp), y: y(Double(visible[0].mgdl))))
-                for s in visible.dropFirst() {
-                    path.addLine(to: CGPoint(x: x(s.timestamp), y: y(Double(s.mgdl))))
+                if let index = scrubIndex {
+                    let shown = visible(Date())
+                    if shown.indices.contains(index) {
+                        let s = shown[index]
+                        scrubBubble(sample: s, size: geo.size, now: Date())
+                    }
                 }
-                context.stroke(path, with: .color(Color.green.opacity(0.85)), lineWidth: 1.5)
-            }
-            for s in visible {
-                let r: CGFloat = 2.4
-                let rect = CGRect(x: x(s.timestamp) - r, y: y(Double(s.mgdl)) - r,
-                                  width: r * 2, height: r * 2)
-                context.fill(Path(ellipseIn: rect), with: .color(Color.green.opacity(0.75)))
-            }
-
-            // 事件标记：三角 + 数值，画在对应时间的曲线上。
-            // 同一条曲线上一串追加针常挤在一分钟里，标签会叠成一团文字——这里按像素间距丢标签，只留三角
-            var lastLabelX: CGFloat = -.greatestFiniteMagnitude
-            for m in markers where m.date >= start && m.kind != .loopHold {
-                let px = x(m.date)
-                let bgValue = nearestValue(to: m.date, in: visible, windowMinutes: windowMinutes) ?? 180
-                let py = y(bgValue)
-                let color: Color = m.kind == .carbs ? .orange : (m.kind == .bolus ? .blue : .green)
-
-                var tri = Path()
-                tri.move(to: CGPoint(x: px, y: py - 6))
-                tri.addLine(to: CGPoint(x: px - 4.5, y: py - 14))
-                tri.addLine(to: CGPoint(x: px + 4.5, y: py - 14))
-                tri.closeSubpath()
-                context.fill(tri, with: .color(color))
-
-                guard px - lastLabelX >= 26 else { continue }
-                lastLabelX = px
-                context.draw(Text(m.shortLabel).font(.system(size: 9, weight: .semibold)).foregroundColor(color),
-                             at: CGPoint(x: px, y: py - 22), anchor: .bottom)
-            }
-
-            // 时间轴：起始、中点、现在
-            let formatter = DateFormatter()
-            formatter.dateFormat = "HH:mm"
-            for fraction in [0.0, 0.5, 1.0] {
-                let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
-                let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
-                context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
-                             at: CGPoint(x: x(date), y: plot.maxY + 10))
             }
         }
         .frame(height: 168)
     }
 
-    private func nearestValue(to date: Date, in samples: [GlucoseSample],
-                              windowMinutes: Double) -> Double? {
-        guard !samples.isEmpty else { return nil }
-        var best: GlucoseSample?
-        var bestGap = Double.greatestFiniteMagnitude
-        for s in samples {
-            let gap = abs(s.timestamp.timeIntervalSince(date))
-            if gap < bestGap { bestGap = gap; best = s }
+    /// 小气泡：时间 + 读数。横向位置跟着手指走，但贴边时向内收，
+    /// 不让文字跑出卡片。
+    private func scrubBubble(sample: GlucoseSample, size: CGSize, now: Date) -> some View {
+        let plotMinX: CGFloat = 26
+        let plotMaxX = max(27, size.width - 12)
+        let start = now.addingTimeInterval(-windowMinutes * 60)
+        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (windowMinutes * 60))
+        let rawX = plotMinX + ratio * (plotMaxX - plotMinX)
+        let bubbleWidth: CGFloat = 118
+        let clampedX = min(max(rawX, bubbleWidth / 2 + 2), size.width - bubbleWidth / 2 - 2)
+
+        let time = sample.timestamp.formatted(date: .omitted, time: .shortened)
+        return VStack(spacing: 1) {
+            Text("\(valueText(sample.mgdl)) \(unitLabel)")
+                .font(.system(size: 12, weight: .semibold, design: .rounded))
+                .monospacedDigit()
+            Text(time)
+                .font(.system(size: 9))
+                .opacity(0.7)
         }
-        // 24 小时窗口里一个点是 5 分钟，20 分钟阈值不变；但窗口很短时点更密，
-        // 这里只判断"有没有点"，距离交给三角本身的位置表达
-        _ = windowMinutes
-        return best.map { Double($0.mgdl) }
+        .foregroundStyle(.white)
+        .frame(width: bubbleWidth)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.82), in: Capsule())
+        .position(x: clampedX, y: 22)
+        .allowsHitTesting(false)
+    }
+
+    private func nearestIndex(to date: Date, in list: [GlucoseSample]) -> Int? {
+        guard !list.isEmpty else { return nil }
+        var best = 0
+        var bestGap = Double.greatestFiniteMagnitude
+        for (index, s) in list.enumerated() {
+            let gap = abs(s.timestamp.timeIntervalSince(date))
+            if gap < bestGap { bestGap = gap; best = index }
+        }
+        // 拖到离最近一个点太远的地方就不显示：否则空白处会吸附到一个很远的值，看着像"这个时刻有数"
+        return bestGap <= 15 * 60 ? best : nil
+    }
+
+    private func nearestValue(to date: Date, in samples: [GlucoseSample]) -> Double? {
+        guard let index = nearestIndex(to: date, in: samples) else { return nil }
+        return Double(samples[index].mgdl)
     }
 }
 
@@ -263,6 +359,10 @@ struct GlucoseTrendSection: View {
                 if model.chartSamples.isEmpty {
                     Text("还没有采样。Nightscout 需要先拉一次；泵来源需要 CGM 连上。")
                         .font(.caption).foregroundStyle(.secondary)
+                } else {
+                    Text("按住曲线左右拖动，可以看任意时间点的读数")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
                 }
 
                 if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 15 {
