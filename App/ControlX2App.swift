@@ -291,6 +291,8 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     var loopLowTicks = 0
     /// 连续几拍出错
     var loopErrorTicks = 0
+    /// 连续几拍读不到血糖（过期或缺失）。六拍 = 30 分钟就卸武装
+    var loopBlindTicks = 0
     /// 重连后补认证的状态。连续失败两次就停下，不留在一个「一直重连、一直失败」的循环里。
     private var isResuming = false
     private var resumeAttempts = 0
@@ -2851,6 +2853,31 @@ struct ClosedLoopView: View {
                         .padding(10)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .background(DS.danger.opacity(0.08), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+
+                if let hold = model.loopLastDecision?.hold, hold == .glucoseLow {
+                    // 低血糖不是"这一拍不打"就完了：泵的基础率还在按计划滴，
+                    // 软件在这台泵上没有停泵的权限，只能把这件事喊到人眼前
+                    VStack(alignment: .leading, spacing: 5) {
+                        Label("现在血糖低于停手线", systemImage: "exclamationmark.octagon.fill")
+                            .font(.system(size: 13, weight: .semibold))
+                            .foregroundStyle(DS.danger)
+                        Text("闭环已经停手，但泵的基础率不会停。要么补糖，要么去泵上暂停，别等下一拍。")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.primary)
+                    }
+                    .padding(11)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(DS.danger.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                }
+
+                if let hold = model.loopLastDecision?.hold, hold == .reservoirLow {
+                    Label("药筒余量不够一针，先换药筒", systemImage: "drop.triangle")
+                        .font(.system(size: 12))
+                        .foregroundStyle(DS.warn)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(DS.warn.opacity(0.10), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
                 }
 
                 if model.loopArmed {

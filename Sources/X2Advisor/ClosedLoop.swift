@@ -27,6 +27,10 @@ import Foundation
 /// 这样每一条安全判断都能单独测，不会出现「线上跑挂了才发现预测是坏的」。
 public enum ClosedLoop {
 
+    /// 药筒低于这个量就不再发针：泵会 Nack，管路死体积也让它打不出完整一针
+    public static let minimumReservoirUnits: Double = 5.0
+
+
     /// 闭环参数。默认值是**保守起点**，不是处方。
     public struct Settings: Codable, Equatable, Sendable {
         /// 目标区间下沿（mg/dL）
@@ -130,6 +134,8 @@ public enum ClosedLoop {
         public var carriedUnits: Double
         /// 上一拍的微剂量是否还没结束（泵还在推）
         public var pumpBusy: Bool
+        /// 泵里还剩多少胰岛素（U）。nil = 没读到
+        public var reservoirUnits: Double?
 
         public init(cgmMgdl: Double? = nil,
                     cgmAgeMinutes: Double? = nil,
@@ -142,7 +148,8 @@ public enum ClosedLoop {
                     trendPerMinute: Double = 0,
                     controlIQEnabled: Bool? = nil,
                     carriedUnits: Double = 0,
-                    pumpBusy: Bool = false) {
+                    pumpBusy: Bool = false,
+                    reservoirUnits: Double? = nil) {
             self.cgmMgdl = cgmMgdl
             self.cgmAgeMinutes = cgmAgeMinutes
             self.iobUnits = iobUnits
@@ -155,6 +162,7 @@ public enum ClosedLoop {
             self.controlIQEnabled = controlIQEnabled
             self.carriedUnits = carriedUnits
             self.pumpBusy = pumpBusy
+            self.reservoirUnits = reservoirUnits
         }
     }
 
@@ -173,6 +181,7 @@ public enum ClosedLoop {
         case noBasalProfile
         case doseBelowStep
         case pumpBusy
+        case reservoirLow
 
         public var explanation: String {
             switch self {
@@ -189,6 +198,7 @@ public enum ClosedLoop {
             case .noBasalProfile: return "没读到当前基础率，没有可换算的量"
             case .doseBelowStep: return "这一拍算出来不足 0.05 U，攒到下一拍"
             case .pumpBusy: return "上一针还在推注，不叠针"
+            case .reservoirLow: return "药筒余量已经不够一针，先换药筒"
             }
         }
     }
@@ -237,6 +247,11 @@ public enum ClosedLoop {
         guard let ciq = inputs.controlIQEnabled else { return hold(.controlIQUnknown) }
         if ciq { return hold(.controlIQOn) }
         if inputs.pumpBusy { return hold(.pumpBusy) }
+        // 药筒见底时泵会 Nack。先在这里拦住，既能给出「去换药筒」这一句人话，
+        // 也不用每拍往泵上送一条必定失败的输注报文。
+        if let reservoir = inputs.reservoirUnits, reservoir < ClosedLoop.minimumReservoirUnits {
+            return hold(.reservoirLow, String(format: "余量 %.1f U", reservoir))
+        }
         guard let bg = inputs.cgmMgdl, bg > 0 else { return hold(.cgmMissing) }
         if let age = inputs.cgmAgeMinutes, age > settings.maxCgmAgeMinutes {
             return hold(.cgmStale, String(format: "%.0f 分钟前的读数", age))

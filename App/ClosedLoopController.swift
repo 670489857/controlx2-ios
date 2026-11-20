@@ -33,6 +33,9 @@ extension AppModel {
         if let data = try? JSONEncoder().encode(loopSettings) {
             UserDefaults.standard.set(data, forKey: Self.loopSettingsKey)
         }
+        // 参数变了，之前那张「允许真发 30 分钟」的凭证就过期了：
+        // 自检核的是这套参数和泵的配合，换了参数等于换了前提
+        if takeoverVerifiedAt != nil { takeoverVerifiedAt = nil }
     }
 
     // MARK: 武装
@@ -75,6 +78,7 @@ extension AppModel {
         loopError = nil
         loopCarried = 0
         loopLowTicks = 0
+        loopBlindTicks = 0
         loopErrorTicks = 0
         loopLiveDosing = live
         loopArmed = true
@@ -134,6 +138,18 @@ extension AppModel {
         let decision = ClosedLoop.decide(loopSettings, loopInputs(snap))
         loopLastDecision = decision
         loopCarried = decision.carriedOut
+
+        // 血糖连续读不到（过期或缺失）时，这一拍只能空转。
+        // 空转不危险，但"武装着却什么都做不了"是一种骗人的状态：界面写着在跑，实际瞎了。
+        if decision.hold == .cgmStale || decision.hold == .cgmMissing {
+            loopBlindTicks += 1
+            if loopBlindTicks >= 6 {
+                disarmLoop(note: "血糖连续 30 分钟读不到（\(decision.summary)），闭环已自动停止。泵的基础率仍在按计划走，请检查 CGM 或 Nightscout。")
+                return
+            }
+        } else {
+            loopBlindTicks = 0
+        }
 
         // 拦在「低血糖」时连着两拍就卸武装。这不是算法判断，是这层必须有的兜底：
         // 泵上的基础率还在跑，软件这边只能停手，人得知道。
@@ -195,7 +211,8 @@ extension AppModel {
             trendPerMinute: currentTrendPerMinute(),
             controlIQEnabled: snap.controlIQ?.closedLoopEnabled,
             carriedUnits: loopCarried,
-            pumpBusy: loopPumpBusy || (snap.currentBolus?.bolusId ?? 0) != 0
+            pumpBusy: loopPumpBusy || (snap.currentBolus?.bolusId ?? 0) != 0,
+            reservoirUnits: snap.insulinUnits
         )
     }
 

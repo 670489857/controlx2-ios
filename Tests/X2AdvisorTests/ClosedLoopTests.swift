@@ -311,4 +311,32 @@ final class ClosedLoopTests: XCTestCase {
         settings.maxCorrectionMultipleOfBasal = 20
         XCTAssertNil(settings.invalidReason)
     }
+
+    /// 药筒见底时不发针：泵会 Nack，先给出「去换药筒」而不是每拍失败一次
+    func testReservoirLowHoldsWithoutTrying() {
+        var settings = ClosedLoop.Settings()
+        var inputs = ClosedLoop.Inputs()
+        inputs.controlIQEnabled = false
+        inputs.cgmMgdl = 200
+        inputs.cgmAgeMinutes = 2
+        inputs.basalProfileUnitsPerHour = 0.5
+        inputs.eventualBg = 200
+        inputs.reservoirUnits = 3
+
+        let decision = ClosedLoop.decide(settings, inputs)
+        XCTAssertEqual(decision.hold, .reservoirLow)
+        XCTAssertEqual(decision.units, 0)
+    }
+
+    func testReservoirUnknownDoesNotBlock() {
+        var inputs = ClosedLoop.Inputs()
+        inputs.controlIQEnabled = false
+        inputs.cgmMgdl = 200
+        inputs.cgmAgeMinutes = 2
+        inputs.basalProfileUnitsPerHour = 0.6
+        inputs.eventualBg = 200
+
+        let decision = ClosedLoop.decide(ClosedLoop.Settings(), inputs)
+        XCTAssertNotEqual(decision.hold, .reservoirLow)
+    }
 }
