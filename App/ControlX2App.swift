@@ -139,6 +139,11 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     /// 而不是让用户对着一个不动的进度条猜。
     @Published var linkPhase: BLETransport.LinkPhase = .idle
     @Published var apiVersion: String?
+    // MARK: 泵自报的硬件/软件信息（0x85）。读不到就保持 nil，界面显示「未读取」
+    @Published var pumpSoftwareName: String?
+    @Published var pumpModelNumber: UInt32?
+    @Published var pumpSerialNumber: UInt32?
+    @Published var pumpRevision: String?
     @Published var insulinUnits: String = "—"
     @Published var lastUpdated: String = "—"
     @Published var glucoseText: String = "—"
@@ -779,6 +784,10 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     func refreshFromSession() async {
         let snap = await session.snapshot
         apiVersion = snap.apiVersion?.description
+        pumpSoftwareName = snap.pumpSoftwareName
+        pumpModelNumber = snap.pumpModelNumber
+        pumpSerialNumber = snap.pumpSerialNumber
+        pumpRevision = snap.pumpRevision
 
         if let units = snap.insulinUnits {
             // 泵在换筒/回抽途中会把剩余量标成估算，直接显示成精确值会误导
@@ -1418,6 +1427,18 @@ struct PairingView: View {
         }
     }
 
+    private func infoRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+            Spacer()
+            Text(value)
+                .font(.system(size: 12, design: .rounded))
+                .monospacedDigit()
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             // 第一屏先说清链路状态。iOS 的系统配对弹窗与这里的配对码是两件事，
@@ -1435,6 +1456,25 @@ struct PairingView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+
+            // 泵自报的硬件/软件信息。读不到就写「未读取」——不要用猜测填空，
+            // 版本号错了会让人拿错误的固件结论去判断能不能用某条指令。
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("泵信息").font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text(model.apiVersion.map { "API \($0)" } ?? "API 未读取")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+                infoRow("软件版本", model.pumpSoftwareName ?? "未读取")
+                infoRow("型号号", model.pumpModelNumber.map { String($0) } ?? "未读取")
+                infoRow("序列号", model.pumpSerialNumber.map { String($0) } ?? "未读取")
+                infoRow("泵版本", (model.pumpRevision?.isEmpty == false) ? model.pumpRevision! : "未读取")
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
 
             VStack(alignment: .leading, spacing: 8) {
@@ -1609,6 +1649,16 @@ struct DashboardView: View {
                     .stroke(tint.opacity(0.55), lineWidth: 1.8)
                     .frame(height: 44)
                     .padding(.top, 16)
+            }
+
+            // 数字看着还在，其实已经过期——这是最容易让人误判的一种状态。
+            // 超过 10 分钟就直接在卡片里说出来，而不是让人自己去读那行小字。
+            if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 10 {
+                Label("Nightscout 已经 \(Int(age)) 分钟没更新，这个数字可能不是现在的",
+                      systemImage: "clock.badge.exclamationmark")
+                    .font(.system(size: 11))
+                    .foregroundStyle(DS.warn)
+                    .padding(.top, 12)
             }
         }
         .padding(20)

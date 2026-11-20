@@ -12,15 +12,49 @@ extension AppModel {
     private static let nsConfigKey = "nightscoutConfig"
     private static let cgmSourceKey = "cgmSource"
 
+    private static let nsSecretAccount = "ns.secret"
+    private static let nsTokenAccount = "ns.token"
+
+    /// 读配置。旧版本把 secret / token 明文写在 UserDefaults 的 JSON 里，
+    /// 这里顺手迁移进 Keychain，并把明文从 plist 里抹掉——迁移只跑一次。
     nonisolated static func loadNightscoutConfig() -> NightscoutConfig {
         guard let data = UserDefaults.standard.data(forKey: nsConfigKey),
-              let c = try? JSONDecoder().decode(NightscoutConfig.self, from: data)
+              var c = try? JSONDecoder().decode(NightscoutConfig.self, from: data)
         else { return NightscoutConfig() }
+
+        let hasLegacySecret = !c.secret.isEmpty
+        let hasLegacyToken = !c.token.isEmpty
+
+        if Keychain.read(account: nsSecretAccount) == nil, hasLegacySecret {
+            Keychain.write(c.secret, account: nsSecretAccount)
+        }
+        if Keychain.read(account: nsTokenAccount) == nil, hasLegacyToken {
+            Keychain.write(c.token, account: nsTokenAccount)
+        }
+        c.secret = Keychain.read(account: nsSecretAccount) ?? c.secret
+        c.token = Keychain.read(account: nsTokenAccount) ?? c.token
+
+        if hasLegacySecret || hasLegacyToken {
+            // 把 plist 里的明文换成空串。地址、认证模式这些不敏感，仍留在 JSON 里。
+            var cleaned = c
+            cleaned.secret = ""
+            cleaned.token = ""
+            if let cleanData = try? JSONEncoder().encode(cleaned) {
+                UserDefaults.standard.set(cleanData, forKey: nsConfigKey)
+            }
+        }
         return c
     }
 
     func saveNightscoutConfig() {
-        if let data = try? JSONEncoder().encode(nsConfig) {
+        Keychain.write(nsConfig.secret, account: Self.nsSecretAccount)
+        Keychain.write(nsConfig.token, account: Self.nsTokenAccount)
+
+        // 落盘的 JSON 永远不含 secret / token。哪怕用户导出备份，也拿不到这两串。
+        var persisted = nsConfig
+        persisted.secret = ""
+        persisted.token = ""
+        if let data = try? JSONEncoder().encode(persisted) {
             UserDefaults.standard.set(data, forKey: Self.nsConfigKey)
         }
         UserDefaults.standard.set(cgmSource.rawValue, forKey: Self.cgmSourceKey)

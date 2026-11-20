@@ -153,4 +153,42 @@ public enum StatusDecoder {
     public static func readU32(_ b: [UInt8], _ o: Int) -> UInt32 {
         UInt32(b[o]) | UInt32(b[o + 1]) << 8 | UInt32(b[o + 2]) << 16 | UInt32(b[o + 3]) << 24
     }
+
+    // MARK: 版本信息（0x85 PumpVersionB，60 字节）
+
+    /// 字段偏移来自 pumpX2 的 `PumpVersionBResponse.parse`：
+    /// softwareName 0..20、configA 20、configB 24、serial 28、model 32、
+    /// pumpRevision 36..44、pcbPart 44、pcbSerial 48、pcbRevision 52..60。
+    ///
+    /// 长度不对时返回 nil 而不是硬解：这条报文在不同固件上可能是别的长度，
+    /// 硬解会把序列号显示成一串错位数字，比显示"未读取"更误导。
+    public struct PumpVersion: Equatable, Sendable {
+        public let softwareName: String
+        public let modelNumber: UInt32
+        public let serialNumber: UInt32
+        public let pumpRevision: String
+    }
+
+    public static func pumpVersionB(_ cargo: [UInt8]) -> PumpVersion? {
+        guard cargo.count >= 44 else { return nil }
+        let name = ascii(cargo, 0, 20)
+        let model = readU32(cargo, 32)
+        let serial = readU32(cargo, 28)
+        let rev = ascii(cargo, 36, 8)
+        return PumpVersion(softwareName: name, modelNumber: model, serialNumber: serial, pumpRevision: rev)
+    }
+
+    /// 固定长度字符串：截到第一个不可打印字节（含 NUL），并去掉首尾空白。
+    /// 泵把这些字段写成定长 NUL 填充，直接当字符串用会带一串看不见的尾字符。
+    private static func ascii(_ b: [UInt8], _ offset: Int, _ length: Int) -> String {
+        guard offset + length <= b.count else { return "" }
+        var bytes: [UInt8] = []
+        for index in offset..<(offset + length) {
+            let v = b[index]
+            if v < 0x20 || v > 0x7E { break }
+            bytes.append(v)
+        }
+        return String(bytes: bytes, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespaces) ?? ""
+    }
 }

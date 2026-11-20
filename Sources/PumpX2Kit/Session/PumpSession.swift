@@ -102,6 +102,13 @@ public actor PumpSession {
         /// 「是解析错了还是泵就这么报的」的证据就是这几个字节。
         public var rawCargo: [UInt8: [UInt8]] = [:]
 
+        // MARK: 泵自报的硬件/软件信息（0x85 PumpVersionB）
+        /// 泵上报的软件名（X2 上一般是 16 位软件 ID 或 7.x 版本串）
+        public var pumpSoftwareName: String?
+        public var pumpModelNumber: UInt32?
+        public var pumpSerialNumber: UInt32?
+        public var pumpRevision: String?
+
         /// mg/dL → mmol/L，仅用于展示切换
         public var glucoseMmol: Double? {
             guard let g = glucoseMgdl else { return nil }
@@ -131,6 +138,8 @@ public actor PumpSession {
 
     public private(set) var state: SessionState = .idle
     public private(set) var snapshot = Snapshot()
+    /// 版本报文只试一次，成败都记下来，不随每次刷新重试
+    private var didAttemptVersionRead = false
     /// 仅在完整配对成功后才有值；持久化它即可免去下次输入配对码
     public private(set) var credentials: PumpCredentials?
     /// 本次连接是否已完成 JPAKE 认证。重连后 `resetSession()` 会把它清成 false，
@@ -395,6 +404,24 @@ public actor PumpSession {
 
     public func refresh() async throws {
         if let v = try? await readApiVersion() { snapshot.apiVersion = v }
+
+        // 版本信息只尝试一次：X2 对 0x84 的受理与固件有关，
+        // 反复重试会在每次下拉刷新时都撞一次可能的 Nack，没有必要。
+        if !didAttemptVersionRead {
+            didAttemptVersionRead = true
+            if let frame = try? await request(
+                PumpMessage.request(characteristic: .currentStatus, opCode: 0x84),
+                expecting: 0x85
+            ) {
+                snapshot.rawCargo[0x85] = frame.cargo
+                if let v = StatusDecoder.pumpVersionB(frame.cargo) {
+                    snapshot.pumpSoftwareName = v.softwareName
+                    snapshot.pumpModelNumber = v.modelNumber
+                    snapshot.pumpSerialNumber = v.serialNumber
+                    snapshot.pumpRevision = v.pumpRevision
+                }
+            }
+        }
 
         // 以下每条都是「先问、再解析、并留下原始字节」。
         // 解析交给 StatusDecoder，偏移量在那里有抓包向量对上，这里只负责搬运。
