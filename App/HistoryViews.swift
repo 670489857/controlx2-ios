@@ -14,12 +14,16 @@ struct HistoryEvent: Identifiable, Equatable {
         case loopHold   // 闭环这一拍被拦下
     }
 
+    /// 这条记录是谁写的。本机 = 在这台手机上按下去的；Nightscout = 从 NS treatments 读来的
+    enum Source: Equatable { case local, nightscout }
+
     let id: String
     let date: Date
     let kind: Kind
     /// 剂量（U）或碳水（g）
     let amount: Double
     let detail: String
+    var source: Source = .local
 
     var symbol: String {
         switch kind {
@@ -41,7 +45,10 @@ struct HistoryEvent: Identifiable, Equatable {
 
     var title: String {
         switch kind {
-        case .bolus: return String(format: "大剂量 %.2f U", amount)
+        case .bolus:
+            return source == .nightscout
+                ? String(format: "NS 注射 %.2f U", amount)
+                : String(format: "大剂量 %.2f U", amount)
         case .carbs: return String(format: "碳水 %.0f g", amount)
         case .loopDose: return String(format: "闭环微剂量 %.2f U", amount)
         case .loopHold: return "闭环未发针"
@@ -69,15 +76,61 @@ extension AppModel {
                                          date: t.date,
                                          kind: .bolus,
                                          amount: t.insulinUnits,
-                                         detail: t.eventType))
+                                         detail: t.eventType,
+                                         source: .nightscout))
             }
             if t.isCarbs {
                 list.append(HistoryEvent(id: "ns-\(t.id)-c",
                                          date: t.date,
                                          kind: .carbs,
                                          amount: t.carbGrams,
-                                         detail: t.eventType))
+                                         detail: t.eventType,
+                                         source: .nightscout))
             }
+        }
+        for r in loopRecords {
+            let key = "loop-\(r.timestamp.timeIntervalSince1970)"
+            if r.units > 0 {
+                list.append(HistoryEvent(id: key,
+                                         date: r.timestamp,
+                                         kind: .loopDose,
+                                         amount: r.units,
+                                         detail: r.accepted == true ? r.summary : "结果未知"))
+            } else if let hold = r.holdReason, hold != ClosedLoop.Hold.doseBelowStep.rawValue {
+                list.append(HistoryEvent(id: key,
+                                         date: r.timestamp,
+                                         kind: .loopHold,
+                                         amount: 0,
+                                         detail: r.summary))
+            }
+        }
+        return list.sorted { $0.date > $1.date }
+    }
+
+    /// 只画在曲线上的标记。
+    ///
+    /// 跟 `historyEvents` 不是一回事：Nightscout 的 treatments 里 insulin 字段是这台泵
+    /// 这段时间打进去的全部胰岛素，既有本机大剂量，也有泵自己的微剂量和别的 App 补的记录。
+    /// 把它们全画成三角，曲线看起来就是"我一小时打了十几针"——而其中大多数根本没经过这个 App。
+    /// 所以曲线上的针只认本机台账：大剂量台账 + 闭环台账。NS 的碳水照旧画，碳水不会看错。
+    var chartMarkers: [HistoryEvent] {
+        var list: [HistoryEvent] = []
+        for t in nsTreatments where !t.isIgnoredType && t.isCarbs {
+            list.append(HistoryEvent(id: "ns-\(t.id)-c",
+                                     date: t.date,
+                                     kind: .carbs,
+                                     amount: t.carbGrams,
+                                     detail: t.eventType,
+                                     source: .nightscout))
+        }
+        // 本机大剂量：ledger 只留 24 小时，正好覆盖最长的时间跨度
+        for r in ledger.records {
+            list.append(HistoryEvent(id: "local-bolus-\(r.at.timeIntervalSince1970)",
+                                     date: r.at,
+                                     kind: .bolus,
+                                     amount: r.units,
+                                     detail: "本机大剂量",
+                                     source: .local))
         }
         for r in loopRecords {
             let key = "loop-\(r.timestamp.timeIntervalSince1970)"
@@ -352,7 +405,7 @@ struct GlucoseTrendSection: View {
                 .tint(DS.accent)
 
                 GlucoseChartView(samples: model.chartSamples,
-                                 markers: model.historyEvents,
+                                 markers: model.chartMarkers,
                                  windowMinutes: Double(model.chartWindowHours * 60),
                                  unit: model.effectiveGlucoseUnit)
 
@@ -363,6 +416,13 @@ struct GlucoseTrendSection: View {
                     Text("按住曲线左右拖动，可以看任意时间点的读数")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
+                }
+
+                if model.cgmSource == .nightscout {
+                    Text("曲线上的三角只画本机打的针，Nightscout 里的注射记录不画——那些多半是泵自己的微剂量")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 15 {
