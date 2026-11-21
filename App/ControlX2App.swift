@@ -1578,9 +1578,9 @@ struct DashboardView: View {
             VStack(spacing: DS.gap) {
                 ConnectionBanner()
                 hero
-                quickActions
                 metrics
-                GlucoseTrendSection()
+                quickActions
+                RecentRecordsSection()
                 PredictionCard()
                 AdviceCard()
                 controlIQCard
@@ -1619,7 +1619,7 @@ struct DashboardView: View {
                 Pill(text: model.cgmSource == .nightscout ? "Nightscout" : "泵 CGM",
                      tint: .secondary)
                 Spacer()
-                Text(model.glucoseSourceHint)
+                Text(model.glucoseSourceName)
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)

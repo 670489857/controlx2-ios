@@ -118,9 +118,6 @@ extension AppModel {
         return list.sorted { $0.date > $1.date }
     }
 
-    /// 曲线上的三角。口径跟记录列表一致——列表里没有的针，曲线上也不画。
-    var chartMarkers: [HistoryEvent] { historyEvents }
-
     // MARK: 后台静音保活
 
     func setBackgroundAudio(_ on: Bool) {
@@ -138,274 +135,20 @@ extension AppModel {
 
 // MARK: - 曲线
 
-/// 血糖曲线 + 事件标记。用 Canvas 画，避免引入图表库。
+/// 首页的最近记录。
 ///
-/// 纵轴固定 40–350 mg/dL：如果按数据自适应，同一段血糖在两次打开之间会"跳形状"，
-/// 读数本身的绝对值反而更难比较。
-struct GlucoseChartView: View {
-
-    let samples: [GlucoseSample]
-    let markers: [HistoryEvent]
-    var windowMinutes: Double = 180
-    /// 显示单位（只影响纵轴标签，不影响绘制坐标——坐标永远是 mg/dL）
-    var unit: GlucoseDisplayUnit = .mgdl
-
-    /// 拖动时被按住的那个点。nil = 没在拖，曲线回到"只看形状"的状态
-    @State private var scrubIndex: Int?
-
-    private let low: Double = 40
-    private let high: Double = 350
-
-    private var unitLabel: String { unit == .mmol ? "mmol/L" : "mg/dL" }
-
-    private func valueText(_ mgdl: Int) -> String {
-        unit == .mmol
-            ? String(format: "%.1f", Double(mgdl) / 18.0182)
-            : "\(mgdl)"
-    }
-
-    private func visible(_ now: Date) -> [GlucoseSample] {
-        let start = now.addingTimeInterval(-windowMinutes * 60)
-        return samples.filter { $0.timestamp >= start }
-    }
-
-    var body: some View {
-        GeometryReader { geo in
-            ZStack(alignment: .topLeading) {
-                Canvas { context, size in
-                    let now = Date()
-                    let start = now.addingTimeInterval(-windowMinutes * 60)
-                    let plot = CGRect(x: 26,
-                                      y: 12,
-                                      width: max(1, size.width - 26 - 12),
-                                      height: max(1, size.height - 12 - 22))
-
-                    func y(_ value: Double) -> CGFloat {
-                        plot.maxY - CGFloat((value - low) / (high - low)) * plot.height
-                    }
-                    func x(_ date: Date) -> CGFloat {
-                        plot.minX + CGFloat(date.timeIntervalSince(start) / (windowMinutes * 60)) * plot.width
-                    }
-
-                    // 目标带参考线：70 / 180 mg/dL
-                    for value in [70.0, 180.0] {
-                        var line = Path()
-                        line.move(to: CGPoint(x: plot.minX, y: y(value)))
-                        line.addLine(to: CGPoint(x: plot.maxX, y: y(value)))
-                        context.stroke(line, with: .color(Color.secondary.opacity(0.35)),
-                                       style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
-                    }
-
-                    // 纵轴刻度
-                    for value in [70.0, 180.0, 250.0] {
-                        let label = unit == .mmol
-                            ? String(format: "%.1f", value / 18.0182)
-                            : String(format: "%.0f", value)
-                        context.draw(Text(label).font(.system(size: 9)).foregroundColor(Color.secondary),
-                                     at: CGPoint(x: plot.minX - 8, y: y(value)), anchor: .trailing)
-                    }
-
-                    let shown = visible(now)
-
-                    // 曲线
-                    if shown.count >= 2 {
-                        var path = Path()
-                        path.move(to: CGPoint(x: x(shown[0].timestamp), y: y(Double(shown[0].mgdl))))
-                        for s in shown.dropFirst() {
-                            path.addLine(to: CGPoint(x: x(s.timestamp), y: y(Double(s.mgdl))))
-                        }
-                        context.stroke(path, with: .color(Color.green.opacity(0.85)), lineWidth: 1.5)
-                    }
-                    for s in shown {
-                        let r: CGFloat = 2.4
-                        let rect = CGRect(x: x(s.timestamp) - r, y: y(Double(s.mgdl)) - r,
-                                          width: r * 2, height: r * 2)
-                        context.fill(Path(ellipseIn: rect), with: .color(Color.green.opacity(0.75)))
-                    }
-
-                    // 事件标记：三角 + 数值，画在对应时间的曲线上。
-                    // 同一条曲线上一串追加针常挤在一分钟里，标签会叠成一团文字——这里按像素间距丢标签，只留三角
-                    var lastLabelX: CGFloat = -.greatestFiniteMagnitude
-                    for m in markers where m.date >= start && m.kind != .loopHold {
-                        let px = x(m.date)
-                        let bgValue = nearestValue(to: m.date, in: shown) ?? 180
-                        let py = y(bgValue)
-                        let color: Color = m.kind == .carbs ? .orange : (m.kind == .bolus ? .blue : .green)
-
-                        var tri = Path()
-                        tri.move(to: CGPoint(x: px, y: py - 6))
-                        tri.addLine(to: CGPoint(x: px - 4.5, y: py - 14))
-                        tri.addLine(to: CGPoint(x: px + 4.5, y: py - 14))
-                        tri.closeSubpath()
-                        context.fill(tri, with: .color(color))
-
-                        guard px - lastLabelX >= 26 else { continue }
-                        lastLabelX = px
-                        context.draw(Text(m.shortLabel).font(.system(size: 9, weight: .semibold)).foregroundColor(color),
-                                     at: CGPoint(x: px, y: py - 22), anchor: .bottom)
-                    }
-
-                    // 时间轴：起始、中点、现在
-                    let formatter = DateFormatter()
-                    formatter.dateFormat = "HH:mm"
-                    for fraction in [0.0, 0.5, 1.0] {
-                        let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
-                        let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
-                        context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
-                                     at: CGPoint(x: x(date), y: plot.maxY + 10))
-                    }
-
-                    // 拖动指示：竖线 + 高亮那个点。
-                    // 竖线用虚线而不是实线——实线会被误读成"现在是这个值"。
-                    if let index = scrubIndex, shown.indices.contains(index) {
-                        let s = shown[index]
-                        let px = x(s.timestamp)
-                        let py = y(Double(s.mgdl))
-
-                        var rule = Path()
-                        rule.move(to: CGPoint(x: px, y: plot.minY))
-                        rule.addLine(to: CGPoint(x: px, y: plot.maxY))
-                        context.stroke(rule, with: .color(Color.primary.opacity(0.35)),
-                                       style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-
-                        context.fill(Path(ellipseIn: CGRect(x: px - 7, y: py - 7, width: 14, height: 14)),
-                                     with: .color(Theme.glucose(Double(s.mgdl))))
-                        context.stroke(Path(ellipseIn: CGRect(x: px - 3.5, y: py - 3.5, width: 7, height: 7)),
-                                       with: .color(.white), lineWidth: 1.5)
-                    }
-                }
-                .contentShape(Rectangle())
-                .simultaneousGesture(
-                    // 只处理横向拖动：竖向留给外层的 ScrollView，否则整页会滚不动
-                    DragGesture(minimumDistance: 0)
-                        .onChanged { drag in
-                            guard abs(drag.translation.width) >= abs(drag.translation.height) else { return }
-                            let plotMinX: CGFloat = 26
-                            let plotMaxX = max(27, geo.size.width - 12)
-                            let width = plotMaxX - plotMinX
-                            let px = min(max(drag.location.x, plotMinX), plotMaxX)
-                            let start = Date().addingTimeInterval(-windowMinutes * 60)
-                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * windowMinutes * 60)
-                            let shown = visible(Date())
-                            if let index = nearestIndex(to: target, in: shown) {
-                                scrubIndex = index
-                            }
-                        }
-                        .onEnded { _ in
-                            scrubIndex = nil
-                        }
-                )
-
-                if let index = scrubIndex {
-                    let shown = visible(Date())
-                    if shown.indices.contains(index) {
-                        let s = shown[index]
-                        scrubBubble(sample: s, size: geo.size, now: Date())
-                    }
-                }
-            }
-        }
-        .frame(height: 168)
-    }
-
-    /// 小气泡：时间 + 读数。横向位置跟着手指走，但贴边时向内收，
-    /// 不让文字跑出卡片。
-    private func scrubBubble(sample: GlucoseSample, size: CGSize, now: Date) -> some View {
-        let plotMinX: CGFloat = 26
-        let plotMaxX = max(27, size.width - 12)
-        let start = now.addingTimeInterval(-windowMinutes * 60)
-        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (windowMinutes * 60))
-        let rawX = plotMinX + ratio * (plotMaxX - plotMinX)
-        let bubbleWidth: CGFloat = 118
-        let clampedX = min(max(rawX, bubbleWidth / 2 + 2), size.width - bubbleWidth / 2 - 2)
-
-        let time = sample.timestamp.formatted(date: .omitted, time: .shortened)
-        return VStack(spacing: 1) {
-            Text("\(valueText(sample.mgdl)) \(unitLabel)")
-                .font(.system(size: 12, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-            Text(time)
-                .font(.system(size: 9))
-                .opacity(0.7)
-        }
-        .foregroundStyle(.white)
-        .frame(width: bubbleWidth)
-        .padding(.vertical, 5)
-        .background(Color.primary.opacity(0.82), in: Capsule())
-        .position(x: clampedX, y: 22)
-        .allowsHitTesting(false)
-    }
-
-    private func nearestIndex(to date: Date, in list: [GlucoseSample]) -> Int? {
-        guard !list.isEmpty else { return nil }
-        var best = 0
-        var bestGap = Double.greatestFiniteMagnitude
-        for (index, s) in list.enumerated() {
-            let gap = abs(s.timestamp.timeIntervalSince(date))
-            if gap < bestGap { bestGap = gap; best = index }
-        }
-        // 拖到离最近一个点太远的地方就不显示：否则空白处会吸附到一个很远的值，看着像"这个时刻有数"
-        return bestGap <= 15 * 60 ? best : nil
-    }
-
-    private func nearestValue(to date: Date, in samples: [GlucoseSample]) -> Double? {
-        guard let index = nearestIndex(to: date, in: samples) else { return nil }
-        return Double(samples[index].mgdl)
-    }
-}
-
-/// 首页血糖下方的整块：曲线 + 最近记录。
-///
-/// 曲线跨度的入口只留这里一个分段控件。之前标题右侧还挂过一个同名菜单，
-/// 两个控件指向同一个状态，本质是同一个东西画了两遍。
-struct GlucoseTrendSection: View {
+/// 曲线那一块已经从首页拿掉了：能拖能看，但它占掉一屏，而此刻真正要看的数在主卡里。
+/// 历史留在「记录」页，首页只留最近几条，翻得到就行。
+struct RecentRecordsSection: View {
     @EnvironmentObject var model: AppModel
 
     var body: some View {
-        Card(title: "血糖曲线", subtitle: nil, padding: 18) {
+        Card(title: "最近记录", subtitle: nil, padding: 18) {
             VStack(alignment: .leading, spacing: 12) {
-                Picker("时间跨度", selection: Binding(get: { model.chartWindowHours },
-                                                    set: { model.setChartWindow($0) })) {
-                    Text("3 小时").tag(3)
-                    Text("6 小时").tag(6)
-                    Text("12 小时").tag(12)
-                    Text("24 小时").tag(24)
-                }
-                .pickerStyle(.segmented)
-                .tint(DS.accent)
-
-                GlucoseChartView(samples: model.chartSamples,
-                                 markers: model.chartMarkers,
-                                 windowMinutes: Double(model.chartWindowHours * 60),
-                                 unit: model.effectiveGlucoseUnit)
-
-                if model.chartSamples.isEmpty {
-                    Text("还没有采样。Nightscout 需要先拉一次；泵来源需要 CGM 连上。")
-                        .font(.caption).foregroundStyle(.secondary)
-                } else {
-                    Text("按住曲线左右拖动，可以看任意时间点的读数")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                }
-
-                if model.cgmSource == .nightscout {
-                    Text("曲线上的三角只画本机打的针，Nightscout 里的注射记录不画——那些多半是泵自己的微剂量")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                if model.cgmSource == .nightscout, let age = model.nsAgeMinutes, age > 15 {
-                    Label("Nightscout 已经 \(Int(age)) 分钟没更新", systemImage: "exclamationmark.circle")
-                        .font(.caption)
-                        .foregroundStyle(DS.warn)
-                }
-
-                RowRule(leading: 0).padding(.top, 2)
-
                 HStack {
-                    Text("最近记录")
-                        .font(.system(size: 13, weight: .semibold))
+                    Text("本机打的针与闭环")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
                     Spacer()
                     Text("共 \(model.historyEvents.count) 条")
                         .font(.system(size: 11))
@@ -413,15 +156,29 @@ struct GlucoseTrendSection: View {
                 }
 
                 if model.historyEvents.isEmpty {
-                    Text("还没有记录。本机打的针、闭环的每一针会出现在这里；Nightscout 只往里补碳水。")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("还没有记录。本机打的针、闭环的每一针会汇总到这里。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 } else {
-                    VStack(spacing: 12) {
-                        ForEach(Array(model.historyEvents.prefix(4))) { event in
+                    VStack(spacing: 13) {
+                        ForEach(Array(model.historyEvents.prefix(5))) { event in
                             HistoryRow(event: event)
                         }
                     }
                 }
+
+                NavigationLink { HistoryView() } label: {
+                    HStack(spacing: 4) {
+                        Text("全部记录")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(DS.accent)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 2)
             }
         }
     }
