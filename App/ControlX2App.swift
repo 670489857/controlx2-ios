@@ -1865,19 +1865,17 @@ struct DashboardView: View {
 
                 if !model.trendSymbol.isEmpty {
                     Image(systemName: model.trendSymbol)
-                        .font(.system(size: 26, weight: .semibold))
+                        .font(.system(size: 34, weight: .semibold))
                         .foregroundStyle(tint.opacity(0.85))
                 }
 
-                // 闭环状态圈：绿=在跑，红=没跑。趋势箭头在左，状态圈在右。
+                // 趋势箭头跟在数字后面，状态圈推到卡片右缘，中间留白由 Spacer 吃掉。
+                Spacer(minLength: 14)
                 Circle()
                     .strokeBorder(model.loopArmed ? Color.green : Color.red,
                                   lineWidth: 5)
-                    .frame(width: 40, height: 40)
-                    .padding(.leading, 8)
+                    .frame(width: 44, height: 44)
                     .accessibilityLabel(model.loopArmed ? "闭环运行中" : "闭环未启动")
-
-                Spacer(minLength: 0)
             }
             .padding(.top, 2)
 
@@ -2059,7 +2057,7 @@ struct ConnectionStatusBar: View {
     private var title: String {
         switch model.linkPhase {
         case .ready:
-            return model.connectedName.map { "已连接 \($0)" } ?? "泵已连接"
+            return "已连接 T泵"
         case .connecting: return "正在连接泵…"
         case .discovering: return "正在发现服务…"
         case .waitingForPairing: return "等待系统配对"
@@ -2071,7 +2069,7 @@ struct ConnectionStatusBar: View {
 
     private var detail: String {
         if model.linkPhase.isReady {
-            let api = model.apiVersion.map { "API \($0)" } ?? "API 未读取"
+            let api = model.apiVersion.map { "接口 v\($0)" } ?? "接口未读取"
             return api + " · 更新 " + model.lastUpdated
         }
         return model.linkPhase.text
@@ -3140,7 +3138,6 @@ struct BasalProfileView: View {
 /// 所以它的形状是：先把边界写在最上面，再给两个分开的开关，最后才是参数和账。
 struct ClosedLoopView: View {
     @EnvironmentObject var model: AppModel
-    @State private var showLiveConfirm = false
     @State private var showClearConfirm = false
     @State private var showBoundary = false
 
@@ -3170,6 +3167,15 @@ struct ClosedLoopView: View {
         return model.loopLiveDosing ? DS.warn : DS.ok
     }
 
+    /// 一个入口：先自动自检，过了就直接按真发形态开。
+    /// 自检不过时 armLoop 会把缺哪一条写出来，不再弹第二个确认框。
+    private func startClosedLoop() {
+        Task {
+            await model.runTakeoverCheck()
+            model.armLoop(live: true)
+        }
+    }
+
     var body: some View {
         ScrollView {
             VStack(spacing: DS.gap) {
@@ -3196,19 +3202,7 @@ struct ClosedLoopView: View {
                 Task { await model.runTakeoverCheck() }
             }
         }
-        .confirmationDialog("闭环怎么跑？", isPresented: $showLiveConfirm,
-                            titleVisibility: .visible) {
-            Button("开始演练（不发针）") { model.armLoop(live: false) }
-            Button("开始真发", role: .destructive) {
-                Task {
-                    await model.runTakeoverCheck()
-                    model.armLoop(live: true)
-                }
-            }
-            Button("取消", role: .cancel) {}
-        } message: {
-            Text("每 5 分钟最多一针，单针上限 \(String(format: "%.2f", model.loopSettings.maxSingleMicroBolus)) U，每小时上限 \(String(format: "%.2f", model.loopSettings.maxHourlyMicroBolus)) U。打出去的收不回来，血糖低了软件只能停手，不能把胰岛素抽回去。")
-        }
+
     }
 
     // MARK: 状态与开关
@@ -3289,32 +3283,8 @@ struct ClosedLoopView: View {
                         model.disarmLoop(note: "你手动停止了闭环")
                     }
                 } else {
-                    HStack(spacing: 10) {
-                        Button {
-                            model.armLoop(live: false)
-                        } label: {
-                            Text("开始演练")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(DS.accent)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 50)
-                                .background(DS.accent.opacity(0.10),
-                                            in: RoundedRectangle(cornerRadius: DS.radiusInner, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
-
-                        Button {
-                            showLiveConfirm = true
-                        } label: {
-                            Text("真发")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundStyle(.white)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 50)
-                                .background(DS.danger,
-                                            in: RoundedRectangle(cornerRadius: DS.radiusInner, style: .continuous))
-                        }
-                        .buttonStyle(.plain)
+                    PrimaryButton(title: "开启闭环", systemImage: "play.fill") {
+                        startClosedLoop()
                     }
                 }
             }
@@ -3354,7 +3324,7 @@ struct ClosedLoopView: View {
             VStack(spacing: 0) {
                 Toggle(isOn: Binding(get: { model.loopArmed },
                                      set: { on in
-                                         if on { showLiveConfirm = true }
+                                         if on { startClosedLoop() }
                                          else { model.disarmLoop(note: "你手动停止了闭环") }
                                      })) {
                     Text("闭环总开关").font(.system(size: 15, weight: .medium))

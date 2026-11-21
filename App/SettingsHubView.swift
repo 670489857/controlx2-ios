@@ -198,8 +198,8 @@ struct LoopAdvancedView: View {
     var body: some View {
         Form {
             Section {
-                glucoseRow("目标上限", $model.loopSettings.targetHigh)
                 glucoseRow("目标下限", $model.loopSettings.targetLow)
+                glucoseRow("目标上限", $model.loopSettings.targetHigh)
                 isfRow
                 row("胰岛素作用时长（分钟）", $model.loopSettings.insulinDurationMinutes)
                 row("单针上限 U", $model.loopSettings.maxSingleMicroBolus, step: 0.05)

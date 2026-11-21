@@ -37,9 +37,12 @@ extension AppModel {
         // 小于 5 的 ISF 不可能是 mg/dL/U，按 mmol 补一次换算再落盘。
         if s.isf > 0, s.isf < 5 {
             s.isf = (s.isf * 18.0182 * 10).rounded() / 10
-            if let fixed = try? JSONEncoder().encode(s) {
-                UserDefaults.standard.set(fixed, forKey: loopSettingsKey)
-            }
+        }
+        // 读的时候顺手把「上下限写反」「ISF 是 mmol 却按 mg 存」这类旧数据
+        // 以纠正后的形态写回去。否则下一次保存会拿纠正后的值和旧字节比，
+        // 把一次纯格式迁移误判成「用户改了参数」，平白停掉闭环。
+        if let fixed = try? JSONEncoder().encode(s) {
+            UserDefaults.standard.set(fixed, forKey: loopSettingsKey)
         }
         return s
     }

@@ -148,9 +148,6 @@ struct GlucoseChartView: View {
     let samples: [GlucoseSample]
     let markers: [HistoryEvent]
     var windowMinutes: Double = 180
-    /// 预测点（从"现在"起每 5 分钟一个）。传进来就把虚线接到曲线右边，
-    /// 不再单独占一张卡。
-    var prediction: [PredictionPoint] = []
     /// 显示单位（只影响纵轴标签，不影响绘制坐标——坐标永远是 mg/dL）
     var unit: GlucoseDisplayUnit = .mgdl
 
@@ -173,10 +170,6 @@ struct GlucoseChartView: View {
         return samples.filter { $0.timestamp >= start }
     }
 
-    /// 有预测时把横轴往右延长 4 小时；没有就不占地方。
-    private var futureMinutes: Double { prediction.isEmpty ? 0 : 240 }
-    private var domainMinutes: Double { windowMinutes + futureMinutes }
-
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
@@ -192,7 +185,7 @@ struct GlucoseChartView: View {
                         plot.maxY - CGFloat((value - low) / (high - low)) * plot.height
                     }
                     func x(_ date: Date) -> CGFloat {
-                        plot.minX + CGFloat(date.timeIntervalSince(start) / (domainMinutes * 60)) * plot.width
+                        plot.minX + CGFloat(date.timeIntervalSince(start) / (windowMinutes * 60)) * plot.width
                     }
 
                     // 目标带参考线：70 / 180 mg/dL
@@ -253,36 +246,14 @@ struct GlucoseChartView: View {
                                      at: CGPoint(x: px, y: py - 22), anchor: .bottom)
                     }
 
-                    // 时间轴：起点、现在、右端（有预测时是 +4 小时）
+                    // 时间轴：起点、中点、现在。曲线只铺历史，不给未来留空。
                     let formatter = DateFormatter()
                     formatter.dateFormat = "HH:mm"
-                    let marks: [(Date, String)] = futureMinutes > 0
-                        ? [(start, formatter.string(from: start)),
-                           (now, "现在"),
-                           (now.addingTimeInterval(futureMinutes * 60), "+4h")]
-                        : [(start, formatter.string(from: start)),
-                           (start.addingTimeInterval(windowMinutes * 60 / 2), formatter.string(from: start.addingTimeInterval(windowMinutes * 30))),
-                           (now, "现在")]
-                    for (date, text) in marks {
+                    for fraction in [0.0, 0.5, 1.0] {
+                        let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
+                        let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
                         context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
                                      at: CGPoint(x: x(date), y: plot.maxY + 10))
-                    }
-
-                    // 预测：从"现在"接出去，橙色虚线。中间那条竖线是分界，别让人以为虚线也是实测。
-                    if futureMinutes > 0, prediction.count >= 2 {
-                        var rule = Path()
-                        rule.move(to: CGPoint(x: x(now), y: plot.minY))
-                        rule.addLine(to: CGPoint(x: x(now), y: plot.maxY))
-                        context.stroke(rule, with: .color(Color.primary.opacity(0.18)),
-                                       style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
-
-                        var path = Path()
-                        path.move(to: CGPoint(x: x(prediction[0].date), y: y(prediction[0].mgdl)))
-                        for point in prediction.dropFirst() {
-                            path.addLine(to: CGPoint(x: x(point.date), y: y(point.mgdl)))
-                        }
-                        context.stroke(path, with: .color(Color.orange.opacity(0.9)),
-                                       style: StrokeStyle(lineWidth: 1.6, dash: [5, 3]))
                     }
 
                     // 拖动指示：竖线 + 高亮那个点。
@@ -315,7 +286,7 @@ struct GlucoseChartView: View {
                             let width = plotMaxX - plotMinX
                             let px = min(max(drag.location.x, plotMinX), plotMaxX)
                             let start = Date().addingTimeInterval(-windowMinutes * 60)
-                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * domainMinutes * 60)
+                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * windowMinutes * 60)
                             let shown = visible(Date())
                             if let index = nearestIndex(to: target, in: shown) {
                                 scrubIndex = index
@@ -344,7 +315,7 @@ struct GlucoseChartView: View {
         let plotMinX: CGFloat = 26
         let plotMaxX = max(27, size.width - 12)
         let start = now.addingTimeInterval(-windowMinutes * 60)
-        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (domainMinutes * 60))
+        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (windowMinutes * 60))
         let rawX = plotMinX + ratio * (plotMaxX - plotMinX)
         let bubbleWidth: CGFloat = 118
         let clampedX = min(max(rawX, bubbleWidth / 2 + 2), size.width - bubbleWidth / 2 - 2)
@@ -409,7 +380,6 @@ struct GlucoseTrendSection: View {
                 GlucoseChartView(samples: model.chartSamples,
                                  markers: model.chartMarkers,
                                  windowMinutes: Double(model.chartWindowHours * 60),
-                                 prediction: model.prediction?.points ?? [],
                                  unit: model.effectiveGlucoseUnit)
 
                 if model.iobUnavailable {
