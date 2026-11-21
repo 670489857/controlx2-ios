@@ -1597,12 +1597,6 @@ struct PairingView: View {
 struct DashboardView: View {
     @EnvironmentObject var model: AppModel
 
-    /// 主卡里的迷你趋势线用最近 4 小时的点，不用当前窗口：
-    /// 它只是"刚才在往哪走"的一个感觉，不承担读数职责
-    private var sparkValues: [Double] {
-        model.samples.suffix(48).map { Double($0.mgdl) }
-    }
-
     private var tint: Color { DS.glucoseTint(model.glucoseValue.map { Double($0) }) }
 
     private var batteryTint: Color {
@@ -1616,6 +1610,7 @@ struct DashboardView: View {
         ScrollView {
             VStack(spacing: DS.gap) {
                 ConnectionBanner()
+                hero
                 metrics
                 quickActions
                 GlucoseTrendSection()
@@ -1687,13 +1682,6 @@ struct DashboardView: View {
                 .font(.system(size: 15, weight: .medium, design: .rounded))
                 .foregroundStyle(.secondary)
                 .padding(.top, -4)
-
-            if sparkValues.count > 1 {
-                MiniSpark(values: sparkValues)
-                    .stroke(tint.opacity(0.55), lineWidth: 1.8)
-                    .frame(height: 44)
-                    .padding(.top, 16)
-            }
 
             // 数字看着还在，其实已经过期——这是最容易让人误判的一种状态。
             // 超过 10 分钟就直接在卡片里说出来，而不是让人自己去读那行小字。
