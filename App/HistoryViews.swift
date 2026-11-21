@@ -173,6 +173,10 @@ struct GlucoseChartView: View {
         return samples.filter { $0.timestamp >= start }
     }
 
+    /// 有预测时把横轴往右延长 4 小时；没有就不占地方。
+    private var futureMinutes: Double { prediction.isEmpty ? 0 : 240 }
+    private var domainMinutes: Double { windowMinutes + futureMinutes }
+
     var body: some View {
         GeometryReader { geo in
             ZStack(alignment: .topLeading) {
