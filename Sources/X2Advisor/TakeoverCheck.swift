@@ -183,7 +183,7 @@ public struct TakeoverCheck {
         } else {
             items.append(Item(id: "maxbolus",
                               title: "读不到泵单次上限",
-                              detail: "刷新一次泵状态再自检",
+                              detail: "自检会自己读一次；仍读不到，去「基础率计划」页手动读，或检查链路",
                               severity: .blocker,
                               passed: false))
         }

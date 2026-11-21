@@ -22,6 +22,10 @@ struct ControlX2App: App {
         .onChange(of: scenePhase) { phase in
             // 从后台回来也一样。iOS 会让 App 在挂起期间丢掉链路，
             // 回来时如果不主动补一次，界面就停在「未连接」等用户点。
+            if phase == .background {
+                // 输入框里的值要等焦点离开才写回 binding，退后台时先落一次盘
+                model.saveLoopSettings()
+            }
             if phase == .active {
                 model.autoConnectIfPossible()
                 // 后台期间 NS 拉不到数（除非保活开着），回前台必须立刻补一次，
@@ -315,6 +319,8 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
         shadowLog = ShadowLog(fileURL: docs.appendingPathComponent("shadow.jsonl"))
         loopLedger = LoopLedger(fileURL: docs.appendingPathComponent("loop.jsonl"))
         advisorSettings = Self.loadSettings()
+        // 之前只写了 save、没写 load：改完的参数每次重开都被默认值盖掉。
+        loopSettings = Self.loadLoopSettings()
         samples = glucoseStore.recent(minutes: 180)
         chartSamples = glucoseStore.recent(minutes: (UserDefaults.standard.object(forKey: "chartWindowHours") as? Int ?? 3) * 60)
         shadowCount = shadowLog.summarize().total

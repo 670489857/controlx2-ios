@@ -340,3 +340,34 @@ final class ClosedLoopTests: XCTestCase {
         XCTAssertNotEqual(decision.hold, .reservoirLow)
     }
 }
+
+extension ClosedLoopTests {
+    /// 老配置（缺 maxCorrectionMultipleOfBasal 这些后加的键）要能解出来，不能整条丢回默认。
+    func testLegacyJSONKeepsValues() throws {
+        let legacy = """
+        {"targetLow":100,"targetHigh":130,"isf":45,"insulinDurationMinutes":300,
+         "maxSingleMicroBolus":0.5,"maxHourlyMicroBolus":5,"maxIobUnits":8,
+         "lowSuspendThreshold":80,"predictedLowWindowMinutes":30,"maxFallingRate":2,
+         "maxCgmAgeMinutes":12,"tickSeconds":300,"minStepUnits":0.05}
+        """.data(using: .utf8)!
+        let s = try JSONDecoder().decode(ClosedLoop.Settings.self, from: legacy)
+
+        XCTAssertEqual(s.targetLow, 100)
+        XCTAssertEqual(s.maxSingleMicroBolus, 0.5)
+        XCTAssertEqual(s.maxHourlyMicroBolus, 5)
+        XCTAssertEqual(s.maxIobUnits, 8)
+        // 缺的键回落到默认，而不是让整条解码失败
+        XCTAssertEqual(s.maxCorrectionMultipleOfBasal, 4.0)
+        XCTAssertEqual(s.pumpBasalUnitsPerHour, 0)
+    }
+
+    func testNewFieldsRoundTrip() throws {
+        var s = ClosedLoop.Settings()
+        s.maxCorrectionMultipleOfBasal = 12
+        s.pumpBasalUnitsPerHour = 0.25
+        let data = try JSONEncoder().encode(s)
+        let back = try JSONDecoder().decode(ClosedLoop.Settings.self, from: data)
+        XCTAssertEqual(back.maxCorrectionMultipleOfBasal, 12)
+        XCTAssertEqual(back.pumpBasalUnitsPerHour, 0.25)
+    }
+}

@@ -84,6 +84,39 @@ public enum ClosedLoop {
 
         public init() {}
 
+        private enum CodingKeys: String, CodingKey {
+            case targetLow, targetHigh, isf, insulinDurationMinutes
+            case maxSingleMicroBolus, maxHourlyMicroBolus, maxIobUnits, lowSuspendThreshold
+            case predictedLowWindowMinutes, maxFallingRate, maxCgmAgeMinutes, tickSeconds, minStepUnits
+            case maxCorrectionMultipleOfBasal, pumpBasalUnitsPerHour
+            case weightKg, totalDailyInsulinUnits, maxDailyUnits
+        }
+
+        /// 宽容解码：老配置缺哪个字段就用哪个字段的默认值。
+        /// 合成的 Codable 只要少一个键就整条失败，结果是"升级完 App，之前调好的参数全没了"。
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            let d = Settings()
+            targetLow = try c.decodeIfPresent(Double.self, forKey: .targetLow) ?? d.targetLow
+            targetHigh = try c.decodeIfPresent(Double.self, forKey: .targetHigh) ?? d.targetHigh
+            isf = try c.decodeIfPresent(Double.self, forKey: .isf) ?? d.isf
+            insulinDurationMinutes = try c.decodeIfPresent(Double.self, forKey: .insulinDurationMinutes) ?? d.insulinDurationMinutes
+            maxSingleMicroBolus = try c.decodeIfPresent(Double.self, forKey: .maxSingleMicroBolus) ?? d.maxSingleMicroBolus
+            maxHourlyMicroBolus = try c.decodeIfPresent(Double.self, forKey: .maxHourlyMicroBolus) ?? d.maxHourlyMicroBolus
+            maxIobUnits = try c.decodeIfPresent(Double.self, forKey: .maxIobUnits) ?? d.maxIobUnits
+            lowSuspendThreshold = try c.decodeIfPresent(Double.self, forKey: .lowSuspendThreshold) ?? d.lowSuspendThreshold
+            predictedLowWindowMinutes = try c.decodeIfPresent(Int.self, forKey: .predictedLowWindowMinutes) ?? d.predictedLowWindowMinutes
+            maxFallingRate = try c.decodeIfPresent(Double.self, forKey: .maxFallingRate) ?? d.maxFallingRate
+            maxCgmAgeMinutes = try c.decodeIfPresent(Double.self, forKey: .maxCgmAgeMinutes) ?? d.maxCgmAgeMinutes
+            tickSeconds = try c.decodeIfPresent(Double.self, forKey: .tickSeconds) ?? d.tickSeconds
+            minStepUnits = try c.decodeIfPresent(Double.self, forKey: .minStepUnits) ?? d.minStepUnits
+            maxCorrectionMultipleOfBasal = try c.decodeIfPresent(Double.self, forKey: .maxCorrectionMultipleOfBasal) ?? d.maxCorrectionMultipleOfBasal
+            pumpBasalUnitsPerHour = try c.decodeIfPresent(Double.self, forKey: .pumpBasalUnitsPerHour) ?? d.pumpBasalUnitsPerHour
+            weightKg = try c.decodeIfPresent(Double.self, forKey: .weightKg) ?? d.weightKg
+            totalDailyInsulinUnits = try c.decodeIfPresent(Double.self, forKey: .totalDailyInsulinUnits) ?? d.totalDailyInsulinUnits
+            maxDailyUnits = try c.decodeIfPresent(Double.self, forKey: .maxDailyUnits) ?? d.maxDailyUnits
+        }
+
         /// 参数合法性。返回 nil 表示可用；返回字符串就是不能启用的理由。
         /// 宁可整体不启用，也不要用半套参数跑——半套参数比默认值更危险。
         public var invalidReason: String? {

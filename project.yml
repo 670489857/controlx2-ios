@@ -31,7 +31,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app
         # 版本号的单一来源是仓库根目录的 VERSION 文件，CI 会校验两处一致后用
         # 它覆盖这里。本地直接开 Xcode 时这两个值就是兜底值。
-        MARKETING_VERSION: "0.9.8"
+        MARKETING_VERSION: "0.9.9"
         CURRENT_PROJECT_VERSION: "1"
         BUILD_GIT_SHA: "local"
         SWIFT_VERSION: "5.9"
@@ -72,7 +72,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: org.controlx2.app.LoopLiveActivity
-        MARKETING_VERSION: "0.9.8"
+        MARKETING_VERSION: "0.9.9"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1,2"

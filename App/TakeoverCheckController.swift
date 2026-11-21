@@ -55,6 +55,11 @@ extension AppModel {
             } catch {
                 loopError = "读泵状态失败，自检用的还是上次的数据：\(error)"
             }
+            // 泵的单次上限在基础率计划那条报文里。之前只有进过「基础率计划」页才读得到，
+            // 于是第一次自检永远卡在「读不到泵单次上限」——自检自己补读一次。
+            if basalProfile == nil {
+                basalProfile = try? await session.readBasalProfile()
+            }
         }
         await refreshFromSession()
         let snap = await session.snapshot
