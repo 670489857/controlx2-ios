@@ -299,6 +299,12 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     private var lastShadowAt: Date?
     /// 闭环定时任务。武装时启动，卸下武装立刻取消
     var loopTask: Task<Void, Never>?
+    /// 低血糖停手后等待回升的巡检任务
+    var loopLowRecoveryTask: Task<Void, Never>?
+    /// 正在等血糖回升、准备自动重新闭环
+    @Published var loopAutoResumePending = false
+    var loopAutoResumeWasLive = false
+    var loopRecoveryGoodTicks = 0
     /// 上一针是否还在推。推注没结束就叠下一针，是最容易出错的地方
     var loopPumpBusy = false
     /// 连续几拍血糖过低。两拍（10 分钟）就自动卸武装
@@ -1181,15 +1187,26 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     /// 每 2 秒读一次当前大剂量状态。连续三次读不到进行中的大剂量才算结束，
     /// 因为泵在受理后要先切状态，第一次读很可能还是旧的空值。
     private func pollBolus(bolusId: Int) async {
-        var emptyReads = 0
-        for _ in 0..<300 {
+        let requested = pendingBolus?.units ?? 0
+        // 小剂量几秒就推完，5 U 大概几分钟。给一个跟剂量相关的上限，
+        // 而不是一律 10 分钟——卡十分钟对 0.05 U 是完全没法解释的等待。
+        let deadline = Date().addingTimeInterval(min(600, max(90, requested * 90)))
+        var idleReads = 0
+
+        while Date() < deadline {
             try? await Task.sleep(for: .seconds(2))
             guard !Task.isCancelled else { return }
             guard let state = try? await session.readCurrentBolus() else { continue }
             activeBolus = state
-            let idle = state.bolusId == 0 || state.statusId == 0
-            emptyReads = idle ? emptyReads + 1 : 0
-            if emptyReads >= 3 {
+
+            // statusId 1/2 才是"泵还在推"。bolusId 为 0、或状态不是这两个，都算收工。
+            let stillDelivering = state.isDelivering && state.bolusId != 0
+            if stillDelivering {
+                idleReads = 0
+                continue
+            }
+            idleReads += 1
+            if idleReads >= 2 {
                 activeBolus = nil
                 bolusPhase = .done
                 try? await session.releaseBolusPermission(bolusId: bolusId)
@@ -1197,7 +1214,10 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
                 return
             }
         }
-        bolusMessage = "10 分钟内没等到结束。请到泵屏幕核对剩余量，不要凭界面判断。"
+
+        activeBolus = nil
+        bolusPhase = .done
+        bolusMessage = "等输注结束超时了。请到泵屏幕核对剩余量，台账按泵记录结算。"
         await settleBolus(bolusId: bolusId)
     }
 
@@ -1254,31 +1274,42 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
 
     /// 取消进行中的输注。取消是另一条签名报文，泵不认就只能在泵屏幕上按。
     func cancelActiveBolus() {
-        guard let id = activeBolus?.bolusId, id > 0 else {
-            bolusMessage = "没有正在进行的输注（泵没有报告 bolusId）"
+        // 泵经常在输完之后还把 bolusId 留成 0，这时「取消」应该告诉用户已经结束了，
+        // 而不是弹一句"没有正在进行的输注"让人以为按钮坏了。
+        let id = activeBolus?.bolusId ?? 0
+        let fallback = pendingBolus?.bolusId ?? 0
+        guard id > 0 || fallback > 0 else {
+            bolusMessage = "泵这边没有正在进行的输注，这一针已经结束或还没开始"
+            activeBolus = nil
+            bolusPhase = .done
             return
         }
+        let target = id > 0 ? id : fallback
         guard linkPhase.isReady else {
             bolusMessage = "链路已断，取消发不出去。立即在泵屏幕上按「取消」"
             return
         }
         bolusPhase = .cancelling
-        bolusMessage = "正在请求泵取消 bolusId=\(id)…"
+        bolusMessage = "正在请求泵取消 bolusId=\(target)…"
         Task {
             do {
-                let result = try await session.cancelBolus(bolusId: id)
+                let result = try await session.cancelBolus(bolusId: target)
                 if result.cancelled {
                     bolusPhase = .done
                     bolusMessage = "泵已取消，剩余剂量不会再进。已经进到体内的部分收不回来。"
                     activeBolus = nil
-                    await settleBolus(bolusId: id)
+                    await settleBolus(bolusId: target)
                 } else {
                     bolusPhase = .delivering
                     bolusMessage = "泵没有确认取消（status=\(result.status)，reason=\(result.reason)），立即在泵屏幕上按取消"
                 }
             } catch {
-                bolusPhase = .delivering
-                bolusMessage = "取消失败：\(error.localizedDescription)。立即在泵屏幕上按取消"
+                // 泵拒收取消报文，多半是这针已经结束了。把界面收回来，并按泵的记录结算，
+                // 不再让页面停在"正在输注 0.00 U"上。
+                bolusPhase = .done
+                activeBolus = nil
+                await settleBolus(bolusId: target)
+                bolusMessage = "泵没有接受取消（\(error.localizedDescription)）。如果泵屏幕还在推，去泵上按暂停；台账按泵当前记录结算。"
             }
         }
     }
@@ -1848,7 +1879,7 @@ struct DashboardView: View {
             NavigationLink { ClosedLoopView() } label: {
                 QuickAction(title: "闭环",
                             systemImage: "arrow.triangle.2.circlepath",
-                            caption: model.loopArmed ? (model.loopLiveDosing ? "真发中" : "演练中") : "未武装",
+                            caption: model.loopArmed ? (model.loopLiveDosing ? "闭环中" : "演练中") : "未闭环",
                             tint: model.loopArmed ? DS.ok : .secondary)
             }
             NavigationLink { HistoryView() } label: {
@@ -3060,11 +3091,14 @@ struct ClosedLoopView: View {
     }
 
     private var stateTitle: String {
-        guard model.loopArmed else { return "未启动" }
-        return model.loopLiveDosing ? "真发针运行中" : "演练中"
+        guard model.loopArmed else { return "未闭环" }
+        return model.loopLiveDosing ? "闭环中" : "演练中"
     }
 
     private var stateSubtitle: String {
+        if !model.loopArmed, model.loopAutoResumePending {
+            return "低血糖停手中。血糖回到 \(Int(model.loopSettings.lowSuspendThreshold)) mg/dL 以上并连续两拍确认后，会自动重新开始"
+        }
         guard model.loopArmed else { return "只显示血糖，不自动给药" }
         return model.loopLiveDosing
             ? "每 5 分钟最多一针，打出去收不回来"
@@ -3291,7 +3325,13 @@ struct ClosedLoopView: View {
     private var readoutsCard: some View {
         Card(title: "当前生效", padding: 18) {
             HStack(spacing: 0) {
-                MetricTile(title: "目标", value: String(format: "%.0f–%.0f", model.loopSettings.targetLow, model.loopSettings.targetHigh), note: "mg/dL")
+                let mmol = model.effectiveGlucoseUnit == .mmol
+                MetricTile(title: "目标",
+                           value: mmol
+                               ? String(format: "%.1f–%.1f", model.loopSettings.targetLow / 18.0182,
+                                        model.loopSettings.targetHigh / 18.0182)
+                               : String(format: "%.0f–%.0f", model.loopSettings.targetLow, model.loopSettings.targetHigh),
+                           note: mmol ? "mmol/L" : "mg/dL")
                 Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34).padding(.horizontal, 8)
                 MetricTile(title: "单针最大", value: String(format: "%.2f", model.loopSettings.maxSingleMicroBolus), note: "U")
                 Rectangle().fill(Color.primary.opacity(0.05)).frame(width: 0.8, height: 34).padding(.horizontal, 8)

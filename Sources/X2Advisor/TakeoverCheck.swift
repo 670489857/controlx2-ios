@@ -217,13 +217,14 @@ public struct TakeoverCheck {
                               passed: false))
         }
 
-        // NS 单路时，泵自己的低血糖报警不会响
+        // NS 单路：现在只有 App 里这一路血糖，泵侧本来就没有 CGM。
+        // 它是事实说明，不是需要逐条确认的警告——降到 info，不挡自检。
         if f.usingNightscout && !f.pumpHasCgm {
             items.append(Item(id: "singlecgm",
-                              title: "只有 Nightscout 一路血糖",
-                              detail: "泵侧没有 CGM，泵自身的低血糖报警不会响；这台手机是唯一报警源",
-                              severity: .warning,
-                              passed: false))
+                              title: "血糖只来自 Nightscout",
+                              detail: "泵侧没有 CGM，这台手机是唯一报警源；保持 App 后台运行",
+                              severity: .info,
+                              passed: true))
         }
 
         items.append(Item(id: "audio",

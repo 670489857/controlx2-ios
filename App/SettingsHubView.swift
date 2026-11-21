@@ -248,6 +248,14 @@ struct LoopAdvancedView: View {
             }
 
             Section {
+                Toggle("低血糖停手后自动重新闭环", isOn: $model.loopSettings.autoResumeAfterLow)
+            } header: {
+                Text("低血糖之后")
+            } footer: {
+                Text("停手后每 5 分钟读一次血糖，回到停止线以上并连续两拍确认，就按原来的形态重新开始（原来演练就还是演练，原来真发就还是真发）。")
+            }
+
+            Section {
                 row("泵自己在跑的基础率 U/h", $model.loopSettings.pumpBasalUnitsPerHour, step: 0.05)
                 Toggle("已确认泵的基础率已按上面的值设置", isOn: $model.loopZeroBasalConfirmed)
             } header: {

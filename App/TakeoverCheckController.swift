@@ -87,9 +87,6 @@ extension AppModel {
         guard let verified = takeoverVerifiedAt else {
             return "还没通过「接管自检」。先到闭环页的接管自检里逐条核对"
         }
-        if Date().timeIntervalSince(verified) > 30 * 60 {
-            return "接管自检已超过 30 分钟，泵的状态可能变了，重新自检一次"
-        }
         if let report = takeoverReport, !report.blockers.isEmpty {
             return "自检有未满足项：" + report.blockers.map(\.title).joined(separator: "、")
         }

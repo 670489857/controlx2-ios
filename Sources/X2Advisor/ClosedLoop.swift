@@ -82,6 +82,10 @@ public enum ClosedLoop {
         /// 24 小时内本 App 最多打多少 U。0 表示不限
         public var maxDailyUnits: Double = 0
 
+        /// 低血糖自动停手之后，血糖回到停止线以上，是否自动重新闭环。
+        /// 停手期间泵的基础率还在跑，回升后不补，血糖会一路往上飘。
+        public var autoResumeAfterLow: Bool = true
+
         public init() {}
 
         private enum CodingKeys: String, CodingKey {
@@ -90,6 +94,7 @@ public enum ClosedLoop {
             case predictedLowWindowMinutes, maxFallingRate, maxCgmAgeMinutes, tickSeconds, minStepUnits
             case maxCorrectionMultipleOfBasal, pumpBasalUnitsPerHour
             case weightKg, totalDailyInsulinUnits, maxDailyUnits
+            case autoResumeAfterLow
         }
 
         /// 宽容解码：老配置缺哪个字段就用哪个字段的默认值。
@@ -115,6 +120,7 @@ public enum ClosedLoop {
             weightKg = try c.decodeIfPresent(Double.self, forKey: .weightKg) ?? d.weightKg
             totalDailyInsulinUnits = try c.decodeIfPresent(Double.self, forKey: .totalDailyInsulinUnits) ?? d.totalDailyInsulinUnits
             maxDailyUnits = try c.decodeIfPresent(Double.self, forKey: .maxDailyUnits) ?? d.maxDailyUnits
+            autoResumeAfterLow = try c.decodeIfPresent(Bool.self, forKey: .autoResumeAfterLow) ?? d.autoResumeAfterLow
         }
 
         /// 参数合法性。返回 nil 表示可用；返回字符串就是不能启用的理由。

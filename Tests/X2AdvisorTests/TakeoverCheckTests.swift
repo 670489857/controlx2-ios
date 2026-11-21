@@ -95,13 +95,15 @@ final class TakeoverCheckTests: XCTestCase {
         XCTAssertTrue(TakeoverCheck.evaluate(f).blockers.contains { $0.id == "cgm" })
     }
 
-    func testNightscoutOnlyIsWarning() {
+    /// 只有 App 这一路血糖是现状说明，不该挡自检，也不该要求逐条确认。
+    func testNightscoutOnlyIsInfo() {
         var f = healthyFacts()
         f.usingNightscout = true
         f.pumpHasCgm = false
         let report = TakeoverCheck.evaluate(f)
-        XCTAssertTrue(report.warnings.contains { $0.id == "singlecgm" })
-        XCTAssertTrue(report.canProceed(warningsAcknowledged: true))
+        XCTAssertFalse(report.warnings.contains { $0.id == "singlecgm" })
+        XCTAssertTrue(report.items.contains { $0.id == "singlecgm" && $0.severity == .info })
+        XCTAssertTrue(report.canProceed(warningsAcknowledged: false))
     }
 
     func testPumpMaxBolusTooSmallIsBlocker() {

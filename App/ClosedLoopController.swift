@@ -76,6 +76,7 @@ extension AppModel {
             return
         }
         loopError = nil
+        cancelLowRecovery()
         loopCarried = 0
         loopLowTicks = 0
         loopBlindTicks = 0
@@ -91,6 +92,7 @@ extension AppModel {
     func disarmLoop(note: String? = nil) {
         loopTask?.cancel()
         loopTask = nil
+        cancelLowRecovery()
         loopArmed = false
         loopLiveDosing = false
         loopNextTickAt = nil
@@ -156,7 +158,10 @@ extension AppModel {
         if decision.hold == .glucoseLow {
             loopLowTicks += 1
             if loopLowTicks >= 2 {
+                let wasLive = loopLiveDosing
                 disarmLoop(note: "血糖连续 10 分钟低于 \(Int(loopSettings.lowSuspendThreshold)) mg/dL，闭环已自动停止。请立刻处理低血糖，泵上的基础率仍在走。")
+                // 停手是暂时的：等血糖回到停止线以上，按同一套参数重新开始。
+                if loopSettings.autoResumeAfterLow { startLowRecovery(live: wasLive) }
                 return
             }
         } else {
@@ -235,6 +240,57 @@ extension AppModel {
         if loopErrorTicks >= 3 {
             disarmLoop(note: "连续三拍通讯失败，闭环已自动停止：\(text)")
         }
+    }
+
+    // MARK: 低血糖之后自动恢复
+
+    /// 停手不是终点。血糖回到停止线以上、连续两拍确认，就按原来的形态重新开始
+    /// （原来是演练就还是演练，原来真发就还是真发）。期间每 5 分钟读一次泵和血糖。
+    func startLowRecovery(live: Bool) {
+        loopAutoResumeWasLive = live
+        loopRecoveryGoodTicks = 0
+        loopAutoResumePending = true
+        loopLowRecoveryTask?.cancel()
+        loopLowRecoveryTask = Task { [weak self] in
+            while !Task.isCancelled {
+                let tick = self?.loopSettings.tickSeconds ?? 300
+                try? await Task.sleep(for: .seconds(tick))
+                guard !Task.isCancelled, let self else { return }
+                await self.lowRecoveryTick()
+            }
+        }
+    }
+
+    func cancelLowRecovery() {
+        loopLowRecoveryTask?.cancel()
+        loopLowRecoveryTask = nil
+        loopAutoResumePending = false
+        loopRecoveryGoodTicks = 0
+    }
+
+    private func lowRecoveryTick() async {
+        guard loopAutoResumePending, !loopArmed else { return }
+        guard linkPhase.isReady else { return }
+        await resumeAfterReconnectIfNeeded()
+        guard (try? await session.refresh()) != nil else { return }
+        await refreshFromSession()
+        guard let bg = glucoseValue else { return }
+
+        if Double(bg) >= loopSettings.lowSuspendThreshold {
+            loopRecoveryGoodTicks += 1
+        } else {
+            loopRecoveryGoodTicks = 0
+        }
+        guard loopRecoveryGoodTicks >= 2 else { return }
+
+        loopAutoResumePending = false
+        loopLowRecoveryTask = nil
+        if let reason = loopArmBlockReason(live: loopAutoResumeWasLive) {
+            loopError = "血糖已回到 \(bg) mg/dL，但自动重开没通过检查：\(reason)"
+            return
+        }
+        armLoop(live: loopAutoResumeWasLive)
+        loopError = nil
     }
 
     // MARK: 发针
