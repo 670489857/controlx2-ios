@@ -256,7 +256,6 @@ struct GlucoseChartView: View {
                     // 时间轴：起点、现在、右端（有预测时是 +4 小时）
                     let formatter = DateFormatter()
                     formatter.dateFormat = "HH:mm"
-                    let now = Date()
                     let marks: [(Date, String)] = futureMinutes > 0
                         ? [(start, formatter.string(from: start)),
                            (now, "现在"),
