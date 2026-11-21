@@ -53,7 +53,7 @@ struct HistoryEvent: Identifiable, Equatable {
             return source == .nightscout
                 ? String(format: "NS 碳水 %.0f g", amount)
                 : String(format: "碳水 %.0f g", amount)
-        case .loopDose: return String(format: "闭环微剂量 %.2f U", amount)
+        case .loopDose: return String(format: "闭环微型大剂量 %.2f U", amount)
         case .loopHold: return "闭环未发针"
         }
     }
@@ -148,6 +148,9 @@ struct GlucoseChartView: View {
     let samples: [GlucoseSample]
     let markers: [HistoryEvent]
     var windowMinutes: Double = 180
+    /// 预测点（从"现在"起每 5 分钟一个）。传进来就把虚线接到曲线右边，
+    /// 不再单独占一张卡。
+    var prediction: [PredictionPoint] = []
     /// 显示单位（只影响纵轴标签，不影响绘制坐标——坐标永远是 mg/dL）
     var unit: GlucoseDisplayUnit = .mgdl
 
@@ -185,7 +188,7 @@ struct GlucoseChartView: View {
                         plot.maxY - CGFloat((value - low) / (high - low)) * plot.height
                     }
                     func x(_ date: Date) -> CGFloat {
-                        plot.minX + CGFloat(date.timeIntervalSince(start) / (windowMinutes * 60)) * plot.width
+                        plot.minX + CGFloat(date.timeIntervalSince(start) / (domainMinutes * 60)) * plot.width
                     }
 
                     // 目标带参考线：70 / 180 mg/dL
@@ -246,14 +249,37 @@ struct GlucoseChartView: View {
                                      at: CGPoint(x: px, y: py - 22), anchor: .bottom)
                     }
 
-                    // 时间轴：起始、中点、现在
+                    // 时间轴：起点、现在、右端（有预测时是 +4 小时）
                     let formatter = DateFormatter()
                     formatter.dateFormat = "HH:mm"
-                    for fraction in [0.0, 0.5, 1.0] {
-                        let date = start.addingTimeInterval(windowMinutes * 60 * fraction)
-                        let text = fraction == 1.0 ? "现在" : formatter.string(from: date)
+                    let now = Date()
+                    let marks: [(Date, String)] = futureMinutes > 0
+                        ? [(start, formatter.string(from: start)),
+                           (now, "现在"),
+                           (now.addingTimeInterval(futureMinutes * 60), "+4h")]
+                        : [(start, formatter.string(from: start)),
+                           (start.addingTimeInterval(windowMinutes * 60 / 2), formatter.string(from: start.addingTimeInterval(windowMinutes * 30))),
+                           (now, "现在")]
+                    for (date, text) in marks {
                         context.draw(Text(text).font(.system(size: 8)).foregroundColor(Color.secondary),
                                      at: CGPoint(x: x(date), y: plot.maxY + 10))
+                    }
+
+                    // 预测：从"现在"接出去，橙色虚线。中间那条竖线是分界，别让人以为虚线也是实测。
+                    if futureMinutes > 0, prediction.count >= 2 {
+                        var rule = Path()
+                        rule.move(to: CGPoint(x: x(now), y: plot.minY))
+                        rule.addLine(to: CGPoint(x: x(now), y: plot.maxY))
+                        context.stroke(rule, with: .color(Color.primary.opacity(0.18)),
+                                       style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
+
+                        var path = Path()
+                        path.move(to: CGPoint(x: x(prediction[0].date), y: y(prediction[0].mgdl)))
+                        for point in prediction.dropFirst() {
+                            path.addLine(to: CGPoint(x: x(point.date), y: y(point.mgdl)))
+                        }
+                        context.stroke(path, with: .color(Color.orange.opacity(0.9)),
+                                       style: StrokeStyle(lineWidth: 1.6, dash: [5, 3]))
                     }
 
                     // 拖动指示：竖线 + 高亮那个点。
@@ -286,7 +312,7 @@ struct GlucoseChartView: View {
                             let width = plotMaxX - plotMinX
                             let px = min(max(drag.location.x, plotMinX), plotMaxX)
                             let start = Date().addingTimeInterval(-windowMinutes * 60)
-                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * windowMinutes * 60)
+                            let target = start.addingTimeInterval(Double((px - plotMinX) / width) * domainMinutes * 60)
                             let shown = visible(Date())
                             if let index = nearestIndex(to: target, in: shown) {
                                 scrubIndex = index
@@ -315,7 +341,7 @@ struct GlucoseChartView: View {
         let plotMinX: CGFloat = 26
         let plotMaxX = max(27, size.width - 12)
         let start = now.addingTimeInterval(-windowMinutes * 60)
-        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (windowMinutes * 60))
+        let ratio = CGFloat(sample.timestamp.timeIntervalSince(start) / (domainMinutes * 60))
         let rawX = plotMinX + ratio * (plotMaxX - plotMinX)
         let bubbleWidth: CGFloat = 118
         let clampedX = min(max(rawX, bubbleWidth / 2 + 2), size.width - bubbleWidth / 2 - 2)
@@ -380,7 +406,28 @@ struct GlucoseTrendSection: View {
                 GlucoseChartView(samples: model.chartSamples,
                                  markers: model.chartMarkers,
                                  windowMinutes: Double(model.chartWindowHours * 60),
+                                 prediction: model.prediction?.points ?? [],
                                  unit: model.effectiveGlucoseUnit)
+
+                if model.iobUnavailable {
+                    Text("未读到活性胰岛素，预测缺了这一项会系统性高估血糖，所以暂不画虚线。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                } else if let p = model.prediction {
+                    HStack(spacing: 8) {
+                        Text(model.effectiveGlucoseUnit == .mmol
+                             ? String(format: "预测 4 小时后 %.1f mmol/L", p.eventualBg / 18.0182)
+                             : "预测 4 小时后 \(Int(p.eventualBg.rounded())) mg/dL")
+                            .font(.system(size: 11, weight: .medium))
+                            .monospacedDigit()
+                        if let low = p.minutesToLow {
+                            Label("\(low) 分钟后跌破停止线", systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.red)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
 
                 if model.chartSamples.isEmpty {
                     Text("还没有采样。Nightscout 需要先拉一次；泵来源需要 CGM 连上。")

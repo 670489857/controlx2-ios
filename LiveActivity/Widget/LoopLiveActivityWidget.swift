@@ -37,7 +37,8 @@ struct LoopLiveActivityWidget: Widget {
                             .font(.caption).bold().monospacedDigit()
                             .foregroundStyle(Palette.primary)
                         Text(context.state.loopText)
-                            .font(.caption2).foregroundStyle(Palette.secondary)
+                            .font(.caption2).bold()
+                            .foregroundStyle(Palette.accentGreen)
                     }
                 }
                 DynamicIslandExpandedRegion(.bottom) {
@@ -143,10 +144,10 @@ private struct LockScreenCard: View {
                         .font(.caption).foregroundStyle(Palette.secondary)
                     Text(state.loopText)
                         .font(.caption2).bold()
-                        .foregroundStyle(Palette.accent(for: state.glucoseValue))
+                        .foregroundStyle(Palette.accentGreen)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Palette.accent(for: state.glucoseValue).opacity(0.18),
+                        .background(Palette.accentGreen.opacity(0.18),
                                     in: Capsule())
                 }
             }

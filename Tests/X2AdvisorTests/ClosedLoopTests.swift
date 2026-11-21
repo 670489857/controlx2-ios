@@ -143,6 +143,20 @@ final class ClosedLoopTests: XCTestCase {
         XCTAssertEqual(d.units, 0)
     }
 
+    func testReversedTargetsAreSwappedOnDecode() throws {
+        // 旧版本把上下限写反过：读回来必须正过来，否则闸门拿着反的区间算
+        let json = #"{"targetLow":108,"targetHigh":90}"#
+        let decoded = try JSONDecoder().decode(ClosedLoop.Settings.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.targetLow, 90)
+        XCTAssertEqual(decoded.targetHigh, 108)
+    }
+
+    func testImpossibleISFIsInvalid() {
+        var s = ClosedLoop.Settings()
+        s.isf = 1.5   // 把 mmol 的数填进了 mg/dL 的槽
+        XCTAssertNotNil(s.invalidReason)
+    }
+
     func testHighGlucoseAddsCorrection() {
         var inputs = healthyInputs()
         inputs.cgmMgdl = 200

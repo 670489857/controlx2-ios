@@ -63,10 +63,17 @@ extension AppModel {
         }
         await refreshFromSession()
         let snap = await session.snapshot
-        takeoverReport = buildTakeoverReport(snap: snap)
+        let report = buildTakeoverReport(snap: snap)
+        takeoverReport = report
         takeoverCheckedAt = Date()
-        // 每次重跑都要重新确认警告，避免用上一次的确认通过这一次
-        takeoverWarningsAcknowledged = false
+        // 全绿就当场签发，不用再点一次「允许真发」。有警告也算通过——
+        // 警告只是提醒，不是闸门；真正的硬性项在 blockers 里。
+        if report.blockers.isEmpty {
+            takeoverWarningsAcknowledged = !report.warnings.isEmpty
+            grantTakeoverClearance()
+        } else {
+            takeoverWarningsAcknowledged = false
+        }
     }
 
     /// 自检通过后签发"允许真发"的凭证。有效期 30 分钟：
@@ -79,6 +86,7 @@ extension AppModel {
             return
         }
         takeoverVerifiedAt = Date()
+        Self.persistTakeoverClearance()
         loopError = nil
     }
 

@@ -104,6 +104,8 @@ public enum ClosedLoop {
             let d = Settings()
             targetLow = try c.decodeIfPresent(Double.self, forKey: .targetLow) ?? d.targetLow
             targetHigh = try c.decodeIfPresent(Double.self, forKey: .targetHigh) ?? d.targetHigh
+            // 旧版本把上下限写反过，读回来先正过来，免得闸门拿着反的区间算
+            if targetLow > targetHigh { swap(&targetLow, &targetHigh) }
             isf = try c.decodeIfPresent(Double.self, forKey: .isf) ?? d.isf
             insulinDurationMinutes = try c.decodeIfPresent(Double.self, forKey: .insulinDurationMinutes) ?? d.insulinDurationMinutes
             maxSingleMicroBolus = try c.decodeIfPresent(Double.self, forKey: .maxSingleMicroBolus) ?? d.maxSingleMicroBolus
@@ -127,6 +129,9 @@ public enum ClosedLoop {
         /// 宁可整体不启用，也不要用半套参数跑——半套参数比默认值更危险。
         public var invalidReason: String? {
             if !(isf > 0) { return "胰岛素敏感系数必须大于 0" }
+            // 1 U 只降不到 5 mg/dL（≈0.28 mmol/L）基本不可能是真人参数，
+            // 多半是单位切换时把 mmol 的数填进了 mg/dL 的槽
+            if isf < 5 { return "ISF 明显偏小（1 U 降不到 5 mg/dL），先确认单位再启用" }
             if targetLow <= 0 || targetHigh <= targetLow { return "目标区间填写不正确" }
             if insulinDurationMinutes < 120 || insulinDurationMinutes > 480 {
                 return "胰岛素作用时长应在 2–8 小时之间"

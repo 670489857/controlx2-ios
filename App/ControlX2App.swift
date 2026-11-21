@@ -327,6 +327,12 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
         advisorSettings = Self.loadSettings()
         // 之前只写了 save、没写 load：改完的参数每次重开都被默认值盖掉。
         loopSettings = Self.loadLoopSettings()
+        // 「跟随来源」已经撤掉：老设备里存着 auto 的，直接落到 mmol
+        if glucoseUnit == .auto {
+            glucoseUnit = .mmol
+            UserDefaults.standard.set(GlucoseDisplayUnit.mmol.rawValue, forKey: "glucoseUnit")
+        }
+        restoreTakeoverClearanceIfNeeded()
         samples = glucoseStore.recent(minutes: 180)
         chartSamples = glucoseStore.recent(minutes: (UserDefaults.standard.object(forKey: "chartWindowHours") as? Int ?? 3) * 60)
         shadowCount = shadowLog.summarize().total
@@ -546,6 +552,7 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
                 await refreshFromSession()
                 phase = .dashboard
                 startPolling()
+                await autoRestoreLoopIfNeeded()
             case .needsPairing:
                 store.delete(for: id.uuidString)
                 lastPumpStore.clear()
@@ -601,6 +608,7 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
                 // 启动路径上会先走到这里（onPhase(.ready) 比 waitReady 返回得早），
                 // 所以轮询也必须在这儿拉起来，否则这一路连上是「只刷一次」
                 startPolling()
+                await autoRestoreLoopIfNeeded()
             } else {
                 await giveUpSession(reason: "泵不再认可这台设备保存的配对凭据")
             }
@@ -1770,7 +1778,6 @@ struct DashboardView: View {
                 metrics
                 quickActions
                 GlucoseTrendSection()
-                PredictionCard()
                 AdviceCard()
                 controlIQCard
                 footer
@@ -1805,8 +1812,6 @@ struct DashboardView: View {
                     .tracking(1.2)
                     .foregroundStyle(tint)
                     .textCase(.uppercase)
-                Pill(text: model.cgmSource == .nightscout ? "Nightscout" : "泵 CGM",
-                     tint: .secondary)
                 Spacer()
                 Text(model.glucoseSourceName)
                     .font(.system(size: 10))
@@ -1823,11 +1828,12 @@ struct DashboardView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
 
-                if !model.trendSymbol.isEmpty {
-                    Image(systemName: model.trendSymbol)
-                        .font(.system(size: 32, weight: .semibold))
-                        .foregroundStyle(tint.opacity(0.85))
-                }
+                // 闭环状态圈：绿=在跑，红=没跑。比箭头更容易一眼确认"现在是谁在管"。
+                Circle()
+                    .strokeBorder(model.loopArmed ? Color.green : Color.red,
+                                  lineWidth: 5)
+                    .frame(width: 34, height: 34)
+                    .accessibilityLabel(model.loopArmed ? "闭环运行中" : "闭环未启动")
 
                 Spacer(minLength: 0)
             }
@@ -3539,7 +3545,7 @@ struct CGMSourceView: View {
             Section {
                 Picker("显示单位", selection: Binding(get: { model.glucoseUnit },
                                                     set: { model.setGlucoseUnit($0) })) {
-                    ForEach(GlucoseDisplayUnit.allCases) { unit in
+                    ForEach(GlucoseDisplayUnit.allCases.filter { $0 != .auto }) { unit in
                         Text(unit.title).tag(unit)
                     }
                 }
@@ -3547,7 +3553,7 @@ struct CGMSourceView: View {
             } header: {
                 Text("血糖单位")
             } footer: {
-                Text("「跟随来源」= Nightscout 用 mmol/L、泵用 mg/dL。手动选一项就固定不动，换来源也保持。单位只改显示，闸门和闭环一直按 mg/dL 算。")
+                Text("只改显示，闸门和闭环一直按 mg/dL 算。默认 mmol/L。")
             }
 
             if model.cgmSource == .nightscout {

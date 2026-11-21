@@ -31,11 +31,7 @@ extension AppModel {
             lastDose = String(format: "%d 分钟前 %.2f U", minutes, record.units)
         }
         let loopText: String
-        if loopArmed {
-            loopText = loopLiveDosing ? "闭环 · 真发针" : "闭环 · 演练"
-        } else {
-            loopText = "闭环 · 未启动"
-        }
+        loopText = loopArmed ? "闭环 · 启动中" : "闭环 · 未启动"
         // 锁屏小趋势线：最近一小时的点，抽到 12 个左右就够画形状了
         let recent = chartSamples.suffix(12).map { Double($0.mgdl) }
         return LoopActivityAttributes.ContentState(

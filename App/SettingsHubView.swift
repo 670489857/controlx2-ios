@@ -200,7 +200,7 @@ struct LoopAdvancedView: View {
             Section {
                 Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
                                                     set: { model.setGlucoseUnit($0) })) {
-                    ForEach(GlucoseDisplayUnit.allCases) { unit in
+                    ForEach(GlucoseDisplayUnit.allCases.filter { $0 != .auto }) { unit in
                         Text(unit.title).tag(unit)
                     }
                 }
@@ -208,7 +208,7 @@ struct LoopAdvancedView: View {
             } header: {
                 Text("显示")
             } footer: {
-                Text("只改显示，闸门与闭环永远按 mg/dL 算。默认 mmol/L。")
+                Text("只改显示，闸门和闭环一直按 mg/dL 算。默认 mmol/L。")
             }
 
             Section {
@@ -473,9 +473,9 @@ struct TakeoverCheckView: View {
     private var report: TakeoverCheck.Report? { model.takeoverReport }
 
     private var clearanceText: String {
-        guard let verified = model.takeoverVerifiedAt else { return "未签发" }
+        guard let verified = model.takeoverVerifiedAt else { return "未通过" }
         let minutes = Int(Date().timeIntervalSince(verified) / 60)
-        return minutes <= 30 ? "有效 · \(minutes) 分钟前签发" : "已过期 · \(minutes) 分钟前"
+        return minutes < 1 ? "已通过 · 刚刚" : "已通过 · \(minutes) 分钟前签发"
     }
 
     var body: some View {
@@ -490,7 +490,6 @@ struct TakeoverCheckView: View {
                     if !report.warnings.isEmpty {
                         warningAckCard(report)
                     }
-                    ctaCard(report)
                 } else {
                     Card {
                         Text("还没跑过自检。点上面的「重新自检」——它会先刷新泵状态，再逐条判定。")
@@ -536,7 +535,7 @@ struct TakeoverCheckView: View {
                 }
                 .disabled(model.takeoverChecking)
 
-                Text("凭证一直有效，只有改参数才会作废。泵的电量、药筒、Control-IQ 状态变了，建议重跑一次。")
+                Text("自检全绿就自动生效，不用点确认。凭证一直有效，只有改参数才会作废；泵的电量、药筒、Control-IQ 状态变了，建议重跑一次。")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             }

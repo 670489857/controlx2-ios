@@ -25,17 +25,90 @@ extension AppModel {
     nonisolated static func loadLoopSettings() -> ClosedLoop.Settings {
         guard let data = UserDefaults.standard.data(forKey: loopSettingsKey),
               let s = try? JSONDecoder().decode(ClosedLoop.Settings.self, from: data)
-        else { return ClosedLoop.Settings() }
+        else {
+            // 第一次装：默认目标 5.0–6.0 mmol/L（90–108 mg/dL），
+            // 比引擎里的保守默认更贴近这套泵上实际在用的区间
+            var fresh = ClosedLoop.Settings()
+            fresh.targetLow = 90
+            fresh.targetHigh = 108
+            return fresh
+        }
         return s
     }
 
     func saveLoopSettings() {
-        if let data = try? JSONEncoder().encode(loopSettings) {
-            UserDefaults.standard.set(data, forKey: Self.loopSettingsKey)
+        let data = try? JSONEncoder().encode(loopSettings)
+        let previous = UserDefaults.standard.data(forKey: Self.loopSettingsKey)
+        if let data { UserDefaults.standard.set(data, forKey: Self.loopSettingsKey) }
+        // 参数变了，凭证作废、闭环也要停：换参数等于换前提，
+        // 不能拿着旧凭证继续按新参数发针
+        let changed = previous != nil && previous != data
+        if changed {
+            Self.clearTakeoverClearance()
+            takeoverVerifiedAt = nil
+            if loopArmed {
+                disarmLoop(note: "闭环参数改了，已自动停止。重新自检后再开。")
+            }
         }
-        // 参数变了，之前那张「允许真发 30 分钟」的凭证就过期了：
-        // 自检核的是这套参数和泵的配合，换了参数等于换了前提
-        if takeoverVerifiedAt != nil { takeoverVerifiedAt = nil }
+    }
+
+    // MARK: 凭证持久化
+
+    private static let loopVerifiedAtKey = "loopVerifiedAt"
+    private static let loopVerifiedSettingsKey = "loopVerifiedSettings"
+    private static let loopDesiredArmedKey = "loopDesiredArmed"
+    private static let loopDesiredLiveKey = "loopDesiredLive"
+
+    /// 参数指纹：直接拿编码后的 JSON 当指纹，不引入哈希，
+    /// 比对的就是"自检时那套参数"和"现在这套参数"是不是同一份。
+    nonisolated static func settingsFingerprint(_ settings: ClosedLoop.Settings) -> Data? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try? encoder.encode(settings)
+    }
+
+    nonisolated static func persistTakeoverClearance() {
+        guard let data = settingsFingerprint(loadLoopSettings()) else { return }
+        UserDefaults.standard.set(Date(), forKey: loopVerifiedAtKey)
+        UserDefaults.standard.set(data, forKey: loopVerifiedSettingsKey)
+    }
+
+    nonisolated static func clearTakeoverClearance() {
+        UserDefaults.standard.removeObject(forKey: loopVerifiedAtKey)
+        UserDefaults.standard.removeObject(forKey: loopVerifiedSettingsKey)
+    }
+
+    /// 冷启动时把上次签发的凭证捡回来——只在参数一字未变时有效
+    func restoreTakeoverClearanceIfNeeded() {
+        guard takeoverVerifiedAt == nil,
+              let saved = UserDefaults.standard.data(forKey: Self.loopVerifiedSettingsKey),
+              let now = Self.settingsFingerprint(loopSettings),
+              saved == now,
+              let at = UserDefaults.standard.object(forKey: Self.loopVerifiedAtKey) as? Date
+        else { return }
+        takeoverVerifiedAt = at
+    }
+
+    /// 划掉 App 再进来：参数没变、上次是开着的，就自动回到闭环。
+    /// 真发仍然要过一遍 armLoop 的全部闸门，闸门不过就只写原因、不硬开。
+    func autoRestoreLoopIfNeeded() async {
+        guard !loopArmed,
+              UserDefaults.standard.bool(forKey: Self.loopDesiredArmedKey),
+              linkPhase.isReady,
+              let saved = UserDefaults.standard.data(forKey: Self.loopVerifiedSettingsKey),
+              let now = Self.settingsFingerprint(loopSettings),
+              saved == now
+        else { return }
+        restoreTakeoverClearanceIfNeeded()
+        if basalProfile == nil {
+            basalProfile = try? await session.readBasalProfile()
+        }
+        let live = UserDefaults.standard.bool(forKey: Self.loopDesiredLiveKey)
+        if let reason = loopArmBlockReason(live: live) {
+            loopError = "上次的闭环没有自动恢复：\(reason)"
+            return
+        }
+        armLoop(live: live)
     }
 
     // MARK: 武装
@@ -83,6 +156,8 @@ extension AppModel {
         loopErrorTicks = 0
         loopLiveDosing = live
         loopArmed = true
+        UserDefaults.standard.set(true, forKey: Self.loopDesiredArmedKey)
+        UserDefaults.standard.set(live, forKey: Self.loopDesiredLiveKey)
         startLoopTask()
         // 武装后立刻跑一拍，别让人对着「下一拍 5:00」等
         Task { await loopTick() }
@@ -95,6 +170,8 @@ extension AppModel {
         cancelLowRecovery()
         loopArmed = false
         loopLiveDosing = false
+        UserDefaults.standard.set(false, forKey: Self.loopDesiredArmedKey)
+        UserDefaults.standard.set(false, forKey: Self.loopDesiredLiveKey)
         loopNextTickAt = nil
         if let note { loopError = note }
     }
