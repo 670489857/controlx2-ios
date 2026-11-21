@@ -261,6 +261,9 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
     @Published var bolusDecision: BolusDecision?
     /// 泵报告的进行中大剂量（0x2D）
     @Published var activeBolus: BolusMessages.BolusState?
+    /// 已受理、但还没被泵确认实际输注量的那一针。
+    /// 不入台账——"泵受理"和"打进身体"是两件事，药筒空的时候泵也会受理。
+    private var pendingBolus: (bolusId: Int, units: Double, at: Date)?
     /// 本机台账：只记这个 App 发出去的针
     @Published var ledger: BolusLedger = BolusLedger.decode(UserDefaults.standard.data(forKey: "bolusLedger"))
     @Published var bolusPolicy: BolusPolicy = AppModel.loadBolusPolicy()
@@ -1145,9 +1148,8 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
                 }
                 bolusPhase = .delivering
                 bolusMessage = "泵已受理 \(String(format: "%.2f", units)) U，开始输注"
-                ledger.append(units: units, at: Date())
-                persistLedger()
-                reviewBolus()
+                // 先挂起，等泵自己报出实际输注量再入台账。受理不等于进了身体。
+                pendingBolus = (bolusId: permission.bolusId, units: units, at: Date())
                 await pollBolus(bolusId: permission.bolusId)
             } catch {
                 bolusPhase = .failed
@@ -1174,12 +1176,49 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             if emptyReads >= 3 {
                 activeBolus = nil
                 bolusPhase = .done
-                bolusMessage = "泵已不再报告进行中的大剂量，本次输注结束"
                 try? await session.releaseBolusPermission(bolusId: bolusId)
+                await settleBolus(bolusId: bolusId)
                 return
             }
         }
         bolusMessage = "10 分钟内没等到结束。请到泵屏幕核对剩余量，不要凭界面判断。"
+    }
+
+    /// 收尾：向泵读"最近一针"的实际输注量，只有真打进身体才入台账。
+    ///
+    /// 为什么非要这一趟：泵对已受理的请求会返回 accepted，但药筒空、管路堵、中途取消时，
+    /// 实际输注可以是 0。按受理量记账，就会在没药的时候也记出一串大剂量，
+    /// 24 小时闸门跟着一起算错。
+    private func settleBolus(bolusId: Int) async {
+        let pending = pendingBolus
+        pendingBolus = nil
+        guard let pending, pending.bolusId == bolusId else { return }
+
+        do {
+            let status = try await session.readLastBolusStatusV2()
+            guard status.bolusId == bolusId else {
+                bolusMessage = "泵最近一条输注记录不是这一针，台账不记；请到泵屏幕核对实际输注量"
+                return
+            }
+            if status.deliveredUnits > 0 {
+                ledger.append(units: status.deliveredUnits, at: pending.at)
+                persistLedger()
+                reviewBolus()
+                bolusMessage = String(format: "泵确认已输注 %.2f U（请求 %.2f U）",
+                                      status.deliveredUnits, pending.units)
+            } else {
+                bolusMessage = String(format: "泵报告这次输注 0 U（请求 %.2f U），台账不记这一针", pending.units)
+            }
+        } catch {
+            bolusMessage = "读不到泵的输注记录，台账不记这一针，请到泵屏幕核对实际量：\(error.localizedDescription)"
+        }
+    }
+
+    /// 清空本机大剂量台账。只动 App 里的记录，不碰泵。
+    func clearLedger() {
+        ledger = BolusLedger()
+        persistLedger()
+        reviewBolus()
     }
 
     /// 取消进行中的输注。取消是另一条签名报文，泵不认就只能在泵屏幕上按。
@@ -1577,9 +1616,9 @@ struct DashboardView: View {
         ScrollView {
             VStack(spacing: DS.gap) {
                 ConnectionBanner()
-                hero
                 metrics
                 quickActions
+                GlucoseTrendSection()
                 RecentRecordsSection()
                 PredictionCard()
                 AdviceCard()
@@ -2260,6 +2299,7 @@ struct BolusView: View {
     @EnvironmentObject var model: AppModel
     @State private var showConfirm = false
     @State private var showCancelConfirm = false
+    @State private var showClearLedger = false
 
     private var decision: BolusDecision {
         model.bolusDecision ?? BolusGuard.evaluate(model.bolusContext())
@@ -2543,6 +2583,12 @@ struct BolusView: View {
         } message: {
             Text("只能取消还没推进去的部分；已经进到体内的收不回来。泵若没有回应取消，必须去泵屏幕上按。")
         }
+        .confirmationDialog("清空本机大剂量台账？", isPresented: $showClearLedger, titleVisibility: .visible) {
+            Button("清空", role: .destructive) { model.clearLedger() }
+            Button("取消", role: .cancel) {}
+        } message: {
+            Text("只删 App 里的记录，不动泵。清空后 24 小时累计从 0 开始算，闸门会因此放宽——清楚这一点再清。")
+        }
     }
 
     // MARK: 台账
@@ -2561,6 +2607,10 @@ struct BolusView: View {
                     Text("还没有记录").font(.system(size: 12)).foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
+                    Button("清空这些记录") { showClearLedger = true }
+                        .font(.system(size: 12))
+                        .foregroundStyle(DS.danger)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     RowRule(leading: 0)
                     ForEach(model.ledger.records.suffix(5).reversed(), id: \.at) { record in
                         HStack {

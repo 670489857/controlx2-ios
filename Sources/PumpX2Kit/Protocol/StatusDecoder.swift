@@ -178,6 +178,30 @@ public enum StatusDecoder {
         return PumpVersion(softwareName: name, modelNumber: model, serialNumber: serial, pumpRevision: rev)
     }
 
+    // MARK: 最近一次大剂量（0xA5 LastBolusStatusV2，24 字节）
+
+    /// 泵自己记的"最后一针"：实际打进多少、请求多少。
+    /// 字段偏移照 pumpX2 的 `LastBolusStatusV2Response.parse`：
+    /// status 0、bolusId 1..2、timestamp 5、delivered 9、requested 20（单位都是千分之一 U）。
+    ///
+    /// 这条报文才是台账该信的东西。"泵受理了"不等于"打进身体了"——
+    /// 药筒空、管路堵、中途取消，都会让受理成功而实际输注为 0。
+    public struct LastBolusStatus: Equatable, Sendable {
+        public let bolusId: Int
+        public let deliveredUnits: Double
+        public let requestedUnits: Double
+        public let statusId: Int
+    }
+
+    public static func lastBolusStatusV2(_ cargo: [UInt8]) -> LastBolusStatus? {
+        guard cargo.count >= 24 else { return nil }
+        let bolusId = Int(UInt16(cargo[1]) | UInt16(cargo[2]) << 8)
+        return LastBolusStatus(bolusId: bolusId,
+                               deliveredUnits: Double(readU32(cargo, 9)) / 1000,
+                               requestedUnits: Double(readU32(cargo, 20)) / 1000,
+                               statusId: Int(cargo[13]))
+    }
+
     /// 固定长度字符串：截到第一个不可打印字节（含 NUL），并去掉首尾空白。
     /// 泵把这些字段写成定长 NUL 填充，直接当字符串用会带一串看不见的尾字符。
     private static func ascii(_ b: [UInt8], _ offset: Int, _ length: Int) -> String {

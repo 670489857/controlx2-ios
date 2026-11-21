@@ -138,6 +138,19 @@ struct SettingsHubView: View {
                                    status: model.liveActivityEnabled ? "已开启" : "未开启")
                     }
                     .buttonStyle(.plain)
+                    RowRule()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("血糖单位")
+                            .font(.system(size: 14))
+                        Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
+                                                            set: { model.setGlucoseUnit($0) })) {
+                            ForEach(GlucoseDisplayUnit.allCases) { unit in
+                                Text(unit.title).tag(unit)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                    }
                 }
             }
         }
@@ -198,14 +211,14 @@ struct LoopAdvancedView: View {
     var body: some View {
         Form {
             Section {
-                row("目标下限 mg/dL", $model.loopSettings.targetLow)
-                row("目标上限 mg/dL", $model.loopSettings.targetHigh)
+                glucoseRow("目标下限", $model.loopSettings.targetLow)
+                glucoseRow("目标上限", $model.loopSettings.targetHigh)
                 row("敏感系数 ISF", $model.loopSettings.isf)
                 row("胰岛素作用时长（分钟）", $model.loopSettings.insulinDurationMinutes)
                 row("单针上限 U", $model.loopSettings.maxSingleMicroBolus, step: 0.05)
                 row("每小时上限 U", $model.loopSettings.maxHourlyMicroBolus, step: 0.05)
                 row("IOB 上限 U", $model.loopSettings.maxIobUnits, step: 0.1)
-                row("停止线 mg/dL", $model.loopSettings.lowSuspendThreshold)
+                glucoseRow("停止线", $model.loopSettings.lowSuspendThreshold)
                 if let invalid = model.loopSettings.invalidReason {
                     Text(invalid).font(.footnote).foregroundStyle(.red)
                 }
@@ -231,7 +244,7 @@ struct LoopAdvancedView: View {
             } header: {
                 Text("参数")
             } footer: {
-                Text("目标、ISF 应与你泵里个人计划一致。默认值只是保守起点，不是处方。")
+                Text("目标、ISF 应与你泵里个人计划一致。默认值只是保守起点，不是处方。阈值按「血糖单位」显示：mmol 保留 1 位小数，存进去仍是 mg/dL 整数。")
             }
 
             Section {
@@ -263,6 +276,26 @@ struct LoopAdvancedView: View {
     private func row(_ title: String, _ value: Binding<Double>, step: Double = 1) -> some View {
         LabeledContent(title) {
             TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.decimalPad)
+                .monospacedDigit()
+        }
+    }
+
+    /// 血糖阈值这类字段：内部一律存 mg/dL，显示跟着全局单位走。
+    /// 切到 mmol 时输入 5.5，存下去是 99 mg/dL——闭环判断永远用 mg/dL，不会因为显示单位改变行为。
+    private func glucoseRow(_ title: String, _ value: Binding<Double>) -> some View {
+        let mmol = model.effectiveGlucoseUnit == .mmol
+        let display = Binding<Double>(
+            get: {
+                mmol ? (value.wrappedValue / 18.0182 * 10).rounded() / 10
+                     : value.wrappedValue.rounded()
+            },
+            set: { input in
+                value.wrappedValue = mmol ? (input * 18.0182).rounded() : input.rounded()
+            })
+        return LabeledContent("\(title) \(mmol ? "mmol/L" : "mg/dL")") {
+            TextField("", value: display, format: .number.precision(.fractionLength(0...1)))
                 .multilineTextAlignment(.trailing)
                 .keyboardType(.decimalPad)
                 .monospacedDigit()
@@ -333,8 +366,8 @@ struct LoopPresetEditorView: View {
             }
 
             Section {
-                row("目标下限 mg/dL", $draft.settings.targetLow)
-                row("目标上限 mg/dL", $draft.settings.targetHigh)
+                glucoseRow("目标下限", $draft.settings.targetLow)
+                glucoseRow("目标上限", $draft.settings.targetHigh)
                 row("敏感系数 ISF", $draft.settings.isf)
                 row("胰岛素作用时长（分钟）", $draft.settings.insulinDurationMinutes)
             } header: {
@@ -345,7 +378,7 @@ struct LoopPresetEditorView: View {
                 row("单针上限 U", $draft.settings.maxSingleMicroBolus, step: 0.05)
                 row("每小时上限 U", $draft.settings.maxHourlyMicroBolus, step: 0.05)
                 row("IOB 上限 U", $draft.settings.maxIobUnits, step: 0.1)
-                row("停止线 mg/dL", $draft.settings.lowSuspendThreshold)
+                glucoseRow("停止线", $draft.settings.lowSuspendThreshold)
                 row("泵自己在跑的基础率 U/h", $draft.settings.pumpBasalUnitsPerHour, step: 0.05)
                 if let invalid = draft.settings.invalidReason {
                     Text(invalid).font(.footnote).foregroundStyle(.red)
@@ -381,6 +414,24 @@ struct LoopPresetEditorView: View {
     private func row(_ title: String, _ value: Binding<Double>, step: Double = 1) -> some View {
         LabeledContent(title) {
             TextField("", value: value, format: .number.precision(.fractionLength(0...2)))
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.decimalPad)
+                .monospacedDigit()
+        }
+    }
+
+    private func glucoseRow(_ title: String, _ value: Binding<Double>) -> some View {
+        let mmol = model.effectiveGlucoseUnit == .mmol
+        let display = Binding<Double>(
+            get: {
+                mmol ? (value.wrappedValue / 18.0182 * 10).rounded() / 10
+                     : value.wrappedValue.rounded()
+            },
+            set: { input in
+                value.wrappedValue = mmol ? (input * 18.0182).rounded() : input.rounded()
+            })
+        return LabeledContent("\(title) \(mmol ? "mmol/L" : "mg/dL")") {
+            TextField("", value: display, format: .number.precision(.fractionLength(0...1)))
                 .multilineTextAlignment(.trailing)
                 .keyboardType(.decimalPad)
                 .monospacedDigit()

@@ -597,6 +597,18 @@ public actor PumpSession {
         link.note("bolus: 释放许可 bolusId=\(bolusId) status=\(status.map(String.init) ?? "解析失败")")
     }
 
+    /// 读泵自己记的最近一针：实际输注量。台账只认这个数。
+    public func readLastBolusStatusV2() async throws -> StatusDecoder.LastBolusStatus {
+        guard authKey != nil else { throw ProtocolError.notAuthenticated }
+        let frame = try await request(PumpMessage.request(characteristic: .currentStatus, opCode: 0xA4),
+                                      expecting: 0xA5, timeout: .seconds(8))
+        snapshot.rawCargo[0xA5] = frame.cargo
+        guard let status = StatusDecoder.lastBolusStatusV2(frame.cargo) else {
+            throw ProtocolError.truncated
+        }
+        return status
+    }
+
     /// 读当前大剂量状态。输注过程中每 2 秒调一次，用来判断已经开始/已经结束。
     public func readCurrentBolus() async throws -> BolusMessages.BolusState {
         let frame = try await request(BolusMessages.currentBolusStatusRequest(), expecting: 0x2D,
