@@ -179,10 +179,14 @@ public enum BolusGuard {
 public struct BolusRecord: Codable, Equatable, Sendable {
     public let at: Date
     public let units: Double
+    /// 有没有被泵回读确认。true = 泵报的实际输注量；false = 只拿到受理、没回读到实际量；
+    /// nil = 旧记录（那时还没有这个概念）。
+    public var confirmed: Bool?
 
-    public init(at: Date, units: Double) {
+    public init(at: Date, units: Double, confirmed: Bool? = nil) {
         self.at = at
         self.units = units
+        self.confirmed = confirmed
     }
 }
 
@@ -193,9 +197,9 @@ public struct BolusLedger: Codable, Equatable, Sendable {
         self.records = records
     }
 
-    public mutating func append(units: Double, at: Date = Date()) {
+    public mutating func append(units: Double, at: Date = Date(), confirmed: Bool? = true) {
         guard units > 0 else { return }
-        records.append(BolusRecord(at: at, units: units))
+        records.append(BolusRecord(at: at, units: units, confirmed: confirmed))
         prune(now: at)
     }
 

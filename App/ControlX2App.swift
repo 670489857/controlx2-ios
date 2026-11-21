@@ -1182,6 +1182,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
             }
         }
         bolusMessage = "10 分钟内没等到结束。请到泵屏幕核对剩余量，不要凭界面判断。"
+        await settleBolus(bolusId: bolusId)
     }
 
     /// 收尾：向泵读"最近一针"的实际输注量，只有真打进身体才入台账。
@@ -1194,24 +1195,38 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
         pendingBolus = nil
         guard let pending, pending.bolusId == bolusId else { return }
 
+        let requested = pending.units
         do {
             let status = try await session.readLastBolusStatusV2()
-            guard status.bolusId == bolusId else {
-                bolusMessage = "泵最近一条输注记录不是这一针，台账不记；请到泵屏幕核对实际输注量"
-                return
-            }
-            if status.deliveredUnits > 0 {
-                ledger.append(units: status.deliveredUnits, at: pending.at)
+            // 泵给的 bolusId 不一定跟授权时那个号一致；金额对得上也算同一针。
+            let sameBolus = status.bolusId == bolusId
+                || abs(status.requestedUnits - requested) < 0.011
+                || abs(status.deliveredUnits - requested) < 0.011
+
+            if sameBolus && status.deliveredUnits > 0 {
+                ledger.append(units: status.deliveredUnits, at: pending.at, confirmed: true)
                 persistLedger()
                 reviewBolus()
                 bolusMessage = String(format: "泵确认已输注 %.2f U（请求 %.2f U）",
-                                      status.deliveredUnits, pending.units)
+                                      status.deliveredUnits, requested)
+            } else if sameBolus {
+                bolusMessage = String(format: "泵报告这次输注 0 U（请求 %.2f U），台账不记这一针", requested)
             } else {
-                bolusMessage = String(format: "泵报告这次输注 0 U（请求 %.2f U），台账不记这一针", pending.units)
+                recordUnconfirmed(requested, at: pending.at, reason: "泵最近一条记录对不上这一针")
             }
         } catch {
-            bolusMessage = "读不到泵的输注记录，台账不记这一针，请到泵屏幕核对实际量：\(error.localizedDescription)"
+            recordUnconfirmed(requested, at: pending.at, reason: error.localizedDescription)
         }
+    }
+
+    /// 回读不到实际量时退一步：按请求量记一笔并标「未确认」。
+    /// 宁可多记一笔让闸门更保守，也不能让用户明明打了针、记录里却什么都没有。
+    private func recordUnconfirmed(_ units: Double, at: Date, reason: String) {
+        ledger.append(units: units, at: at, confirmed: false)
+        persistLedger()
+        reviewBolus()
+        bolusMessage = "泵没回读到实际输注量（\(reason)），按请求 "
+            + String(format: "%.2f", units) + " U 记了一笔「未确认」。到泵屏幕核一下实际进了多少。"
     }
 
     /// 清空本机大剂量台账。只动 App 里的记录，不碰泵。
@@ -1240,6 +1255,7 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
                     bolusPhase = .done
                     bolusMessage = "泵已取消，剩余剂量不会再进。已经进到体内的部分收不回来。"
                     activeBolus = nil
+                    await settleBolus(bolusId: id)
                 } else {
                     bolusPhase = .delivering
                     bolusMessage = "泵没有确认取消（status=\(result.status)，reason=\(result.reason)），立即在泵屏幕上按取消"
@@ -1614,7 +1630,6 @@ struct DashboardView: View {
                 metrics
                 quickActions
                 GlucoseTrendSection()
-                RecentRecordsSection()
                 PredictionCard()
                 AdviceCard()
                 controlIQCard
@@ -1677,11 +1692,6 @@ struct DashboardView: View {
                 Spacer(minLength: 0)
             }
             .padding(.top, 2)
-
-            Text(model.glucoseSub.isEmpty ? "等待 CGM 数据" : model.glucoseSub)
-                .font(.system(size: 15, weight: .medium, design: .rounded))
-                .foregroundStyle(.secondary)
-                .padding(.top, -4)
 
             // 数字看着还在，其实已经过期——这是最容易让人误判的一种状态。
             // 超过 10 分钟就直接在卡片里说出来，而不是让人自己去读那行小字。
@@ -2607,6 +2617,11 @@ struct BolusView: View {
                                 .foregroundStyle(.secondary)
                                 .monospacedDigit()
                             Spacer()
+                            if record.confirmed == false {
+                                Text("未确认")
+                                    .font(.system(size: 10))
+                                    .foregroundStyle(DS.warn)
+                            }
                             Text(String(format: "%.2f U", record.units))
                                 .font(.system(size: 12, design: .rounded))
                                 .monospacedDigit()
