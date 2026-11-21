@@ -24,7 +24,7 @@ extension AppModel {
 
     nonisolated static func loadLoopSettings() -> ClosedLoop.Settings {
         guard let data = UserDefaults.standard.data(forKey: loopSettingsKey),
-              let s = try? JSONDecoder().decode(ClosedLoop.Settings.self, from: data)
+              var s = try? JSONDecoder().decode(ClosedLoop.Settings.self, from: data)
         else {
             // 第一次装：默认目标 5.0–6.0 mmol/L（90–108 mg/dL），
             // 比引擎里的保守默认更贴近这套泵上实际在用的区间
@@ -32,6 +32,14 @@ extension AppModel {
             fresh.targetLow = 90
             fresh.targetHigh = 108
             return fresh
+        }
+        // 旧版没单位换算，1.5 mmol 被当成 1.5 mg/dL 存了进来。
+        // 小于 5 的 ISF 不可能是 mg/dL/U，按 mmol 补一次换算再落盘。
+        if s.isf > 0, s.isf < 5 {
+            s.isf = (s.isf * 18.0182 * 10).rounded() / 10
+            if let fixed = try? JSONEncoder().encode(s) {
+                UserDefaults.standard.set(fixed, forKey: loopSettingsKey)
+            }
         }
         return s
     }

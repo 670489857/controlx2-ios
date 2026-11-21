@@ -1358,8 +1358,15 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
 
     static func loadSettings() -> AdvisorSettings {
         guard let data = UserDefaults.standard.data(forKey: settingsKey),
-              let s = try? JSONDecoder().decode(AdvisorSettings.self, from: data)
+              var s = try? JSONDecoder().decode(AdvisorSettings.self, from: data)
         else { return AdvisorSettings() }
+        // 同闭环：旧数据里的 1.5 其实是 mmol/L per U，补成 27 mg/dL per U
+        if s.isf > 0, s.isf < 5 {
+            s.isf = (s.isf * 18.0182 * 10).rounded() / 10
+            if let fixed = try? JSONEncoder().encode(s) {
+                UserDefaults.standard.set(fixed, forKey: settingsKey)
+            }
+        }
         return s
     }
 
@@ -1789,10 +1796,12 @@ struct DashboardView: View {
     private var tint: Color { DS.glucoseTint(model.glucoseValue.map { Double($0) }) }
 
     private var batteryTint: Color {
-        guard let text = model.batteryText.first, let value = Int(String(text)), value < 25 else {
+        guard let value = Int(model.batteryText.trimmingCharacters(in: CharacterSet(charactersIn: "%"))) else {
             return .primary
         }
-        return DS.warn
+        if value <= 5 { return DS.danger }
+        if value < 20 { return DS.warn }
+        return DS.ok
     }
 
     var body: some View {
@@ -1845,7 +1854,7 @@ struct DashboardView: View {
                     .lineLimit(1)
             }
 
-            HStack(alignment: .center, spacing: 18) {
+            HStack(alignment: .center, spacing: 12) {
                 Text(model.glucoseText)
                     .font(.system(size: 88, weight: .semibold, design: .rounded))
                     .monospacedDigit()
@@ -1854,12 +1863,18 @@ struct DashboardView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.6)
 
-                // 闭环状态圈：绿=在跑，红=没跑。比箭头更容易一眼确认"现在是谁在管"。
+                if !model.trendSymbol.isEmpty {
+                    Image(systemName: model.trendSymbol)
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(tint.opacity(0.85))
+                }
+
+                // 闭环状态圈：绿=在跑，红=没跑。趋势箭头在左，状态圈在右。
                 Circle()
                     .strokeBorder(model.loopArmed ? Color.green : Color.red,
-                                  lineWidth: 6)
-                    .frame(width: 46, height: 46)
-                    .padding(.leading, 2)
+                                  lineWidth: 5)
+                    .frame(width: 40, height: 40)
+                    .padding(.leading, 8)
                     .accessibilityLabel(model.loopArmed ? "闭环运行中" : "闭环未启动")
 
                 Spacer(minLength: 0)
@@ -2230,11 +2245,19 @@ struct AdvisorSettingsView: View {
     @EnvironmentObject var model: AppModel
     @State private var showClearShadow = false
 
+    /// 只换显示：advisor 内核、影子记录、预测仍然按 mg/dL 算
+    private func glucoseField(_ value: Binding<Double>) -> Binding<Double> {
+        Binding(
+            get: { (value.wrappedValue / 18.0182 * 10).rounded() / 10 },
+            set: { value.wrappedValue = ($0 * 18.0182 * 10).rounded() / 10 }
+        )
+    }
+
     var body: some View {
         Form {
             Section {
-                LabeledContent("敏感系数 ISF") {
-                    TextField("50", value: $model.advisorSettings.isf, format: .number)
+                LabeledContent("敏感系数 ISF（mmol/L per U）") {
+                    TextField("2.8", value: glucoseField($model.advisorSettings.isf), format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
@@ -2243,15 +2266,15 @@ struct AdvisorSettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
-                LabeledContent("目标血糖") {
-                    TextField("110", value: $model.advisorSettings.targetBg, format: .number)
+                LabeledContent("目标血糖（mmol/L）") {
+                    TextField("6.1", value: glucoseField($model.advisorSettings.targetBg), format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
             } header: {
                 Text("胰岛素参数")
             } footer: {
-                Text("单位：ISF 为 mg/dL per U，CR 为 g per U。这些值应与医嘱一致，不是默认值。")
+                Text("单位：ISF 为 mmol/L per U，CR 为 g per U，血糖阈值都按 mmol/L 显示。存进去仍是 mg/dL，闸门和预测不换单位。这些值应与医嘱一致，不是默认值。")
             }
 
             Section {
@@ -2260,13 +2283,13 @@ struct AdvisorSettingsView: View {
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
-                LabeledContent("追加阈值") {
-                    TextField("120", value: $model.advisorSettings.minBgToCorrect, format: .number)
+                LabeledContent("追加阈值（mmol/L）") {
+                    TextField("6.7", value: glucoseField($model.advisorSettings.minBgToCorrect), format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
-                LabeledContent("低血糖阈值") {
-                    TextField("70", value: $model.advisorSettings.lowThreshold, format: .number)
+                LabeledContent("低血糖阈值（mmol/L）") {
+                    TextField("3.9", value: glucoseField($model.advisorSettings.lowThreshold), format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
@@ -2315,8 +2338,8 @@ struct AdvisorSettingsView: View {
                     get: { model.bolusPolicy.minIntervalMinutes <= 0 },
                     set: { on in model.bolusPolicy.minIntervalMinutes = on ? 0 : 60 }
                 ))
-                LabeledContent("低血糖阈值") {
-                    TextField("80", value: $model.bolusPolicy.lowGlucoseThreshold, format: .number)
+                LabeledContent("低血糖阈值（mmol/L）") {
+                    TextField("4.4", value: glucoseField($model.bolusPolicy.lowGlucoseThreshold), format: .number)
                         .multilineTextAlignment(.trailing)
                         .keyboardType(.decimalPad)
                 }
