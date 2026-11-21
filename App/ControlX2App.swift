@@ -201,7 +201,7 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     /// 血糖卡片下面那行小字，明确写出这个数是从哪来的
     @Published var glucoseSourceHint: String = "mg/dL · 以泵屏幕为准"
     @Published var glucoseUnit: GlucoseDisplayUnit =
-        GlucoseDisplayUnit(rawValue: UserDefaults.standard.string(forKey: "glucoseUnit") ?? "auto") ?? .auto
+        GlucoseDisplayUnit(rawValue: UserDefaults.standard.string(forKey: "glucoseUnit") ?? "mmol") ?? .mmol
     /// 上一次成功拉 NS 的时间。轮询靠它做 2 分钟节流
     var nsLastFetchAt: Date?
     /// 最近一批 NS 记录，界面和趋势码都从这里取
@@ -2084,7 +2084,9 @@ struct PredictionCard: View {
                 Text("预测").font(.subheadline.weight(.semibold))
                 Spacer()
                 if let p = model.prediction {
-                    Text("4 小时后 \(Int(p.eventualBg.rounded())) mg/dL")
+                    Text(model.effectiveGlucoseUnit == .mmol
+                         ? String(format: "4 小时后 %.1f mmol/L", p.eventualBg / 18.0182)
+                         : "4 小时后 \(Int(p.eventualBg.rounded())) mg/dL")
                         .font(.caption).foregroundStyle(.secondary).monospacedDigit()
                 }
             }
@@ -2534,7 +2536,9 @@ struct BolusView: View {
             ? String(format: "24 小时上限 %.2f U", p.max24hUnits) : "24 小时不限"
         let interval = p.minIntervalMinutes > 0
             ? String(format: "最小间隔 %.0f 分钟", p.minIntervalMinutes) : "不要求间隔"
-        let low = String(format: "低血糖阈值 %.0f mg/dL", p.lowGlucoseThreshold)
+        let low = model.effectiveGlucoseUnit == .mmol
+            ? String(format: "低血糖阈值 %.1f mmol/L", p.lowGlucoseThreshold / 18.0182)
+            : String(format: "低血糖阈值 %.0f mg/dL", p.lowGlucoseThreshold)
         return "\(single) · \(daily) · \(interval) · \(low)"
     }
 

@@ -138,19 +138,6 @@ struct SettingsHubView: View {
                                    status: model.liveActivityEnabled ? "已开启" : "未开启")
                     }
                     .buttonStyle(.plain)
-                    RowRule()
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("血糖单位")
-                            .font(.system(size: 14))
-                        Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
-                                                            set: { model.setGlucoseUnit($0) })) {
-                            ForEach(GlucoseDisplayUnit.allCases) { unit in
-                                Text(unit.title).tag(unit)
-                            }
-                        }
-                        .pickerStyle(.segmented)
-                        .labelsHidden()
-                    }
                 }
             }
         }
@@ -211,9 +198,23 @@ struct LoopAdvancedView: View {
     var body: some View {
         Form {
             Section {
-                glucoseRow("目标下限", $model.loopSettings.targetLow)
+                Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
+                                                    set: { model.setGlucoseUnit($0) })) {
+                    ForEach(GlucoseDisplayUnit.allCases) { unit in
+                        Text(unit.title).tag(unit)
+                    }
+                }
+                .pickerStyle(.segmented)
+            } header: {
+                Text("显示")
+            } footer: {
+                Text("只改显示，闸门与闭环永远按 mg/dL 算。默认 mmol/L。")
+            }
+
+            Section {
                 glucoseRow("目标上限", $model.loopSettings.targetHigh)
-                row("敏感系数 ISF", $model.loopSettings.isf)
+                glucoseRow("目标下限", $model.loopSettings.targetLow)
+                isfRow
                 row("胰岛素作用时长（分钟）", $model.loopSettings.insulinDurationMinutes)
                 row("单针上限 U", $model.loopSettings.maxSingleMicroBolus, step: 0.05)
                 row("每小时上限 U", $model.loopSettings.maxHourlyMicroBolus, step: 0.05)
@@ -292,6 +293,21 @@ struct LoopAdvancedView: View {
 
     /// 血糖阈值这类字段：内部一律存 mg/dL，显示跟着全局单位走。
     /// 切到 mmol 时输入 5.5，存下去是 99 mg/dL——闭环判断永远用 mg/dL，不会因为显示单位改变行为。
+    /// ISF 的单位是「每 1 U 降多少血糖」。切到 mmol 时显示成 mmol/L per U，
+    /// 存进去仍然是 mg/dL per U。
+    private var isfRow: some View {
+        let mmol = model.effectiveGlucoseUnit == .mmol
+        let display = Binding<Double>(
+            get: { mmol ? (model.loopSettings.isf / 18.0182 * 10).rounded() / 10 : model.loopSettings.isf },
+            set: { input in model.loopSettings.isf = mmol ? (input * 18.0182 * 10).rounded() / 10 : input })
+        return LabeledContent(mmol ? "敏感系数 ISF（mmol/L per U）" : "敏感系数 ISF（mg/dL per U）") {
+            TextField("", value: display, format: .number.precision(.fractionLength(0...1)))
+                .multilineTextAlignment(.trailing)
+                .keyboardType(.decimalPad)
+                .monospacedDigit()
+        }
+    }
+
     private func glucoseRow(_ title: String, _ value: Binding<Double>) -> some View {
         let mmol = model.effectiveGlucoseUnit == .mmol
         let display = Binding<Double>(
@@ -520,7 +536,7 @@ struct TakeoverCheckView: View {
                 }
                 .disabled(model.takeoverChecking)
 
-                Text("凭证 30 分钟有效。泵的电量、药筒、Control-IQ 状态都会变，过期就重新核对。")
+                Text("凭证一直有效，只有改参数才会作废。泵的电量、药筒、Control-IQ 状态变了，建议重跑一次。")
                     .font(.system(size: 11))
                     .foregroundStyle(.tertiary)
             }
@@ -588,7 +604,7 @@ struct TakeoverCheckView: View {
 
     private func ctaCard(_ report: TakeoverCheck.Report) -> some View {
         VStack(spacing: 10) {
-            PrimaryButton(title: "自检通过，允许真发 30 分钟",
+            PrimaryButton(title: "自检通过，允许真发",
                           systemImage: "checkmark.shield",
                           disabled: !report.canProceed(warningsAcknowledged: model.takeoverWarningsAcknowledged)) {
                 model.grantTakeoverClearance()
