@@ -146,6 +146,8 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     @Published var pumpRevision: String?
     @Published var insulinUnits: String = "—"
     @Published var lastUpdated: String = "—"
+    /// 手动刷新中。按钮转圈用，避免连点发出一串报文。
+    @Published var isRefreshing = false
     @Published var glucoseText: String = "—"
     @Published var glucoseSub: String = ""
     @Published var trendSymbol: String = ""
@@ -734,12 +736,20 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     }
 
     func refresh() {
-        // 链路本身没通时，读数据是空转：先连回去，连上后 attemptResume 会刷新一次
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        // 链路本身没通时，读数据是空转：先连回去，连上后 attemptResume 会刷新一次。
+        // 这时按钮也要转一会儿，否则点了没反应，看起来像按钮坏了。
         guard linkPhase.isReady else {
             autoConnectIfPossible()
+            Task {
+                try? await Task.sleep(for: .seconds(2))
+                isRefreshing = false
+            }
             return
         }
         Task {
+            defer { isRefreshing = false }
             // 断线重连后 authKey 已被清空，此时直接 refresh 一条报文都发不出去
             //（会话层会拦下未认证的状态请求）。先补认证，再读。
             await resumeAfterReconnectIfNeeded()
@@ -1718,6 +1728,7 @@ struct DashboardView: View {
         ScrollView {
             VStack(spacing: DS.gap) {
                 ConnectionBanner()
+                ConnectionStatusBar()
                 hero
                 metrics
                 quickActions
@@ -1940,6 +1951,88 @@ struct ConnectionBanner: View {
             .padding(12)
             .background(Color(.secondarySystemGroupedBackground),
                         in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        }
+    }
+}
+
+/// 常驻的连接状态条。
+///
+/// 之前的横幅只在"正在连"和"出错"时出现，正常连上时首页什么都没有，
+/// 用户没法判断到底连没连、数据是几点的。这里把状态、时间、刷新按钮放在一起。
+struct ConnectionStatusBar: View {
+    @EnvironmentObject var model: AppModel
+
+    private var dot: Color {
+        switch model.linkPhase {
+        case .ready: return DS.ok
+        case .failed: return DS.danger
+        case .waitingForPairing, .reconnecting: return DS.warn
+        default: return .secondary
+        }
+    }
+
+    private var title: String {
+        switch model.linkPhase {
+        case .ready:
+            return model.connectedName.map { "已连接 \($0)" } ?? "泵已连接"
+        case .connecting: return "正在连接泵…"
+        case .discovering: return "正在发现服务…"
+        case .waitingForPairing: return "等待系统配对"
+        case .reconnecting: return "正在重连…"
+        case .failed: return "未连接"
+        case .idle: return "未连接"
+        }
+    }
+
+    private var detail: String {
+        if model.linkPhase.isReady {
+            let api = model.apiVersion.map { "API \($0)" } ?? "API 未读取"
+            return api + " · 更新 " + model.lastUpdated
+        }
+        return model.linkPhase.text
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Circle().fill(dot).frame(width: 8, height: 8)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 6)
+
+            Button {
+                model.refresh()
+            } label: {
+                HStack(spacing: 5) {
+                    if model.isRefreshing {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold))
+                    }
+                    Text("刷新").font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(DS.accent)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(DS.accent.opacity(0.1), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(model.isRefreshing)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.secondarySystemGroupedBackground),
+                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.045), lineWidth: 0.8)
         }
     }
 }
