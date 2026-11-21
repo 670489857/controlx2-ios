@@ -198,20 +198,6 @@ struct LoopAdvancedView: View {
     var body: some View {
         Form {
             Section {
-                Picker("血糖单位", selection: Binding(get: { model.glucoseUnit },
-                                                    set: { model.setGlucoseUnit($0) })) {
-                    ForEach(GlucoseDisplayUnit.allCases.filter { $0 != .auto }) { unit in
-                        Text(unit.title).tag(unit)
-                    }
-                }
-                .pickerStyle(.segmented)
-            } header: {
-                Text("显示")
-            } footer: {
-                Text("只改显示，闸门和闭环一直按 mg/dL 算。默认 mmol/L。")
-            }
-
-            Section {
                 glucoseRow("目标上限", $model.loopSettings.targetHigh)
                 glucoseRow("目标下限", $model.loopSettings.targetLow)
                 isfRow
@@ -505,7 +491,9 @@ struct TakeoverCheckView: View {
         .background(PageBackground())
         .navigationTitle("接管自检")
         .task {
-            if model.takeoverReport == nil { await model.runTakeoverCheck() }
+            // 每次进来都重跑：泵的电量、药筒、Control-IQ 都可能已经变了，
+            // 拿上一次的报告在这里显示，只会让人以为已经通过了
+            await model.runTakeoverCheck()
         }
     }
 

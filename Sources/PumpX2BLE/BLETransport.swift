@@ -54,7 +54,7 @@ public final class BLETransport: NSObject, PumpLink {
             case .discovering: return "正在发现服务…"
             case .waitingForPairing: return "等待蓝牙配对，请在 iPhone 弹窗上点「配对」"
             case .ready: return "链路已就绪"
-            case let .reconnecting(attempt, reason): return "\(reason)，正在重连 \(attempt)/2…"
+            case let .reconnecting(attempt, reason): return "\(reason)，正在重连 \(attempt)/4…"
             case let .failed(m): return m
             }
         }
@@ -441,7 +441,7 @@ extension BLETransport: CBCentralManagerDelegate {
         resetConnectionState()
         onDisconnect?()
 
-        guard autoReconnect, let id, reconnectAttempts < 2 else {
+        guard autoReconnect, let id, reconnectAttempts < 4 else {
             let hint = autoReconnect
                 ? "\(reason)。若反复失败：iOS 设置 → 蓝牙 → 忽略「tslim X2」，泵上删除已配对设备，再重试。"
                 : reason

@@ -252,6 +252,10 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     /// 自动连接没成功的原因。只挂在页面上，不弹框——刚打开 App 就被弹窗挡住，
     /// 比多等几秒更难受。
     @Published var connectionNote: String?
+    /// 链路自动重试的节拍。传输层自己只试两次，失败后如果不接管，
+    /// 状态页会一直停在「未连接」，等用户去点刷新。
+    private var reconnectRetryTask: Task<Void, Never>?
+    private var reconnectRetryCount = 0
 
     // MARK: 大剂量（输注）
     /// 输注总开关，默认关。第一次打开要走一遍风险确认。
@@ -386,11 +390,16 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
                     // 状态页上只把「传输层正在自己重连」画成进度；失败则收起进度、写原因。
                     // 这里不处理 .failed 以外的跳转——状态页不因为一次断链就把人赶回列表。
                     switch p {
+                    case .ready:
+                        self.autoConnecting = false
+                        self.reconnectRetryCount = 0
+                        self.reconnectRetryTask?.cancel()
                     case .reconnecting:
                         self.autoConnecting = true
                     case let .failed(message):
                         self.autoConnecting = false
                         self.connectionNote = message
+                        self.scheduleReconnectRetry()
                     default:
                         break
                     }
@@ -487,6 +496,23 @@ final class AppModel: ObservableObject {    enum Phase: Hashable {
     }
 
     /// 自动连接失败后回到扫描页（用户主动要求时才走这条）
+    /// 断链后的自动重试。间隔从 8 秒逐步拉到 30 秒，最多 6 次；
+    /// 用户自己回扫描页就停，不在背后抢连接。
+    private func scheduleReconnectRetry() {
+        guard phase == .dashboard, reconnectRetryCount < 6 else { return }
+        reconnectRetryTask?.cancel()
+        let attempt = reconnectRetryCount
+        reconnectRetryTask = Task { @MainActor [weak self] in
+            let delay = min(30, 8 + attempt * 6)
+            try? await Task.sleep(for: .seconds(delay))
+            guard let self, !Task.isCancelled, self.phase == .dashboard else { return }
+            guard case .failed = self.linkPhase else { return }
+            self.reconnectRetryCount += 1
+            self.autoConnectIfPossible()
+            self.scheduleReconnectRetry()
+        }
+    }
+
     func goToDiscovery() {
         connectionNote = nil
         autoConnecting = false
@@ -1819,7 +1845,7 @@ struct DashboardView: View {
                     .lineLimit(1)
             }
 
-            HStack(alignment: .center, spacing: 10) {
+            HStack(alignment: .center, spacing: 18) {
                 Text(model.glucoseText)
                     .font(.system(size: 88, weight: .semibold, design: .rounded))
                     .monospacedDigit()
@@ -1831,8 +1857,9 @@ struct DashboardView: View {
                 // 闭环状态圈：绿=在跑，红=没跑。比箭头更容易一眼确认"现在是谁在管"。
                 Circle()
                     .strokeBorder(model.loopArmed ? Color.green : Color.red,
-                                  lineWidth: 5)
-                    .frame(width: 34, height: 34)
+                                  lineWidth: 6)
+                    .frame(width: 46, height: 46)
+                    .padding(.leading, 2)
                     .accessibilityLabel(model.loopArmed ? "闭环运行中" : "闭环未启动")
 
                 Spacer(minLength: 0)
@@ -3139,11 +3166,22 @@ struct ClosedLoopView: View {
         .background(PageBackground())
         .navigationTitle("闭环")
         .onChange(of: model.loopSettings) { _ in model.saveLoopSettings() }
-        .onAppear { model.refreshLoopTotals() }
+        .onAppear {
+            model.refreshLoopTotals()
+            // 进页面就把自检跑掉：全绿会当场签发，省得人再进二级页点一遍
+            if !model.loopArmed, model.takeoverVerifiedAt == nil {
+                Task { await model.runTakeoverCheck() }
+            }
+        }
         .confirmationDialog("闭环怎么跑？", isPresented: $showLiveConfirm,
                             titleVisibility: .visible) {
             Button("开始演练（不发针）") { model.armLoop(live: false) }
-            Button("开始真发", role: .destructive) { model.armLoop(live: true) }
+            Button("开始真发", role: .destructive) {
+                Task {
+                    await model.runTakeoverCheck()
+                    model.armLoop(live: true)
+                }
+            }
             Button("取消", role: .cancel) {}
         } message: {
             Text("每 5 分钟最多一针，单针上限 \(String(format: "%.2f", model.loopSettings.maxSingleMicroBolus)) U，每小时上限 \(String(format: "%.2f", model.loopSettings.maxHourlyMicroBolus)) U。打出去的收不回来，血糖低了软件只能停手，不能把胰岛素抽回去。")

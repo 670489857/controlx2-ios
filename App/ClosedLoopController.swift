@@ -198,6 +198,8 @@ extension AppModel {
 
         guard linkPhase.isReady else {
             registerLoopError("链路断开，这一拍跳过")
+            // 闭环跑着跑着断链时，别等人来点刷新
+            autoConnectIfPossible()
             return
         }
 
@@ -314,6 +316,14 @@ extension AppModel {
     private func registerLoopError(_ text: String) {
         loopErrorTicks += 1
         loopError = text
+        // 链路显示还连着、但报文连续超时：多半是会话层已经僵了。
+        // 在第二拍先把会话重置掉，让下一拍重新认证，别等三拍满了直接停针。
+        if loopErrorTicks == 2, linkPhase.isReady {
+            Task {
+                await session.resetSession()
+                await resumeAfterReconnectIfNeeded()
+            }
+        }
         if loopErrorTicks >= 3 {
             disarmLoop(note: "连续三拍通讯失败，闭环已自动停止：\(text)")
         }
