@@ -117,7 +117,7 @@ enum BolusPhase: Equatable {
 
 /// UI 层状态机。只负责展示与用户动作，协议细节全部在 PumpX2Kit。
 @MainActor
-final class AppModel: ObservableObject {    enum Phase: Equatable {
+final class AppModel: ObservableObject {    enum Phase: Hashable {
         case disclaimer
         case discovery
         case pairing
@@ -1316,15 +1316,24 @@ final class AppModel: ObservableObject {    enum Phase: Equatable {
 struct RootView: View {
     @EnvironmentObject var model: AppModel
     @State private var showDiag = false
+    @State private var path = NavigationPath()
 
     var body: some View {
-        NavigationStack {
-            switch model.phase {
-            case .disclaimer: DisclaimerView()
-            case .discovery: DiscoveryView()
-            case .pairing: PairingView()
-            case .dashboard: DashboardView()
+        NavigationStack(path: $path) {
+            Group {
+                switch model.phase {
+                case .disclaimer: DisclaimerView()
+                case .discovery: DiscoveryView()
+                case .pairing: PairingView()
+                case .dashboard: DashboardView()
+                }
             }
+            // 根视图按阶段重建：配对成功后如果还挂着设置页/配对页的导航栈，
+            // 用户会停在旧页面上，看起来像"必须杀后台才进得去"。
+            .id(model.phase)
+        }
+        .onChange(of: model.phase) { _, _ in
+            path = NavigationPath()
         }
         .alert("提示", isPresented: Binding(get: { model.errorText != nil },
                                           set: { if !$0 { model.errorText = nil } })) {
@@ -1472,6 +1481,7 @@ struct DiscoveryView: View {
 struct PairingView: View {
     @EnvironmentObject var model: AppModel
     @State private var showForget = false
+    @State private var showHelp = false
 
     private var linkColor: Color {
         switch model.linkPhase {
@@ -1482,131 +1492,213 @@ struct PairingView: View {
         }
     }
 
+    private var codeIsEnterable: Bool {
+        let n = JPAKEAuth.normalize(model.pairingCode).count
+        return n == 6 || n == 16
+    }
+
     private func infoRow(_ title: String, _ value: String) -> some View {
         HStack {
-            Text(title).font(.system(size: 12)).foregroundStyle(.secondary)
+            Text(title).font(.system(size: 13)).foregroundStyle(.secondary)
             Spacer()
             Text(value)
-                .font(.system(size: 12, design: .rounded))
+                .font(.system(size: 13, design: .rounded))
                 .monospacedDigit()
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
     }
 
+    private func stepRow(_ number: Int, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text("\(number)")
+                .font(.system(size: 11, weight: .bold, design: .rounded))
+                .foregroundStyle(.white)
+                .frame(width: 18, height: 18)
+                .background(DS.accent, in: Circle())
+            Text(text)
+                .font(.system(size: 13))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            // 第一屏先说清链路状态。iOS 的系统配对弹窗与这里的配对码是两件事，
-            // 不分开讲，用户会把"系统弹窗没点"当成"配对码错"。
-            VStack(alignment: .leading, spacing: 6) {
+        ScrollView {
+            VStack(spacing: DS.gap) {
+                linkCard
+                pumpInfoCard
+                stepsCard
+                codeCard
+                footerCard
+            }
+            .padding(.horizontal, DS.pagePadding)
+            .padding(.top, 8)
+            .padding(.bottom, 44)
+        }
+        .background(PageBackground())
+        .navigationTitle("配对")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+
+    // MARK: 链路
+
+    private var linkCard: some View {
+        Card(padding: 18) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Circle().fill(linkColor).frame(width: 8, height: 8)
-                    Text(model.linkPhase.text).font(.footnote)
-                    if !model.linkPhase.isReady { ProgressView().controlSize(.mini) }
+                    Text(model.linkPhase.text)
+                        .font(.system(size: 14, weight: .medium))
+                    if !model.linkPhase.isReady {
+                        ProgressView().controlSize(.mini)
+                    }
+                    Spacer()
                 }
                 if model.linkPhase.isWaitingForUser {
-                    Text("iPhone 上弹出了「蓝牙配对请求 tslim X2」，点「配对」。如果随后还要输入 PIN，就输泵屏幕上那 6 位码。这一步不做完，下面的配对码发了也没用。")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text("iPhone 弹出了「蓝牙配对请求 tslim X2」，点「配对」。这一步不做完，下面的码发了也没用。")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+    }
 
-            // 泵自报的硬件/软件信息。读不到就写「未读取」——不要用猜测填空，
-            // 版本号错了会让人拿错误的固件结论去判断能不能用某条指令。
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("泵信息").font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                    Text(model.apiVersion.map { "API \($0)" } ?? "API 未读取")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.tertiary)
-                }
+    // MARK: 泵信息
+
+    private var pumpInfoCard: some View {
+        Card(title: "泵信息", subtitle: "配对成功后由泵自报", padding: 18) {
+            VStack(spacing: 9) {
                 infoRow("软件版本", model.pumpSoftwareName ?? "未读取")
                 infoRow("型号号", model.pumpModelNumber.map { String($0) } ?? "未读取")
                 infoRow("序列号", model.pumpSerialNumber.map { String($0) } ?? "未读取")
-                // 泵版本这个 8 字节字段 X2/Mobi 都固定填一个 "0"，不是读取失败。
-                // 显示出来只会让人以为哪里坏了，干脆没有就不显示。
                 let revision = (model.pumpRevision ?? "").trimmingCharacters(in: .whitespaces)
                 if !revision.isEmpty && revision != "0" {
                     infoRow("泵版本", revision)
                 }
-            }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("按这个顺序做").font(.headline)
-                Label("设置 → 蓝牙：打开「移动连接 / Mobile Connection」", systemImage: "1.circle.fill")
-                Label("同一页里若显示已配对的手机，先「解除配对」（泵只记一台）", systemImage: "2.circle.fill")
-                Label("先让本页显示「链路已就绪」，再点泵上的「配对设备 / Pair Device」", systemImage: "3.circle.fill")
-                Label("读泵屏幕上的 6 位数字，30 秒内输入并开始配对", systemImage: "4.circle.fill")
-                Text("顺序尽量别颠倒：泵的码通常只对当次连接有效，先读码再连、或者中途断线重连，这个码可能就作废了。")
-                    .font(.caption).foregroundStyle(.secondary)
-                Text("另外：如果装着 t:connect，先彻底退出（后台也要杀掉），它和本 App 会抢同一台泵。")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
-            .font(.footnote)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12))
-
-            if model.codeLikelyStale {
-                Label("刚才链路断过一次，泵上的码很可能已经换了。请回泵上重按「配对设备」读新码再输入。",
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.footnote)
-                    .foregroundStyle(.orange)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            Text("输入泵屏幕上显示的配对码").font(.headline)
-            TextField("000000 或 A1B2-C3D4-E5F6-7890", text: $model.pairingCode)
-                .keyboardType(.asciiCapable)
-                .textInputAutocapitalization(.characters)
-                .autocorrectionDisabled()
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 22, weight: .medium, design: .monospaced))
-                .onChange(of: model.pairingCode) { _, new in
-                    let filtered = new.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
-                    model.pairingCode = String(filtered.prefix(19))
-                }
-            if model.pairingProgress > 0 {
-                ProgressView(value: Double(model.pairingProgress), total: 100)
-                Text("配对进度 \(model.pairingProgress)%").font(.caption).foregroundStyle(.secondary)
-            }
-            Button("开始配对") { model.pair() }
-                .buttonStyle(.borderedProminent)
-                .disabled(!(JPAKEAuth.normalize(model.pairingCode).count == 6
-                            || JPAKEAuth.normalize(model.pairingCode).count == 16))
-            Text("**6 位数字**：t:slim X2 固件 v7.7 及以上、t:slim Mobi，走 EC-JPAKE。\n**16 位字母数字**：更早的 X2 固件，泵上常以 4 位一组显示。")
-                .font(.caption).foregroundStyle(.secondary)
-            Text("6 位码的配对全程约 3–5 秒，期间会连发 6 条报文，请让 App 保持在前台。失败后泵上会换一个新码，重新读一次。")
-                .font(.caption).foregroundStyle(.secondary)
-
-            Spacer()
-
-            // 「忘记此泵」放在这一页：它属于设备管理，放在首页底部只会让人误点
-            Divider()
-            Button(role: .destructive) {
-                showForget = true
-            } label: {
-                Label("忘记此泵", systemImage: "trash")
-                    .font(.footnote)
-            }
-            .confirmationDialog("删除本机保存的配对凭据？", isPresented: $showForget,
-                                titleVisibility: .visible) {
-                Button("删除", role: .destructive) { model.forgetPump() }
-                Button("取消", role: .cancel) {}
-            } message: {
-                Text("泵那边的配对记录还在。要彻底断开，还得在泵上「解除配对」。")
+                infoRow("API", model.apiVersion.map { String($0) } ?? "未读取")
             }
         }
-        .padding()
-        .scrollContentBackground(.hidden)
-        .background(PageBackground())
-        .navigationTitle("配对")
+    }
+
+    // MARK: 步骤
+
+    private var stepsCard: some View {
+        Card(title: "配对步骤", padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                stepRow(1, "设置 → 蓝牙：打开「移动连接 / Mobile Connection」")
+                stepRow(2, "同一页里若还挂着旧手机，先「解除配对」——泵只记一台")
+                stepRow(3, "等本页显示「链路已就绪」，再点泵上的「配对设备 / Pair Device」")
+                stepRow(4, "读泵屏幕上的 6 位数字，30 秒内输入下面的框")
+
+                Text("码只对当次连接有效，中途断线就得回泵上重读。装着 t:connect 的话先彻底退出，它会和本 App 抢同一台泵。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
+            }
+        }
+    }
+
+    // MARK: 配对码
+
+    private var codeCard: some View {
+        Card(title: "输入配对码", subtitle: "泵屏幕上的 6 位数字", padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                TextField("000000", text: $model.pairingCode)
+                    .keyboardType(.asciiCapable)
+                    .textInputAutocapitalization(.characters)
+                    .autocorrectionDisabled()
+                    .font(.system(size: 24, weight: .semibold, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .padding(.vertical, 12)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+                    .onChange(of: model.pairingCode) { _, new in
+                        let filtered = new.uppercased().filter { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-") }
+                        model.pairingCode = String(filtered.prefix(19))
+                    }
+
+                if model.codeLikelyStale {
+                    Label("链路断过一次，泵上的码很可能已经换了，回泵上重读。",
+                          systemImage: "exclamationmark.triangle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(DS.warn)
+                }
+
+                if model.pairingProgress > 0 {
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: Double(model.pairingProgress), total: 100)
+                        Text("配对进度 \(model.pairingProgress)%")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                PrimaryButton(title: "开始配对", systemImage: "link", disabled: !codeIsEnterable) {
+                    model.pair()
+                }
+
+                Text("6 位数字：X2 固件 v7.7 以上、Mobi。16 位字母数字：更早的 X2，泵上常以 4 位一组显示。")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: 底部
+
+    private var footerCard: some View {
+        Card(padding: 18) {
+            VStack(alignment: .leading, spacing: 12) {
+                Button {
+                    withAnimation { showHelp.toggle() }
+                } label: {
+                    HStack {
+                        Text("配对失败怎么办")
+                            .font(.system(size: 13, weight: .medium))
+                        Spacer()
+                        Image(systemName: showHelp ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+
+                if showHelp {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("1. 码错或过期：回泵上重按「配对设备」，读新码。泵会换码，旧码立刻作废。")
+                        Text("2. 系统弹窗没点「配对」：去 iPhone 设置 → 蓝牙里把它删掉，重来一次。")
+                        Text("3. 泵只记一台手机：先在泵上「解除配对」，再连。")
+                        Text("4. 一直卡在 0%：杀掉 t:connect，关掉再打开泵的移动连接。")
+                    }
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+
+                RowRule(leading: 0)
+
+                Button(role: .destructive) {
+                    showForget = true
+                } label: {
+                    HStack {
+                        Image(systemName: "trash")
+                        Text("忘记此泵")
+                        Spacer()
+                    }
+                    .font(.system(size: 13))
+                }
+                .confirmationDialog("删除本机保存的配对凭据？", isPresented: $showForget,
+                                    titleVisibility: .visible) {
+                    Button("删除", role: .destructive) { model.forgetPump() }
+                    Button("取消", role: .cancel) {}
+                } message: {
+                    Text("泵那边的配对记录还在。要彻底断开，还得在泵上「解除配对」。")
+                }
+            }
+        }
     }
 }
 
