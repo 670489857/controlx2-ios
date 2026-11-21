@@ -49,7 +49,10 @@ struct HistoryEvent: Identifiable, Equatable {
             return source == .nightscout
                 ? String(format: "NS 注射 %.2f U", amount)
                 : String(format: "大剂量 %.2f U", amount)
-        case .carbs: return String(format: "碳水 %.0f g", amount)
+        case .carbs:
+            return source == .nightscout
+                ? String(format: "NS 碳水 %.0f g", amount)
+                : String(format: "碳水 %.0f g", amount)
         case .loopDose: return String(format: "闭环微剂量 %.2f U", amount)
         case .loopHold: return "闭环未发针"
         }
@@ -67,26 +70,16 @@ struct HistoryEvent: Identifiable, Equatable {
 
 extension AppModel {
 
-    /// NS 治疗记录 + 本机闭环台账，按时间倒序
-    var historyEvents: [HistoryEvent] {
+    /// 本机台账里的针：大剂量 + 闭环微剂量。都是在这台手机上按下去、发出去的。
+    private var localInsulinEvents: [HistoryEvent] {
         var list: [HistoryEvent] = []
-        for t in nsTreatments where !t.isIgnoredType {
-            if t.isInsulin {
-                list.append(HistoryEvent(id: "ns-\(t.id)-i",
-                                         date: t.date,
-                                         kind: .bolus,
-                                         amount: t.insulinUnits,
-                                         detail: t.eventType,
-                                         source: .nightscout))
-            }
-            if t.isCarbs {
-                list.append(HistoryEvent(id: "ns-\(t.id)-c",
-                                         date: t.date,
-                                         kind: .carbs,
-                                         amount: t.carbGrams,
-                                         detail: t.eventType,
-                                         source: .nightscout))
-            }
+        // 大剂量台账只留 24 小时，跟最长的时间跨度对齐
+        for r in ledger.records {
+            list.append(HistoryEvent(id: "local-bolus-\(r.at.timeIntervalSince1970)",
+                                     date: r.at,
+                                     kind: .bolus,
+                                     amount: r.units,
+                                     detail: "本机大剂量"))
         }
         for r in loopRecords {
             let key = "loop-\(r.timestamp.timeIntervalSince1970)"
@@ -104,17 +97,16 @@ extension AppModel {
                                          detail: r.summary))
             }
         }
-        return list.sorted { $0.date > $1.date }
+        return list
     }
 
-    /// 只画在曲线上的标记。
+    /// 记录列表：本机的针 + NS 的碳水，按时间倒序。
     ///
-    /// 跟 `historyEvents` 不是一回事：Nightscout 的 treatments 里 insulin 字段是这台泵
-    /// 这段时间打进去的全部胰岛素，既有本机大剂量，也有泵自己的微剂量和别的 App 补的记录。
-    /// 把它们全画成三角，曲线看起来就是"我一小时打了十几针"——而其中大多数根本没经过这个 App。
-    /// 所以曲线上的针只认本机台账：大剂量台账 + 闭环台账。NS 的碳水照旧画，碳水不会看错。
-    var chartMarkers: [HistoryEvent] {
-        var list: [HistoryEvent] = []
+    /// NS 的 insulin 字段不进来。它记的是这台泵这段时间打进去的全部胰岛素——
+    /// 泵自己的微剂量、别的 App 补的记录都混在里面。照着列，一屏几十条 0.0x U 的
+    /// 「注射」，跟自己按的那几针糊在一起，分不出哪些是本机干的。
+    var historyEvents: [HistoryEvent] {
+        var list = localInsulinEvents
         for t in nsTreatments where !t.isIgnoredType && t.isCarbs {
             list.append(HistoryEvent(id: "ns-\(t.id)-c",
                                      date: t.date,
@@ -123,33 +115,11 @@ extension AppModel {
                                      detail: t.eventType,
                                      source: .nightscout))
         }
-        // 本机大剂量：ledger 只留 24 小时，正好覆盖最长的时间跨度
-        for r in ledger.records {
-            list.append(HistoryEvent(id: "local-bolus-\(r.at.timeIntervalSince1970)",
-                                     date: r.at,
-                                     kind: .bolus,
-                                     amount: r.units,
-                                     detail: "本机大剂量",
-                                     source: .local))
-        }
-        for r in loopRecords {
-            let key = "loop-\(r.timestamp.timeIntervalSince1970)"
-            if r.units > 0 {
-                list.append(HistoryEvent(id: key,
-                                         date: r.timestamp,
-                                         kind: .loopDose,
-                                         amount: r.units,
-                                         detail: r.accepted == true ? r.summary : "结果未知"))
-            } else if let hold = r.holdReason, hold != ClosedLoop.Hold.doseBelowStep.rawValue {
-                list.append(HistoryEvent(id: key,
-                                         date: r.timestamp,
-                                         kind: .loopHold,
-                                         amount: 0,
-                                         detail: r.summary))
-            }
-        }
         return list.sorted { $0.date > $1.date }
     }
+
+    /// 曲线上的三角。口径跟记录列表一致——列表里没有的针，曲线上也不画。
+    var chartMarkers: [HistoryEvent] { historyEvents }
 
     // MARK: 后台静音保活
 
@@ -443,7 +413,7 @@ struct GlucoseTrendSection: View {
                 }
 
                 if model.historyEvents.isEmpty {
-                    Text("还没有记录。Nightscout 的注射与碳水、本机闭环的每一针都会汇总到这里。")
+                    Text("还没有记录。本机打的针、闭环的每一针会出现在这里；Nightscout 只往里补碳水。")
                         .font(.caption).foregroundStyle(.secondary)
                 } else {
                     VStack(spacing: 12) {
@@ -515,7 +485,7 @@ struct HistoryView: View {
             VStack(spacing: DS.gap) {
                 if groups.isEmpty {
                     Card {
-                        Text("还没有记录。Nightscout 的注射与碳水、本机闭环的每一针都会汇总到这里。")
+                        Text("还没有记录。本机打的针、闭环的每一针会出现在这里；Nightscout 只往里补碳水。")
                             .font(.footnote).foregroundStyle(.secondary)
                     }
                 }

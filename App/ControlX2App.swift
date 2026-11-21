@@ -1471,7 +1471,12 @@ struct PairingView: View {
                 infoRow("软件版本", model.pumpSoftwareName ?? "未读取")
                 infoRow("型号号", model.pumpModelNumber.map { String($0) } ?? "未读取")
                 infoRow("序列号", model.pumpSerialNumber.map { String($0) } ?? "未读取")
-                infoRow("泵版本", (model.pumpRevision?.isEmpty == false) ? model.pumpRevision! : "未读取")
+                // 泵版本这个 8 字节字段 X2/Mobi 都固定填一个 "0"，不是读取失败。
+                // 显示出来只会让人以为哪里坏了，干脆没有就不显示。
+                let revision = (model.pumpRevision ?? "").trimmingCharacters(in: .whitespaces)
+                if !revision.isEmpty && revision != "0" {
+                    infoRow("泵版本", revision)
+                }
             }
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
